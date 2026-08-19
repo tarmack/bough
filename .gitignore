@@ -1,0 +1,7 @@
+# Rust / Cargo build output
+/target
+
+# Agent plan scratch directory (not part of the project)
+/.moderator
+
+# Note: Cargo.lock is intentionally tracked — this is a binary crate.
