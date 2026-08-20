@@ -14,6 +14,7 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use two_face::theme::LazyThemeSet;
 
 /// One colored span within a single highlighted line.
+#[derive(Debug, Clone)]
 pub struct TokenOwned {
     /// The literal text of the span.
     pub text: String,

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::time::SystemTime;
 
 /// A command failed or `git` exited non-zero. `message` holds the raw stderr.
 #[derive(Debug)]
@@ -98,8 +99,40 @@ pub fn default_branch() -> Option<String> {
     None
 }
 
+/// mtime of `.git/HEAD`, used by the backstop poll to detect branch switches
+/// (`git checkout`, `git reset`) that `notify` may miss on some filesystems.
+/// Returns `None` when `.git/HEAD` can't be stat-ed (not a repo, or HEAD
+/// missing).
+pub fn head_mtime() -> Option<SystemTime> {
+    std::fs::metadata(".git/HEAD")
+        .ok()
+        .and_then(|m| m.modified().ok())
+}
+
+/// mtime of the local branch ref `refs/heads/<name>`. Checks the loose ref
+/// first; when absent, looks for the ref inside `.git/packed-refs` and reports
+/// the `packed-refs` file mtime (conservatively over-triggers on any repack —
+/// acceptable for a backstop). `None` when the ref can't be found at all.
+pub fn base_ref_mtime(name: &str) -> Option<SystemTime> {
+    if let Some(mtime) = std::fs::metadata(format!(".git/refs/heads/{name}"))
+        .ok()
+        .and_then(|m| m.modified().ok())
+    {
+        return Some(mtime);
+    }
+    let packed = std::fs::read_to_string(".git/packed-refs").ok()?;
+    let needle = format!("refs/heads/{name}");
+    if packed.lines().any(|l| l.ends_with(&needle)) {
+        std::fs::metadata(".git/packed-refs")
+            .ok()
+            .and_then(|m| m.modified().ok())
+    } else {
+        None
+    }
+}
+
 /// List changed files as `(status, path)` pairs via
-/// `git diff --name-status <revision>`.
+/// `git diff --name-status <revision>`, plus untracked files (marked `A`).
 pub fn changed_files(revision: &str) -> Result<Vec<(char, String)>, GitError> {
     let out = run(
         &[
@@ -111,7 +144,37 @@ pub fn changed_files(revision: &str) -> Result<Vec<(char, String)>, GitError> {
         ],
         &[0],
     )?;
-    Ok(parse_name_status(&out))
+    let mut entries = parse_name_status(&out);
+    // Untracked files are new to the working tree; surface them as additions.
+    if let Ok(paths) = untracked_paths() {
+        entries.extend(paths.into_iter().map(|p| ('A', p)));
+    }
+    Ok(entries)
+}
+
+/// Untracked, non-ignored files in the working tree (relative paths).
+fn untracked_paths() -> Result<Vec<String>, GitError> {
+    let out = run(
+        &[
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "-o",
+            "--exclude-standard",
+        ],
+        &[0],
+    )?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether `path` is not tracked by git (i.e. a new, untracked file).
+pub fn is_untracked(path: &str) -> bool {
+    // `ls-files --error-unmatch` exits 0 for a tracked path, 1 for untracked.
+    run(&["ls-files", "--error-unmatch", "--", path], &[0]).is_err()
 }
 
 /// Fetch the per-file diff for `path` against `revision` with `ctx` context
@@ -119,6 +182,27 @@ pub fn changed_files(revision: &str) -> Result<Vec<(char, String)>, GitError> {
 pub fn file_diff_ctx(revision: &str, path: &str, ctx: u32) -> Result<String, GitError> {
     let u_arg = format!("-U{ctx}");
     run(&["diff", &u_arg, revision, "--", path], &[0])
+}
+
+/// Diff a file against the empty tree: every line is an addition. Used for
+/// untracked files and for a repository with no commits. `--no-index`
+/// against `/dev/null` emits the whole file as added lines and exits 1 when
+/// the file differs (always, for a non-empty file).
+pub fn file_diff_no_index(path: &str, ctx: u32) -> Result<String, GitError> {
+    let u_arg = format!("-U{ctx}");
+    run(
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-index",
+            &u_arg,
+            "--",
+            "/dev/null",
+            path,
+        ],
+        &[0, 1],
+    )
 }
 
 /// List files that would form the initial commit (staged + untracked, excluding
@@ -160,7 +244,21 @@ pub fn diff_stats(revision: &str) -> Result<HashMap<String, (usize, usize)>, Git
             map.insert(path, (added, deleted));
         }
     }
+    // Untracked files: every line is new; count them as additions.
+    if let Ok(paths) = untracked_paths() {
+        for path in paths {
+            let added = line_count(&path);
+            map.insert(path, (added, 0));
+        }
+    }
     Ok(map)
+}
+
+/// Count the lines (LF) in a file; 0 when it can't be read.
+fn line_count(path: &str) -> usize {
+    std::fs::read(path)
+        .map(|bytes| bytes.iter().filter(|&&b| b == b'\n').count())
+        .unwrap_or(0)
 }
 
 /// For a no-commit repo: every file is added; count its lines as the added
@@ -168,9 +266,7 @@ pub fn diff_stats(revision: &str) -> Result<HashMap<String, (usize, usize)>, Git
 pub fn empty_stats(paths: &[String]) -> HashMap<String, (usize, usize)> {
     let mut map = HashMap::new();
     for path in paths {
-        let lines = std::fs::read(path)
-            .map(|bytes| bytes.iter().filter(|&&b| b == b'\n').count())
-            .unwrap_or(0);
+        let lines = line_count(path);
         map.insert(path.clone(), (lines, 0));
     }
     map
@@ -287,6 +383,21 @@ pub fn file_meta(revision: &str, path: &str) -> Result<FileMeta, GitError> {
     })
 }
 
+/// Metadata for an untracked file: a pure addition against the empty tree.
+pub fn file_meta_untracked(path: &str) -> Result<FileMeta, GitError> {
+    let added = line_count(path);
+    Ok(FileMeta {
+        status: 'A',
+        added,
+        deleted: 0,
+        old_path: None,
+        rename_percent: None,
+        mode_old: None,
+        mode_new: None,
+        binary: false,
+    })
+}
+
 /// Parse one `git diff --numstat` line.
 ///
 /// Format: `<added>\t<deleted>\t<path>` (renames add an extra old path
@@ -347,26 +458,6 @@ fn parse_raw_line(line: &str) -> Option<RawEntry> {
         old_path,
         path,
     })
-}
-
-/// Diff a single file against an empty target with `ctx` context lines via
-/// `git diff --no-index -U<ctx>`. For a repository with no commits.
-pub fn file_diff_empty_ctx(path: &str, ctx: u32) -> Result<String, GitError> {
-    let u_arg = format!("-U{ctx}");
-    // `--no-index` exits 1 when files differ, 0 when identical.
-    run(
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-index",
-            &u_arg,
-            "--",
-            "/dev/null",
-            path,
-        ],
-        &[0, 1],
-    )
 }
 
 /// Parse `git diff --name-status` output.
@@ -489,5 +580,26 @@ mod tests {
             }
             _ => panic!("expected counts"),
         }
+    }
+
+    #[test]
+    fn head_mtime_present_in_this_repo() {
+        // This test runs inside the bough git repo, so .git/HEAD must exist.
+        assert!(head_mtime().is_some());
+    }
+
+    #[test]
+    fn base_ref_mtime_finds_local_branch() {
+        // bough's repo has at least one local branch; whichever is current
+        // must resolve. `main` or `master` should be present.
+        let found = ["main", "master"]
+            .iter()
+            .find_map(|name| base_ref_mtime(name));
+        assert!(found.is_some(), "expected main or master to exist");
+    }
+
+    #[test]
+    fn base_ref_mtime_absent_ref_returns_none() {
+        assert!(base_ref_mtime("definitely-not-a-branch-xyz").is_none());
     }
 }

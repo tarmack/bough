@@ -4,7 +4,7 @@
 //! node tree. A directory aggregates the set of statuses present anywhere
 //! beneath it; a file carries its own single status letter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -12,7 +12,7 @@ pub enum Kind {
     File,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TreeNode {
     pub name: String,
     /// Full slash-joined path within the repository.
@@ -31,7 +31,7 @@ pub struct TreeNode {
     pub file_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Tree {
     pub nodes: Vec<TreeNode>,
     pub root: usize,
@@ -96,6 +96,18 @@ impl Tree {
             }
         }
         sum_stats(&mut self.nodes, self.root);
+    }
+
+    /// Reapply expansion state from a set of expanded dir paths. Every
+    /// directory whose `path` is in `paths` becomes expanded; all others
+    /// collapse. Used by the UI after swapping in a fresh `Snapshot` so the
+    /// user's collapse/expand choices survive a tree rebuild.
+    pub fn expand_paths(&mut self, paths: &HashSet<String>) {
+        for node in &mut self.nodes {
+            if node.kind == Kind::Dir {
+                node.expanded = paths.contains(&node.path);
+            }
+        }
     }
 }
 
