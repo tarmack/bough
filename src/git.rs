@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::time::SystemTime;
 
 /// A command failed or `git` exited non-zero. `message` holds the raw stderr.
 #[derive(Debug)]
@@ -75,6 +74,80 @@ pub fn current_branch() -> Result<Option<String>, GitError> {
     }
 }
 
+/// Branch-state summary for the footer: current branch, its divergence from
+/// the base ref and from its upstream. Every field degrades to `None`/0 when
+/// it can't be determined (detached HEAD, no upstream, no base).
+#[derive(Debug, Clone, Default)]
+pub struct BranchState {
+    /// Current branch short name, or `None` when detached (or unresolved).
+    pub name: Option<String>,
+    /// Base ref short name the diff is against; `None` when comparing `HEAD`
+    /// to the working tree only (e.g. on the trunk).
+    pub base: Option<String>,
+    /// Commits `HEAD` has that `base` does not.
+    pub ahead: Option<u32>,
+    /// Commits `base` has that `HEAD` does not.
+    pub behind: Option<u32>,
+    /// Upstream/tracking branch short name; `None` when no upstream is set.
+    pub upstream: Option<String>,
+    /// Commits not yet pushed to `upstream`; `None` when no upstream.
+    pub unpushed: Option<u32>,
+}
+
+/// Gather the current branch-state: branch name, divergence from the base ref
+/// embedded in `rev`, and unpushed commits vs the upstream. Every field is
+/// optional and computed defensively (never returns an error).
+///
+/// `rev` is the revision string the diff was built against, e.g. `main...HEAD`
+/// (base is `main`) or `HEAD` (no base comparison).
+pub fn branch_state(rev: &str) -> BranchState {
+    let mut state = BranchState {
+        name: current_branch().ok().flatten(),
+        ..BranchState::default()
+    };
+
+    // Ahead/behind vs base: `--left-right --count base...HEAD` prints
+    // "<behind>\t<ahead>". The revision's left side is the base ref, the
+    // right side the head to compare.
+    if let Some((base, head)) = rev.split_once("...") {
+        let base = base.trim();
+        let head = head.trim();
+        if !base.is_empty() && base != "HEAD" {
+            state.base = Some(base.to_string());
+            if let Ok(out) = run(
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{base}...{head}"),
+                ],
+                &[0],
+            ) {
+                let mut parts = out.split_whitespace();
+                if let (Some(b), Some(a)) = (parts.next(), parts.next()) {
+                    state.behind = b.parse::<u32>().ok();
+                    state.ahead = a.parse::<u32>().ok();
+                }
+            }
+        }
+    }
+
+    // Upstream short name; absent when the branch doesn't track a remote.
+    state.upstream = run(&["rev-parse", "--abbrev-ref", "@{u}"], &[0])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Unpushed commits: those reachable from HEAD but not from the upstream.
+    if state.upstream.is_some() {
+        state.unpushed = run(&["rev-list", "--count", "@{u}..HEAD"], &[0])
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+    }
+
+    state
+}
+
 /// Detect the repository's default branch: `origin/HEAD` first, then a local
 /// `main` or `master`. Returns `None` when none can be determined.
 pub fn default_branch() -> Option<String> {
@@ -97,38 +170,6 @@ pub fn default_branch() -> Option<String> {
         }
     }
     None
-}
-
-/// mtime of `.git/HEAD`, used by the backstop poll to detect branch switches
-/// (`git checkout`, `git reset`) that `notify` may miss on some filesystems.
-/// Returns `None` when `.git/HEAD` can't be stat-ed (not a repo, or HEAD
-/// missing).
-pub fn head_mtime() -> Option<SystemTime> {
-    std::fs::metadata(".git/HEAD")
-        .ok()
-        .and_then(|m| m.modified().ok())
-}
-
-/// mtime of the local branch ref `refs/heads/<name>`. Checks the loose ref
-/// first; when absent, looks for the ref inside `.git/packed-refs` and reports
-/// the `packed-refs` file mtime (conservatively over-triggers on any repack —
-/// acceptable for a backstop). `None` when the ref can't be found at all.
-pub fn base_ref_mtime(name: &str) -> Option<SystemTime> {
-    if let Some(mtime) = std::fs::metadata(format!(".git/refs/heads/{name}"))
-        .ok()
-        .and_then(|m| m.modified().ok())
-    {
-        return Some(mtime);
-    }
-    let packed = std::fs::read_to_string(".git/packed-refs").ok()?;
-    let needle = format!("refs/heads/{name}");
-    if packed.lines().any(|l| l.ends_with(&needle)) {
-        std::fs::metadata(".git/packed-refs")
-            .ok()
-            .and_then(|m| m.modified().ok())
-    } else {
-        None
-    }
 }
 
 /// List changed files as `(status, path)` pairs via
@@ -580,26 +621,5 @@ mod tests {
             }
             _ => panic!("expected counts"),
         }
-    }
-
-    #[test]
-    fn head_mtime_present_in_this_repo() {
-        // This test runs inside the bough git repo, so .git/HEAD must exist.
-        assert!(head_mtime().is_some());
-    }
-
-    #[test]
-    fn base_ref_mtime_finds_local_branch() {
-        // bough's repo has at least one local branch; whichever is current
-        // must resolve. `main` or `master` should be present.
-        let found = ["main", "master"]
-            .iter()
-            .find_map(|name| base_ref_mtime(name));
-        assert!(found.is_some(), "expected main or master to exist");
-    }
-
-    #[test]
-    fn base_ref_mtime_absent_ref_returns_none() {
-        assert!(base_ref_mtime("definitely-not-a-branch-xyz").is_none());
     }
 }

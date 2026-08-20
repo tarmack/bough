@@ -20,6 +20,15 @@ pub enum LineKind {
     Removed,
     /// A hunk header (`@@ -a,b +c,d @@`).
     HunkHeader,
+    /// A per-file section header inside a multi-file (folder) diff.
+    FileHeader,
+}
+
+impl LineKind {
+    /// Whether this line is a navigable header (`@@` hunk or file header).
+    pub fn is_header(self) -> bool {
+        matches!(self, LineKind::HunkHeader | LineKind::FileHeader)
+    }
 }
 
 /// A single body line in a parsed diff.
@@ -28,15 +37,35 @@ pub struct DiffLine {
     /// How this line should be rendered.
     pub kind: LineKind,
     /// The line with its leading `+`/`-`/` ` prefix stripped. Hunk headers
-    /// keep the full `@@ ... @@` text.
+    /// keep the full `@@ ... @@` text; file headers keep their raw text.
     pub raw_text: String,
-    /// 0-based index of the hunk this line belongs to; increments on each
-    /// `@@` line.
-    pub hunk_index: usize,
+    /// Index into [`ParsedDiff::sections`] of the section this line belongs
+    /// to. Header lines (`HunkHeader`/`FileHeader`) name their own section;
+    /// body lines name the hunk (or file) section they sit in.
+    pub section: usize,
     /// Word-level runs, set on Added/Removed lines when LCS word-diff was
     /// applied to the adjacent pair; `None` otherwise. The same shared vector
     /// is assigned to both members of a paired removed/added block.
     pub word_runs: Option<Vec<WordRun>>,
+}
+
+/// A navigable, foldable unit of a diff body: either one file's section (its
+/// `FileHeader` row) or one hunk within a file. Drives chunk navigation and
+/// folding, which treat files and hunks uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKind {
+    File,
+    Hunk,
+}
+
+/// One section of a diff: a file or a hunk. See [`ParsedDiff::sections`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section {
+    pub kind: SectionKind,
+    /// Index into [`ParsedDiff::files`] of the owning file.
+    pub file: usize,
+    /// For [`SectionKind::Hunk`], the index into `files[file].hunks`.
+    pub hunk: Option<usize>,
 }
 
 /// One run of tokens in a word-level diff of a line pair.
@@ -86,12 +115,33 @@ pub struct FileHeader {
     pub hunks: Vec<HunkMeta>,
 }
 
-/// The parsed form of one file's `git diff`.
+/// The parsed form of a `git diff`, covering one file or many (a directory
+/// diff produces one entry per changed file).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedDiff {
+    /// Locked top header. For a single-file diff this is that file's header;
+    /// for a multi-file (folder) diff it is a summary carrying the folder path
+    /// and aggregate counts.
     pub header: FileHeader,
+    /// Per-file headers in document order.
+    pub files: Vec<FileHeader>,
+    /// Ordered sections: a `File` section for each file, followed by its
+    /// `Hunk` sections, in document order. Drives navigation and folding.
+    pub sections: Vec<Section>,
     /// Classified body lines. File-metadata lines are excluded.
     pub lines: Vec<DiffLine>,
+}
+
+impl ParsedDiff {
+    /// Index of the `File` section owning `s` (the first `File` section with
+    /// the same `file`), or `None` when no file section exists (single-file
+    /// diffs have hunk sections only).
+    pub fn file_section_for(&self, s: usize) -> Option<usize> {
+        let file = self.sections.get(s)?.file;
+        self.sections
+            .iter()
+            .position(|x| x.kind == SectionKind::File && x.file == file)
+    }
 }
 
 /// Upper bound on the number of changed word runs per line pair. Above this
@@ -105,63 +155,288 @@ const WORD_DIFF_MAX_RUNS: usize = 6;
 /// word diff is abandoned and the renderer falls back to a plain tint.
 const WORD_DIFF_MAX_TOKENS: usize = 256;
 
-/// Parse raw `git diff` output for a single file into a [`ParsedDiff`].
+/// Parse raw `git diff` output into a [`ParsedDiff`].
+///
+/// A diff may cover one file (the common case) or several, when the caller
+/// selected a whole directory. Each file becomes a [`FileHeader`] in `files`
+/// plus a `File` section whose body is its `Hunk` sections.
 ///
 /// `path` and `status` come from the caller's tree data; `path` is the
-/// fallback when the diff header does not name a (renamed) new path.
+/// fallback when the diff header does not name a (renamed) new path and the
+/// summary header's path for a multi-file diff.
 pub fn parse_diff(raw: &str, path: &str, status: char) -> ParsedDiff {
-    let mut header = FileHeader {
+    let blocks = split_blocks(raw);
+    let multi = blocks.len() > 1;
+
+    let mut files = Vec::new();
+    let mut sections = Vec::new();
+    let mut lines = Vec::new();
+
+    for block in &blocks {
+        let file = files.len();
+        let header = parse_block(block, multi, file, &mut sections, &mut lines, path, status);
+        files.push(header);
+    }
+    apply_word_pairs(&mut lines);
+
+    let header = summary_header(&files, path, multi);
+    ParsedDiff {
+        header,
+        files,
+        sections,
+        lines,
+    }
+}
+
+/// Build the locked top header: the single file's own header, or a folder
+/// summary (folder path + aggregate counts) for a multi-file diff.
+fn summary_header(files: &[FileHeader], path: &str, multi: bool) -> FileHeader {
+    if !multi {
+        return files[0].clone();
+    }
+    FileHeader {
         path: path.to_string(),
         old_path: None,
-        status,
-        added: 0,
-        deleted: 0,
+        status: 'M',
+        added: files.iter().map(|f| f.added).sum(),
+        deleted: files.iter().map(|f| f.deleted).sum(),
         rename_percent: None,
         mode_old: None,
         mode_new: None,
-        binary: false,
+        binary: files.iter().any(|f| f.binary),
+        hunks: Vec::new(),
+    }
+}
+
+/// Parse one file's raw block into its [`FileHeader`], emitting its `Hunk`
+/// sections (plus a `File` section when the diff spans multiple files) and
+/// their body lines into `sections`/`lines`.
+///
+/// `file` is this block's index into the diff's `files` list.
+fn parse_block(
+    block: &str,
+    multi: bool,
+    file: usize,
+    sections: &mut Vec<Section>,
+    lines: &mut Vec<DiffLine>,
+    fallback_path: &str,
+    fallback_status: char,
+) -> FileHeader {
+    // A `File` section is emitted only for multi-file diffs, where each file
+    // shows an in-body header row. A single-file diff keeps hunks as the only
+    // sections so hunk navigation is unchanged.
+    let mut cur_section = sections.len();
+    if multi {
+        let file_section = sections.len();
+        sections.push(Section {
+            kind: SectionKind::File,
+            file,
+            hunk: None,
+        });
+        cur_section = file_section;
+
+        // Emit the file-header row.
+        lines.push(DiffLine {
+            kind: LineKind::FileHeader,
+            raw_text: block_new_path(block)
+                .unwrap_or(fallback_path)
+                .to_string(),
+            section: file_section,
+            word_runs: None,
+        });
+    }
+
+    let mut header = FileHeader {
+        path: block_new_path(block)
+            .unwrap_or(fallback_path)
+            .to_string(),
+        old_path: block_old_path(block),
+        status: block_status(block).unwrap_or(if multi { 'M' } else { fallback_status }),
+        added: 0,
+        deleted: 0,
+        rename_percent: block_rename_percent(block),
+        mode_old: block_mode_old(block),
+        mode_new: block_mode_new(block),
+        binary: block_binary(block),
         hunks: Vec::new(),
     };
 
-    let mut lines: Vec<DiffLine> = Vec::new();
-    let mut hunk_count = 0usize;
-
-    for raw_line in raw.lines() {
+    // Walk the body: each `@@` opens a new `Hunk` section; body lines hang
+    // off the current hunk (or the file section when the file has no hunks).
+    for raw_line in block.lines() {
         if is_meta_line(raw_line) {
             continue;
         }
         let (kind, raw_text) = classify(raw_line);
-        // A hunk header opens the next hunk; its body lines belong to it. So
-        // a header gets the pre-increment count, subsequent lines get the
-        // current (incremented) count minus one.
-        let hunk_index = if kind == LineKind::HunkHeader {
-            hunk_count
-        } else {
-            hunk_count.saturating_sub(1)
-        };
         if kind == LineKind::HunkHeader {
+            let hunk_section = sections.len();
+            let hunk = header.hunks.len();
+            sections.push(Section {
+                kind: SectionKind::Hunk,
+                file,
+                hunk: Some(hunk),
+            });
             header.hunks.push(parse_hunk_header(raw_line));
-            hunk_count += 1;
+            cur_section = hunk_section;
         }
         lines.push(DiffLine {
             kind,
             raw_text,
-            hunk_index,
+            section: cur_section,
             word_runs: None,
         });
-        // Accumulate per-hunk body counts; body lines index the hunk opened by
-        // the preceding `@@` header.
-        if let Some(hunk) = header.hunks.get_mut(hunk_index) {
-            match kind {
-                LineKind::Added => hunk.added += 1,
-                LineKind::Removed => hunk.deleted += 1,
-                _ => {}
+        // Accumulate added/deleted on the owning file and (when inside a
+        // hunk) on that hunk's metadata.
+        match kind {
+            LineKind::Added => {
+                header.added += 1;
+                if let Some(hunk) = header.hunks.last_mut() {
+                    hunk.added += 1;
+                }
+            }
+            LineKind::Removed => {
+                header.deleted += 1;
+                if let Some(hunk) = header.hunks.last_mut() {
+                    hunk.deleted += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    header
+}
+
+/// Split raw diff output into per-file blocks at each `diff --git` line. When
+/// the text contains no such marker (empty or synthetic diff) the whole input
+/// is one block.
+fn split_blocks(raw: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        if line.starts_with("diff --git ") {
+            blocks.push(String::new());
+        } else if blocks.is_empty() && !line.trim().is_empty() {
+            // Leading non-`diff --git` content (e.g. an error/header line):
+            // seed a single block so nothing is dropped.
+            blocks.push(String::new());
+        }
+        if let Some(last) = blocks.last_mut() {
+            last.push_str(line);
+            last.push('\n');
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(raw.to_string());
+    }
+    blocks
+}
+
+/// New path from the `diff --git a/<old> b/<new>` or `+++ b/<path>` line.
+fn block_new_path(block: &str) -> Option<&str> {
+    // `+++ b/<path>` (or `/dev/null` for deletions).
+    let mut plus = None;
+    let mut header = None;
+    for line in block.lines() {
+        if let Some(p) = line.strip_prefix("+++ b/") {
+            if p != "/dev/null" {
+                plus = Some(p);
+            }
+        } else if let Some(p) = line.strip_prefix("+++ ") {
+            if p != "/dev/null" {
+                plus = Some(p);
+            }
+        } else if let Some(p) = line.strip_prefix("diff --git ") {
+            header = Some(p);
+        }
+    }
+    if let Some(p) = plus {
+        return Some(p);
+    }
+    // `diff --git a/old b/new` → the part after ` b/`.
+    let h = header?;
+    let (_, new) = h.rsplit_once(" b/")?;
+    Some(new)
+}
+
+/// Old path from the `diff --git a/<old>` prefix, when present.
+fn block_old_path(block: &str) -> Option<String> {
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(old) = rest.strip_prefix("a/") {
+                let old = old.split(" b/").next().unwrap_or(old);
+                if old != "/dev/null" {
+                    return Some(old.to_string());
+                }
             }
         }
     }
-    apply_word_pairs(&mut lines);
+    None
+}
 
-    ParsedDiff { header, lines }
+/// Status letter inferred from the block's meta lines, or `None` (caller's).
+fn block_status(block: &str) -> Option<char> {
+    let mut rename = false;
+    for line in block.lines() {
+        if line.starts_with("new file mode ") {
+            return Some('A');
+        }
+        if line.starts_with("deleted file mode ") {
+            return Some('D');
+        }
+        if line.starts_with("rename from ") || line.starts_with("rename to ") {
+            rename = true;
+        }
+    }
+    if rename {
+        Some('R')
+    } else {
+        None
+    }
+}
+
+/// Similarity percentage from the `similarity index N%` line.
+fn block_rename_percent(block: &str) -> Option<u8> {
+    block.lines().find_map(|l| {
+        let digits = l.strip_prefix("similarity index ")?.strip_suffix('%')?;
+        digits.parse().ok()
+    })
+}
+
+/// Old mode from `old mode <octal>`.
+fn block_mode_old(block: &str) -> Option<u32> {
+    for line in block.lines() {
+        if let Some(m) = line.strip_prefix("old mode ") {
+            return parse_mode(m);
+        }
+    }
+    None
+}
+
+/// New mode from `new mode <octal>`, else the `index ... <octal>` mode.
+fn block_mode_new(block: &str) -> Option<u32> {
+    for line in block.lines() {
+        if let Some(m) = line.strip_prefix("new mode ") {
+            return parse_mode(m);
+        }
+    }
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix("index ") {
+            if let Some(m) = rest.split(' ').next_back() {
+                return parse_mode(m);
+            }
+        }
+    }
+    None
+}
+
+/// Parse an octal file mode string (e.g. `100644`).
+fn parse_mode(m: &str) -> Option<u32> {
+    u32::from_str_radix(m.trim(), 8).ok()
+}
+
+/// Whether the block marks a binary file change.
+fn block_binary(block: &str) -> bool {
+    block.lines().any(|l| l.starts_with("Binary files "))
 }
 
 /// Parse a single `@@ -a,b +c,d @@ <section>` hunk header into [`HunkMeta`].
@@ -517,10 +792,9 @@ mod tests {
 
         assert_eq!(parsed.header.status, 'M');
         assert_eq!(parsed.header.path, "src/a.rs");
-        // File-level `added`/`deleted` are supplied by the caller (`git::FileMeta`);
-        // `parse_diff` only accumulates them per-hunk.
-        assert_eq!(parsed.header.added, 0);
-        assert_eq!(parsed.header.deleted, 0);
+        // `parse_diff` accumulates per-file added/deleted from the body.
+        assert_eq!(parsed.header.added, 3);
+        assert_eq!(parsed.header.deleted, 2);
         assert!(!parsed.header.binary);
 
         let kinds: Vec<LineKind> = parsed.lines.iter().map(|l| l.kind).collect();
@@ -539,10 +813,18 @@ mod tests {
             ]
         );
 
-        // hunk_index resets to 0 for the first hunk and becomes 1 after the
-        // second `@@`.
-        let indexes: Vec<usize> = parsed.lines.iter().map(|l| l.hunk_index).collect();
+        // A single file: no in-body `File` section — hunks are the sections,
+        // so `line.section` equals the hunk index.
+        let indexes: Vec<usize> = parsed.lines.iter().map(|l| l.section).collect();
         assert_eq!(indexes, vec![0, 0, 0, 0, 0, 1, 1, 1, 1]);
+
+        assert_eq!(parsed.sections.len(), 2);
+        assert_eq!(parsed.sections[0].kind, SectionKind::Hunk);
+        assert_eq!(parsed.sections[0].file, 0);
+        assert_eq!(parsed.sections[0].hunk, Some(0));
+        assert_eq!(parsed.sections[1].kind, SectionKind::Hunk);
+        assert_eq!(parsed.sections[1].file, 0);
+        assert_eq!(parsed.sections[1].hunk, Some(1));
 
         // Per-hunk metadata: sections from the `@@` headers, added/deleted
         // from each hunk's own body lines.
@@ -636,13 +918,16 @@ mod tests {
                    rename from old.rs\n\
                    rename to new.rs\n";
         let parsed = parse_diff(raw, "new.rs", 'R');
-        // Rename/similarity metadata is supplied by the caller (`git::FileMeta`);
-        // the shadow parser no longer extracts it from the diff header.
+        // Rename/similarity metadata is parsed from the diff header lines.
         assert_eq!(parsed.header.path, "new.rs");
-        assert_eq!(parsed.header.old_path, None);
-        assert_eq!(parsed.header.rename_percent, None);
+        assert_eq!(parsed.header.old_path.as_deref(), Some("old.rs"));
+        assert_eq!(parsed.header.rename_percent, Some(92));
+        assert_eq!(parsed.header.status, 'R');
         assert!(!parsed.header.binary);
         assert!(parsed.lines.is_empty());
+        // A single file, no hunks: no in-body section.
+        assert_eq!(parsed.files.len(), 1);
+        assert!(parsed.sections.is_empty());
     }
 
     #[test]
@@ -650,13 +935,67 @@ mod tests {
         let raw = "diff --git a/x.bin b/x.bin\n\
                    Binary files a/x.bin and b/x.bin differ\n";
         let parsed = parse_diff(raw, "x.bin", 'M');
-        // Binary detection is supplied by the caller (`git::FileMeta`); the
-        // `Binary files ...` line is treated as file metadata and filtered out
-        // of the body (consistent with the other header lines).
-        assert!(!parsed.header.binary);
+        // Binary detection is parsed from the `Binary files ...` meta line.
+        assert!(parsed.header.binary);
         assert!(parsed.lines.is_empty());
         assert_eq!(parsed.header.added, 0);
         assert_eq!(parsed.header.deleted, 0);
+    }
+
+    #[test]
+    fn parse_diff_folder_splits_into_files() {
+        let raw = "diff --git a/src/a.rs b/src/a.rs\n\
+                   index 1111111 2222222 100644\n\
+                   --- a/src/a.rs\n\
+                   +++ b/src/a.rs\n\
+                   @@ -1 +1 @@\n\
+                   -old\n\
+                   +new\n\
+                   diff --git a/src/b.rs b/src/b.rs\n\
+                   index 3333333 4444444 100644\n\
+                   --- a/src/b.rs\n\
+                   +++ b/src/b.rs\n\
+                   @@ -2 +2 @@\n\
+                   -foo\n\
+                   +bar\n";
+        let parsed = parse_diff(raw, "src", 'M');
+
+        // Two files, each with its own File section and one Hunk section.
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.files[0].path, "src/a.rs");
+        assert_eq!(parsed.files[1].path, "src/b.rs");
+        assert_eq!(parsed.sections.len(), 4);
+        assert_eq!(parsed.sections[0].kind, SectionKind::File);
+        assert_eq!(parsed.sections[0].file, 0);
+        assert_eq!(parsed.sections[1].kind, SectionKind::Hunk);
+        assert_eq!(parsed.sections[1].hunk, Some(0));
+        assert_eq!(parsed.sections[2].kind, SectionKind::File);
+        assert_eq!(parsed.sections[2].file, 1);
+        assert_eq!(parsed.sections[3].kind, SectionKind::Hunk);
+        assert_eq!(parsed.sections[3].hunk, Some(0));
+
+        // Body lines: each file's header row plus a hunk; file headers open
+        // their file's section.
+        let kinds: Vec<LineKind> = parsed.lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::FileHeader,
+                LineKind::HunkHeader,
+                LineKind::Removed,
+                LineKind::Added,
+                LineKind::FileHeader,
+                LineKind::HunkHeader,
+                LineKind::Removed,
+                LineKind::Added,
+            ]
+        );
+
+        // Summary header: folder path + aggregate counts, no hunk counter.
+        assert_eq!(parsed.header.path, "src");
+        assert_eq!(parsed.header.added, 2);
+        assert_eq!(parsed.header.deleted, 2);
+        assert!(parsed.header.hunks.is_empty());
     }
 
     #[test]

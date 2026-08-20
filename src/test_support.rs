@@ -8,9 +8,29 @@ use std::sync::Arc;
 use crossbeam_channel::bounded;
 
 use crate::app::App;
-use crate::diff::{DiffLine, FileHeader, HunkMeta, LineKind, ParsedDiff};
+use crate::diff::{DiffLine, FileHeader, HunkMeta, LineKind, ParsedDiff, Section, SectionKind};
 use crate::snapshot::{ArcSnapshot, Request, Snapshot};
 use crate::tree::Tree;
+
+/// Build a single-file [`ParsedDiff`] from its header and body lines. Hunk
+/// sections are derived from the header's `hunks`; each line's `section` is
+/// its hunk index (single-file diffs have no `File` section).
+pub fn single_parsed(header: FileHeader, lines: Vec<DiffLine>) -> ParsedDiff {
+    let hunks_len = header.hunks.len();
+    let sections = (0..hunks_len)
+        .map(|i| Section {
+            kind: SectionKind::Hunk,
+            file: 0,
+            hunk: Some(i),
+        })
+        .collect();
+    ParsedDiff {
+        header: header.clone(),
+        files: vec![header],
+        sections,
+        lines,
+    }
+}
 
 /// A two-file `App` (a.rs, b.rs) backed by a `Snapshot`, ready for further
 /// setup. The worker request channel is a throwaway bounded channel.
@@ -27,25 +47,12 @@ pub fn sample_snapshot(tree: Tree) -> ArcSnapshot {
 }
 
 fn sample_snapshot_with_tree(tree: Tree) -> ArcSnapshot {
-    let flat = tree.flatten();
-    let selected_path = flat
-        .first()
-        .and_then(|&idx| {
-            let n = &tree.nodes[idx];
-            (n.kind == crate::tree::Kind::File).then_some(n.path.clone())
-        });
     Arc::new(Snapshot {
-        rev: "HEAD".into(),
         empty: false,
-        flat,
-        stats: Default::default(),
-        selected_path,
         selected_diff: None,
         selected_highlight: Vec::new(),
-        highlight_truncated_at: 0,
         error: None,
-        generated_at: std::time::Instant::now(),
-        seq: 0,
+        branch_state: crate::git::BranchState::default(),
         tree,
     })
 }
@@ -57,51 +64,29 @@ pub fn snapshot_with_diff(parsed: ParsedDiff) -> ArcSnapshot {
         .take(parsed.lines.len())
         .collect();
     let tree = Tree::build(vec![('M', "x.rs".to_string())]);
-    let flat = tree.flatten();
     Arc::new(Snapshot {
-        rev: "HEAD".into(),
         empty: false,
-        flat,
-        stats: Default::default(),
-        selected_path: None,
         selected_diff: Some(parsed),
         selected_highlight: hl,
-        highlight_truncated_at: 0,
         error: None,
-        generated_at: std::time::Instant::now(),
-        seq: 0,
+        branch_state: crate::git::BranchState::default(),
         tree,
     })
 }
 
 /// `n` context lines in a single hunk.
 pub fn sample_parsed(n: usize) -> ParsedDiff {
-    ParsedDiff {
-        header: FileHeader {
-            path: "x.rs".into(),
-            status: 'M',
-            added: 1,
-            deleted: 1,
-            old_path: None,
-            rename_percent: None,
-            mode_old: None,
-            mode_new: None,
-            binary: false,
-            hunks: vec![HunkMeta {
-                section: None,
-                added: 1,
-                deleted: 1,
-            }],
-        },
-        lines: (0..n)
+    single_parsed(
+        header_full(None, None),
+        (0..n)
             .map(|i| DiffLine {
                 kind: LineKind::Context,
                 raw_text: format!("l{i}"),
-                hunk_index: 0,
+                section: 0,
                 word_runs: None,
             })
             .collect(),
-    }
+    )
 }
 
 /// A single-hunk file header with optional mode change.
@@ -129,7 +114,7 @@ pub fn hunk_header(idx: usize) -> DiffLine {
     DiffLine {
         kind: LineKind::HunkHeader,
         raw_text: format!("@@ -{idx} +{idx} @@"),
-        hunk_index: idx,
+        section: idx,
         word_runs: None,
     }
 }
@@ -139,33 +124,34 @@ pub fn ctx_line(idx: usize, hunk: usize) -> DiffLine {
     DiffLine {
         kind: LineKind::Context,
         raw_text: format!("l{idx}"),
-        hunk_index: hunk,
+        section: hunk,
         word_runs: None,
     }
 }
 
 /// A 3-hunk diff whose 6 visible lines all fit in the pane.
 pub fn fitting_hunk() -> ParsedDiff {
-    ParsedDiff {
-        header: FileHeader {
-            path: "x.rs".into(),
-            status: 'M',
-            added: 3,
-            deleted: 3,
-            old_path: None,
-            rename_percent: None,
-            mode_old: None,
-            mode_new: None,
-            binary: false,
-            hunks: (0..3)
-                .map(|_| HunkMeta {
-                    section: None,
-                    added: 1,
-                    deleted: 1,
-                })
-                .collect(),
-        },
-        lines: vec![
+    let header = FileHeader {
+        path: "x.rs".into(),
+        status: 'M',
+        added: 3,
+        deleted: 3,
+        old_path: None,
+        rename_percent: None,
+        mode_old: None,
+        mode_new: None,
+        binary: false,
+        hunks: (0..3)
+            .map(|_| HunkMeta {
+                section: None,
+                added: 1,
+                deleted: 1,
+            })
+            .collect(),
+    };
+    single_parsed(
+        header,
+        vec![
             hunk_header(0),
             ctx_line(0, 0),
             hunk_header(1),
@@ -173,5 +159,5 @@ pub fn fitting_hunk() -> ParsedDiff {
             hunk_header(2),
             ctx_line(2, 2),
         ],
-    }
+    )
 }

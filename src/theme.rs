@@ -41,6 +41,7 @@ pub fn bg_for(kind: LineKind) -> Color {
         LineKind::Added => BG_ADDED,
         LineKind::Removed => BG_REMOVED,
         LineKind::HunkHeader => BG_HUNK,
+        LineKind::FileHeader => Color::Reset,
         LineKind::Context => Color::Reset,
     }
 }

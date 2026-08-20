@@ -203,7 +203,6 @@ struct WorkerState {
     selected_path: Option<String>,
     ctx: u32,
     latest_request_seq: Seq,
-    next_seq: Seq,
     last_tree: Option<Tree>,
     last_error: Option<String>,
     last_stats: HashMap<String, (usize, usize)>,
@@ -212,6 +211,8 @@ struct WorkerState {
     floor_raised_at: Option<Instant>,
     /// Wall time of the last `git::changed_files` call, for adaptive floor.
     last_git_wall: Duration,
+    /// Cached branch state (ahead/behind vs base, unpushed vs upstream).
+    last_branch: git::BranchState,
 }
 
 impl WorkerState {
@@ -221,6 +222,9 @@ impl WorkerState {
         highlighter: Option<Highlighter>,
         initial_tree: Tree,
     ) -> Self {
+        // Compute once up front so the first worker snapshot already shows
+        // real branch state; later recomputes refresh it.
+        let initial_branch = git::branch_state(&rev);
         WorkerState {
             rev,
             empty,
@@ -228,27 +232,21 @@ impl WorkerState {
             selected_path: None,
             ctx: 3,
             latest_request_seq: 0,
-            next_seq: 1,
             last_tree: Some(initial_tree),
             last_error: None,
             last_stats: HashMap::new(),
             cache: LruCache::new(8),
             floor_raised_at: None,
             last_git_wall: Duration::ZERO,
+            last_branch: initial_branch,
         }
-    }
-
-    fn bump_seq(&mut self) -> Seq {
-        let s = self.next_seq;
-        self.next_seq = self.next_seq.saturating_add(1);
-        s
     }
 
     /// Send an initial empty-ish snapshot so the UI's first frame isn't blank
     /// while the first recompute is debouncing.
     fn send_initial(&mut self, tx: &Sender<ArcSnapshot>) {
         let tree = self.last_tree.clone().unwrap_or_else(|| Tree::build(Vec::new()));
-        let snap = self.snapshot(tree, None, Vec::new(), 0, self.last_error.clone());
+        let snap = self.snapshot(tree, None, Vec::new(), self.last_error.clone());
         let _ = tx.send(Arc::new(snap));
     }
 
@@ -259,22 +257,15 @@ impl WorkerState {
         tree: Tree,
         selected_diff: Option<ParsedDiff>,
         selected_highlight: Vec<Option<Vec<TokenOwned>>>,
-        highlight_truncated_at: usize,
         error: Option<String>,
     ) -> Snapshot {
         Snapshot {
-            rev: self.rev.clone(),
             empty: self.empty,
-            flat: tree.flatten(),
-            stats: self.last_stats.clone(),
-            selected_path: self.selected_path.clone(),
+            tree,
             selected_diff,
             selected_highlight,
-            highlight_truncated_at,
             error,
-            generated_at: Instant::now(),
-            seq: self.bump_seq(),
-            tree,
+            branch_state: self.last_branch.clone(),
         }
     }
 }
@@ -408,6 +399,7 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
         git::changed_files(&state.rev)
     };
     state.last_git_wall = t0.elapsed();
+    state.last_branch = git::branch_state(&state.rev);
 
     let entries = match entries {
         Ok(e) => e,
@@ -438,7 +430,7 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
     tree.annotate_stats(&stats);
     state.last_tree = Some(clone_tree(&tree));
 
-    let (selected_diff, selected_highlight, truncated_at) = {
+    let (selected_diff, selected_highlight) = {
         let rev = state.rev.clone();
         let empty = state.empty;
         let ctx = state.ctx;
@@ -447,7 +439,7 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
 
     state.last_stats = stats;
     state.last_error = None;
-    let snap = state.snapshot(tree, selected_diff, selected_highlight, truncated_at, None);
+    let snap = state.snapshot(tree, selected_diff, selected_highlight, None);
     let _ = tx.send(Arc::new(snap));
 }
 
@@ -457,25 +449,25 @@ fn send_error_snapshot(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
         .last_tree
         .clone()
         .unwrap_or_else(|| Tree::build(Vec::new()));
-    let snap = state.snapshot(tree, None, Vec::new(), 0, state.last_error.clone());
+    let snap = state.snapshot(tree, None, Vec::new(), state.last_error.clone());
     let _ = tx.send(Arc::new(snap));
 }
 
 /// Parse + highlight the currently-selected file's diff, if it's in the tree.
-/// Returns `(diff, highlight, truncated_at)`. On any error, `(None, vec![], 0)`.
+/// Returns `(diff, highlight)`. On any error, `(None, vec![])`.
 fn build_selected_diff(
     state: &mut WorkerState,
     tree: &Tree,
     rev: &str,
     empty: bool,
     ctx: u32,
-) -> (Option<ParsedDiff>, Vec<Option<Vec<TokenOwned>>>, usize) {
+) -> (Option<ParsedDiff>, Vec<Option<Vec<TokenOwned>>>) {
     let Some(path) = state.selected_path.clone() else {
-        return (None, Vec::new(), 0);
+        return (None, Vec::new());
     };
     let in_tree = tree.nodes.iter().any(|n| n.path == path);
     if !in_tree {
-        return (None, Vec::new(), 0);
+        return (None, Vec::new());
     }
     build_diff_for(&path, state, rev, empty, ctx)
 }
@@ -489,14 +481,10 @@ fn build_diff_for(
     rev: &str,
     empty: bool,
     ctx: u32,
-) -> (Option<ParsedDiff>, Vec<Option<Vec<TokenOwned>>>, usize) {
+) -> (Option<ParsedDiff>, Vec<Option<Vec<TokenOwned>>>) {
     let key = (path.to_string(), ctx);
     if let Some((parsed, hl)) = state.cache.get(&key) {
-        return (
-            Some(parsed.clone()),
-            hl.clone(),
-            0, // cached entries are always complete (never truncated)
-        );
+        return (Some(parsed.clone()), hl.clone());
     }
 
     let new_file = empty || git::is_untracked(path);
@@ -513,24 +501,37 @@ fn build_diff_for(
     match (raw, meta) {
         (Ok(raw), Ok(meta)) => {
             let mut parsed = diff::parse_diff(&raw, path, meta.status);
-            parsed.header.path = path.to_string();
-            parsed.header.added = meta.added;
-            parsed.header.deleted = meta.deleted;
-            parsed.header.old_path = meta.old_path;
-            parsed.header.rename_percent = meta.rename_percent;
-            parsed.header.mode_old = meta.mode_old;
-            parsed.header.mode_new = meta.mode_new;
-            parsed.header.binary = meta.binary;
-            let (hl, truncated_at) =
-                build_highlight(&parsed, path, &mut state.highlighter);
+            // Authoritative per-file metadata (numstat-based) applies only to a
+            // single-file diff; a directory diff carries per-file metadata
+            // parsed straight from its raw body.
+            if parsed.files.len() == 1 {
+                apply_file_meta(&mut parsed.header, &meta, path);
+                if let Some(f) = parsed.files.first_mut() {
+                    apply_file_meta(f, &meta, path);
+                }
+            }
+            let hl = build_highlight(&parsed, &mut state.highlighter);
             state.cache.put(key, (parsed.clone(), hl.clone()));
-            (Some(parsed), hl, truncated_at)
+            (Some(parsed), hl)
         }
         (Err(e), _) | (_, Err(e)) => {
             state.last_error = Some(e.to_string());
-            (None, Vec::new(), 0)
+            (None, Vec::new())
         }
     }
+}
+
+/// Override a parsed file header with the authoritative `git::FileMeta`.
+fn apply_file_meta(header: &mut diff::FileHeader, meta: &git::FileMeta, path: &str) {
+    header.path = path.to_string();
+    header.added = meta.added;
+    header.deleted = meta.deleted;
+    header.old_path = meta.old_path.clone();
+    header.rename_percent = meta.rename_percent;
+    header.mode_old = meta.mode_old;
+    header.mode_new = meta.mode_new;
+    header.binary = meta.binary;
+    header.status = meta.status;
 }
 
 /// Serve a `Request::Diff`: LRU hit → send a snapshot with the cached diff
@@ -540,57 +541,64 @@ fn serve_diff(state: &mut WorkerState, path: &str, ctx: u32, tx: &Sender<ArcSnap
     let cached = state.cache.get(&key).map(|(p, h)| (p.clone(), h.clone()));
 
     if let Some((parsed, hl)) = cached {
-        send_diff_snapshot(state, Some(parsed), hl, 0, tx);
+        send_diff_snapshot(state, Some(parsed), hl, tx);
     }
 
     // Fresh fetch (also repopulates the cache). If we sent a cached entry
     // above, this resend carries the up-to-date content ~150ms later.
     let rev = state.rev.clone();
     let empty = state.empty;
-    let (parsed, hl, truncated_at) = build_diff_for(path, state, &rev, empty, ctx);
-    send_diff_snapshot(state, parsed, hl, truncated_at, tx);
+    let (parsed, hl) = build_diff_for(path, state, &rev, empty, ctx);
+    send_diff_snapshot(state, parsed, hl, tx);
 }
 
 /// Assemble and send a snapshot whose only changed field vs the last full
-/// recompute is the selected diff (plus seq + error).
+/// recompute is the selected diff (plus error).
 fn send_diff_snapshot(
     state: &mut WorkerState,
     parsed: Option<ParsedDiff>,
     hl: Vec<Option<Vec<TokenOwned>>>,
-    truncated_at: usize,
     tx: &Sender<ArcSnapshot>,
 ) {
     let tree = state
         .last_tree
         .clone()
         .unwrap_or_else(|| Tree::build(Vec::new()));
-    let snap = state.snapshot(tree, parsed, hl, truncated_at, state.last_error.clone());
+    let snap = state.snapshot(tree, parsed, hl, state.last_error.clone());
     let _ = tx.send(Arc::new(snap));
 }
 
 /// Highlight a parsed diff's body lines up to `HIGHLIGHT_CAP`; lines past the
-/// cap get `None` (rendered uncolored). Returns `(highlight, truncated_at)`.
+/// cap get `None` (rendered uncolored). Each line is highlighted against its
+/// owning file's grammar; file-header rows are never colored.
 fn build_highlight(
     parsed: &ParsedDiff,
-    path: &str,
     highlighter: &mut Option<Highlighter>,
-) -> (Vec<Option<Vec<TokenOwned>>>, usize) {
+) -> Vec<Option<Vec<TokenOwned>>> {
     let total = parsed.lines.len();
     let cap = total.min(HIGHLIGHT_CAP);
     let mut out: Vec<Option<Vec<TokenOwned>>> = Vec::with_capacity(total);
 
     for line in parsed.lines.iter().take(cap) {
+        let file = parsed.sections.get(line.section).map(|s| s.file).unwrap_or(0);
+        let file_path = parsed.files.get(file).map(|f| f.path.as_str()).unwrap_or("");
+
         if line.kind == LineKind::HunkHeader {
+            let hunk_idx = parsed
+                .sections
+                .get(line.section)
+                .and_then(|s| s.hunk)
+                .unwrap_or(0);
             let section = parsed
-                .header
-                .hunks
-                .get(line.hunk_index)
+                .files
+                .get(file)
+                .and_then(|f| f.hunks.get(hunk_idx))
                 .and_then(|m| m.section.as_deref());
             match highlighter.as_mut() {
                 Some(h) => {
                     h.reset();
                     let tokens = match section {
-                        Some(sec) => h.line(path, sec),
+                        Some(sec) => h.line(file_path, sec),
                         None => Vec::new(),
                     };
                     out.push(Some(tokens));
@@ -599,15 +607,19 @@ fn build_highlight(
             }
             continue;
         }
+        if line.kind == LineKind::FileHeader {
+            out.push(Some(Vec::new()));
+            continue;
+        }
         match highlighter.as_mut() {
-            Some(h) => out.push(Some(h.line(path, &line.raw_text))),
+            Some(h) => out.push(Some(h.line(file_path, &line.raw_text))),
             None => out.push(Some(Vec::new())),
         }
     }
 
-    let truncated_at = if cap < total { cap } else { 0 };
+    // Lines past the cap stay `None` (rendered uncolored).
     out.resize(total, None);
-    (out, truncated_at)
+    out
 }
 
 /// Deep-clone a `Tree` (its nodes hold owned `Vec`s and `String`s).
@@ -718,10 +730,9 @@ mod tests {
     fn build_highlight_wraps_each_line_in_some() {
         let parsed = sample_parsed(3);
         let mut hl = Highlighter::new("Monokai Extended").ok();
-        let (out, truncated) = build_highlight(&parsed, "x.rs", &mut hl);
+        let out = build_highlight(&parsed, &mut hl);
         assert_eq!(out.len(), parsed.lines.len());
         assert!(out.iter().all(|e| e.is_some()));
-        assert_eq!(truncated, 0);
     }
 
     #[test]
@@ -731,7 +742,7 @@ mod tests {
             .map(|_| crate::diff::DiffLine {
                 kind: LineKind::Context,
                 raw_text: "x".into(),
-                hunk_index: 0,
+                section: 0,
                 word_runs: None,
             })
             .collect();
@@ -752,10 +763,31 @@ mod tests {
                     deleted: 1,
                 }],
             },
+            files: vec![crate::diff::FileHeader {
+                path: "x.rs".into(),
+                status: 'M',
+                added: 1,
+                deleted: 1,
+                old_path: None,
+                rename_percent: None,
+                mode_old: None,
+                mode_new: None,
+                binary: false,
+                hunks: vec![crate::diff::HunkMeta {
+                    section: None,
+                    added: 1,
+                    deleted: 1,
+                }],
+            }],
+            sections: vec![crate::diff::Section {
+                kind: crate::diff::SectionKind::File,
+                file: 0,
+                hunk: None,
+            }],
             lines,
         };
         let mut hl = Highlighter::new("Monokai Extended").ok();
-        let (out, truncated) = build_highlight(&parsed, "x.rs", &mut hl);
+        let out = build_highlight(&parsed, &mut hl);
         assert_eq!(out.len(), 2 * HIGHLIGHT_CAP);
         // First HIGHLIGHT_CAP entries are Some(...).
         assert!(out.iter().take(HIGHLIGHT_CAP).all(|e| e.is_some()));
@@ -764,6 +796,14 @@ mod tests {
             .iter()
             .skip(HIGHLIGHT_CAP)
             .all(|e| e.is_none()));
-        assert_eq!(truncated, HIGHLIGHT_CAP);
+    }
+
+    #[test]
+    fn worker_state_new_populates_branch() {
+        // This repo is a git repo, so the first worker state must already
+        // carry a branch name (the footer depends on it before any recompute).
+        let tree = Tree::build(Vec::new());
+        let state = WorkerState::new("main...HEAD".into(), false, None, tree);
+        assert!(state.last_branch.name.is_some());
     }
 }

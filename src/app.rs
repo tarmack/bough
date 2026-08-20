@@ -10,9 +10,9 @@ use std::collections::HashSet;
 
 use crossbeam_channel::Sender;
 
-use crate::diff::{self, LineKind, ParsedDiff};
+use crate::diff::ParsedDiff;
 use crate::highlight::TokenOwned;
-use crate::snapshot::{ArcSnapshot, Request, Seq, Snapshot};
+use crate::snapshot::{ArcSnapshot, Request, Seq};
 use crate::text::max_scroll_for;
 use crate::tree::{self, Tree};
 
@@ -85,12 +85,17 @@ impl App {
         let mut tree = snapshot.tree.clone();
         tree.expand_paths(&expanded_dirs);
         let flat = tree.flatten();
-        let selected_path = flat
-            .first()
-            .and_then(|&idx| {
-                let n = &tree.nodes[idx];
-                (n.kind == tree::Kind::File).then_some(n.path.clone())
-            });
+        // Select the first tree node (a directory or a file) so the diff pane
+        // renders something immediately on open. Empty repos have no base to
+        // diff a folder against, so pick the first file there.
+        let selected_path = flat.first().and_then(|&idx| {
+            let n = &tree.nodes[idx];
+            if n.kind == tree::Kind::Dir && snapshot.empty {
+                None
+            } else {
+                Some(n.path.clone())
+            }
+        });
         let mut app = App {
             snapshot,
             tree,
@@ -127,7 +132,7 @@ impl App {
     /// fallback when the path is gone), and re-anchors the diff scroll by hunk
     /// index so the view doesn't jump to the top on every save.
     pub fn apply_snapshot(&mut self, snap: ArcSnapshot) {
-        let old_hunk = self.top_visible_hunk_index();
+        let old_section = self.top_visible_section();
         let old_path = self.selected_path.clone();
 
         self.snapshot = snap;
@@ -143,42 +148,42 @@ impl App {
             .get(self.selection)
             .map(|&idx| self.tree.nodes[idx].path.clone());
 
-        // Re-anchor diff scroll by hunk index.
-        if let Some(hunk) = old_hunk {
-            self.reanchor_diff_scroll(hunk);
+        // Re-anchor diff scroll by section.
+        if let Some(section) = old_section {
+            self.reanchor_diff_scroll(section);
         } else {
             self.clamp_diff_scroll();
         }
     }
 
-    /// `hunk_index` of the topmost visible `@@` hunk header, or the first
-    /// visible line's hunk index — recorded before a snapshot swap so the view
+    /// Section of the topmost visible header (file or hunk), or the first
+    /// visible line's section — recorded before a snapshot swap so the view
     /// can follow it.
-    fn top_visible_hunk_index(&self) -> Option<usize> {
+    fn top_visible_section(&self) -> Option<usize> {
         let parsed = self.snapshot.selected_diff.as_ref()?;
         let visible = self.visible_line_indices();
         let start = self.diff_scroll;
         // Sticky pinned header first.
         if start > 0 {
             if let Some(&li) = visible.iter().take(start).rev().find(|&&li| {
-                parsed.lines[li].kind == LineKind::HunkHeader
+                parsed.lines[li].kind.is_header()
             }) {
-                return Some(parsed.lines[li].hunk_index);
+                return Some(parsed.lines[li].section);
             }
         }
-        visible.get(start).map(|&li| parsed.lines[li].hunk_index)
+        visible.get(start).map(|&li| parsed.lines[li].section)
     }
 
-    /// Scroll so the hunk header for `hunk` is at the top of the diff pane
-    /// after a snapshot swap; fall back to clamping when the hunk is gone.
-    fn reanchor_diff_scroll(&mut self, hunk: usize) {
+    /// Scroll so the header for `section` is at the top of the diff pane after
+    /// a snapshot swap; fall back to clamping when the section is gone.
+    fn reanchor_diff_scroll(&mut self, section: usize) {
         let Some(parsed) = self.snapshot.selected_diff.as_ref() else {
             self.diff_scroll = 0;
             return;
         };
         let visible = self.visible_line_indices();
         if let Some(pos) = visible.iter().position(|&li| {
-            parsed.lines[li].kind == LineKind::HunkHeader && parsed.lines[li].hunk_index == hunk
+            parsed.lines[li].kind.is_header() && parsed.lines[li].section == section
         }) {
             self.diff_scroll = pos + 1;
         }
@@ -217,12 +222,8 @@ impl App {
         self.snapshot.error.as_deref()
     }
 
-    pub fn rev(&self) -> &str {
-        &self.snapshot.rev
-    }
-
-    pub fn empty(&self) -> bool {
-        self.snapshot.empty
+    pub fn branch_state(&self) -> &crate::git::BranchState {
+        &self.snapshot.branch_state
     }
 
     // ── Selection / navigation ──────────────────────────────────────────
@@ -238,10 +239,7 @@ impl App {
         self.collapsed_hunks.clear();
         self.context_lines = 3;
         self.diff_scroll = 0;
-        self.active_chunk = if self
-            .parsed()
-            .is_some_and(|p| !p.header.hunks.is_empty())
-        {
+        self.active_chunk = if self.parsed().is_some_and(|p| !p.sections.is_empty()) {
             Some(0)
         } else {
             None
@@ -339,29 +337,58 @@ impl App {
             == 0
     }
 
-    /// Move the active-chunk selection by `delta` chunks (clamped). Used when the
-    /// diff fits in the pane (no scrolling possible) so selection still moves.
+    /// Move the active-section selection by `delta` sections (clamped to the
+    /// currently visible headers). Used when the diff fits in the pane (no
+    /// scrolling possible) so selection still moves across files and hunks,
+    /// skipping any folded-away sections.
     pub fn move_active_chunk(&mut self, delta: i32) {
-        let max = self
-            .parsed()
-            .map_or(0usize, |p| p.header.hunks.len().saturating_sub(1));
-        let cur = self.active_chunk.unwrap_or(0) as i32;
-        let next = (cur + delta).clamp(0, max as i32) as usize;
-        self.active_chunk = Some(next);
+        let headers = self.visible_headers();
+        if headers.is_empty() {
+            return;
+        }
+        let cur_pos = self.active_chunk.and_then(|s| headers.iter().position(|&h| h == s));
+        let next_pos = match cur_pos {
+            Some(p) => (p as i32 + delta).clamp(0, headers.len() as i32 - 1) as usize,
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    headers.len() - 1
+                }
+            }
+        };
+        self.active_chunk = Some(headers[next_pos]);
     }
 
-    /// Move the chunk cursor by `delta`: jump to the adjacent chunk when its
-    /// header is already in view, otherwise scroll one line in the direction.
-    /// Scrolling activates a chunk as soon as its header line enters the view.
+    /// Move the section cursor by `delta`: jump to the adjacent section (file
+    /// or hunk) when its header is already in view, otherwise scroll one line
+    /// in the direction. Scrolling activates a section as soon as its header
+    /// line enters the view. Sections folded away (a collapsed file's hunks)
+    /// are skipped so the cursor moves to the next actually-visible header.
     pub fn navigate_chunk(&mut self, delta: i32) {
         if let Some(cur) = self.active_chunk {
             let dest = cur as i32 + delta;
             let in_range = self
                 .parsed()
-                .is_some_and(|p| dest >= 0 && (dest as usize) < p.header.hunks.len());
-            if in_range && self.chunk_header_in_view(dest as usize) {
-                self.active_chunk = Some(dest as usize);
-                return;
+                .is_some_and(|p| dest >= 0 && (dest as usize) < p.sections.len());
+            if in_range {
+                let dest = dest as usize;
+                if self.chunk_header_in_view(dest) {
+                    self.active_chunk = Some(dest);
+                    return;
+                }
+                // The adjacent section may be hidden by a folded file. Jump to the
+                // nearest visible header rather than scrolling (which would do
+                // nothing), and snap it into view so the selection is always
+                // visible.
+                if !self.visible_headers().contains(&dest) {
+                    if let Some(next) = self.nearest_visible_header(dest, delta) {
+                        if next != cur {
+                            self.snap_view_to_chunk(next);
+                            return;
+                        }
+                    }
+                }
             }
         }
         let before = self.diff_scroll;
@@ -380,32 +407,66 @@ impl App {
         };
         if let Some(li) = entered {
             if let Some(parsed) = self.parsed() {
-                if parsed.lines[li].kind == LineKind::HunkHeader {
-                    self.active_chunk = Some(parsed.lines[li].hunk_index);
+                if parsed.lines[li].kind.is_header() {
+                    self.active_chunk = Some(parsed.lines[li].section);
                 }
             }
         }
     }
 
-    /// Whether `chunk`'s hunk header is currently visible (in-flow window or the
+    /// Sections of the header lines currently visible (in document order).
+    fn visible_headers(&self) -> Vec<usize> {
+        let Some(parsed) = self.parsed() else {
+            return Vec::new();
+        };
+        self.visible_line_indices()
+            .iter()
+            .filter(|&&li| parsed.lines[li].kind.is_header())
+            .map(|&li| parsed.lines[li].section)
+            .collect()
+    }
+
+    /// Nearest visible header section in direction `delta` from `from` (the
+    /// first visible section after it when going down, before it going up).
+    fn nearest_visible_header(&self, from: usize, delta: i32) -> Option<usize> {
+        let headers = self.visible_headers();
+        if delta > 0 {
+            headers
+                .iter()
+                .find(|&&h| h > from)
+                .copied()
+                .or_else(|| headers.last().copied())
+        } else {
+            headers
+                .iter()
+                .rev()
+                .find(|&&h| h < from)
+                .copied()
+                .or_else(|| headers.first().copied())
+        }
+    }
+
+    /// Whether `section`'s header is currently visible (in-flow window or the
     /// pinned sticky top header).
-    fn chunk_header_in_view(&self, chunk: usize) -> bool {
+    fn chunk_header_in_view(&self, section: usize) -> bool {
         let Some(parsed) = self.parsed() else {
             return false;
         };
         let visible = self.visible_line_indices();
-        let start = self.diff_scroll;
-        let end = start.saturating_add(self.diff_page_size());
+        if visible.is_empty() {
+            return false;
+        }
+        let start = self.diff_scroll.min(visible.len());
+        let end = start.saturating_add(self.diff_page_size()).min(visible.len());
         let sticky = visible.iter().take(start).rev().find_map(|&li| {
-            (parsed.lines[li].kind == LineKind::HunkHeader).then_some(parsed.lines[li].hunk_index)
+            (parsed.lines[li].kind.is_header()).then_some(parsed.lines[li].section)
         });
-        if sticky == Some(chunk) {
+        if sticky == Some(section) {
             return true;
         }
-        let in_flow = visible[start..end.min(visible.len())].iter().any(|&li| {
-            parsed.lines[li].kind == LineKind::HunkHeader && parsed.lines[li].hunk_index == chunk
-        });
-        in_flow
+        visible[start..end].iter().any(|&li| {
+            parsed.lines[li].kind.is_header() && parsed.lines[li].section == section
+        })
     }
 
     /// `parsed.lines` index of the top rendered body line: the sticky header if
@@ -419,7 +480,7 @@ impl App {
                 .iter()
                 .take(start)
                 .rev()
-                .find(|&&li| parsed.lines[li].kind == LineKind::HunkHeader)
+                .find(|&&li| parsed.lines[li].kind.is_header())
             {
                 return Some(*li);
             }
@@ -470,11 +531,26 @@ impl App {
             .lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| {
-                l.kind == LineKind::HunkHeader || !self.collapsed_hunks.contains(&l.hunk_index)
-            })
+            .filter(|(_, l)| self.line_visible(parsed, l))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Whether a body line is hidden because its section (or owning file
+    /// section) is collapsed. Header rows stay visible — a collapsed file or
+    /// hunk shows its header with a fold arrow — while their bodies fold.
+    fn line_visible(&self, parsed: &ParsedDiff, l: &crate::diff::DiffLine) -> bool {
+        let s = l.section;
+        let file_sec = parsed.file_section_for(s);
+        let file_hidden = file_sec.is_some_and(|fs| self.collapsed_hunks.contains(&fs));
+        if file_hidden && !(l.kind.is_header() && file_sec == Some(s)) {
+            // The file is folded; keep only its own header row.
+            return false;
+        }
+        if l.kind.is_header() {
+            return true;
+        }
+        !self.collapsed_hunks.contains(&s)
     }
 
     pub fn clamp_diff_scroll(&mut self) {
@@ -482,35 +558,35 @@ impl App {
         self.diff_scroll = self.diff_scroll.min(max);
     }
 
-    pub fn collapse_hunk(&mut self, hunk: usize) {
-        self.collapsed_hunks.insert(hunk);
-        self.snap_view_to_chunk(hunk);
+    pub fn collapse_hunk(&mut self, section: usize) {
+        self.collapsed_hunks.insert(section);
+        self.snap_view_to_chunk(section);
     }
 
-    pub fn expand_hunk(&mut self, hunk: usize) {
-        self.collapsed_hunks.remove(&hunk);
+    pub fn expand_hunk(&mut self, section: usize) {
+        self.collapsed_hunks.remove(&section);
         self.clamp_diff_scroll();
     }
 
-    pub fn toggle_hunk(&mut self, hunk: usize) {
-        if self.collapsed_hunks.contains(&hunk) {
-            self.expand_hunk(hunk);
+    pub fn toggle_hunk(&mut self, section: usize) {
+        if self.collapsed_hunks.contains(&section) {
+            self.expand_hunk(section);
         } else {
-            self.collapse_hunk(hunk);
+            self.collapse_hunk(section);
         }
     }
 
-    fn snap_view_to_chunk(&mut self, hunk: usize) {
+    fn snap_view_to_chunk(&mut self, section: usize) {
         let Some(parsed) = self.parsed() else {
             return;
         };
         let visible = self.visible_line_indices();
         if let Some(pos) = visible.iter().position(|&li| {
-            parsed.lines[li].kind == LineKind::HunkHeader && parsed.lines[li].hunk_index == hunk
+            parsed.lines[li].kind.is_header() && parsed.lines[li].section == section
         }) {
             self.diff_scroll = pos + 1;
         }
-        self.active_chunk = Some(hunk);
+        self.active_chunk = Some(section);
         self.clamp_diff_scroll();
     }
 
@@ -522,7 +598,7 @@ impl App {
         let win = self.diff_page_size();
         if let Some(last) = visible
             .iter()
-            .rposition(|&li| parsed.lines[li].hunk_index == dest)
+            .rposition(|&li| parsed.lines[li].section == dest)
         {
             self.diff_scroll = last.saturating_sub(win.saturating_sub(1));
         }
@@ -535,27 +611,25 @@ impl App {
     }
 
     pub fn go_last_chunk(&mut self) {
-        let max = self
-            .parsed()
-            .map_or(0, |p| p.header.hunks.len().saturating_sub(1));
+        let max = self.parsed().map_or(0, |p| p.sections.len().saturating_sub(1));
         self.snap_view_to_chunk(max);
     }
 
     pub fn go_chunk_start(&mut self) {
-        if let Some(hunk) = self.active_chunk {
-            self.snap_view_to_chunk(hunk);
+        if let Some(section) = self.active_chunk {
+            self.snap_view_to_chunk(section);
         }
     }
 
     pub fn go_chunk_end(&mut self) {
-        if let Some(hunk) = self.active_chunk {
-            self.enter_chunk_from_bottom(hunk);
+        if let Some(section) = self.active_chunk {
+            self.enter_chunk_from_bottom(section);
         }
     }
 
     pub fn toggle_hunk_at_cursor(&mut self) {
-        if let Some(hunk) = self.active_chunk {
-            self.toggle_hunk(hunk);
+        if let Some(section) = self.active_chunk {
+            self.toggle_hunk(section);
         }
     }
 
@@ -570,25 +644,25 @@ impl App {
         let start = self.diff_scroll;
         let line_idx = if let Some(sticky) = self.sticky_line {
             if body_row == 0 {
-                return parsed.lines.get(sticky).map(|l| l.hunk_index);
+                return parsed.lines.get(sticky).map(|l| l.section);
             }
             visible.get(start + body_row - 1).copied()
         } else {
             visible.get(start + body_row).copied()
         }?;
         let line = parsed.lines.get(line_idx)?;
-        (line.kind == LineKind::HunkHeader).then_some(line.hunk_index)
+        (line.kind.is_header()).then_some(line.section)
     }
 
     pub fn open_hunk_at_cursor(&mut self) {
-        if let Some(hunk) = self.active_chunk {
-            self.expand_hunk(hunk);
+        if let Some(section) = self.active_chunk {
+            self.expand_hunk(section);
         }
     }
 
     pub fn close_hunk_at_cursor(&mut self) {
-        if let Some(hunk) = self.active_chunk {
-            self.collapse_hunk(hunk);
+        if let Some(section) = self.active_chunk {
+            self.collapse_hunk(section);
         }
     }
 
@@ -599,7 +673,7 @@ impl App {
 
     pub fn collapse_all_hunks(&mut self) {
         if let Some(parsed) = self.parsed() {
-            self.collapsed_hunks = (0..parsed.header.hunks.len()).collect();
+            self.collapsed_hunks = (0..parsed.sections.len()).collect();
         }
         self.clamp_diff_scroll();
     }
@@ -745,8 +819,8 @@ mod tests {
 
     #[test]
     fn navigate_chunk_scrolls_when_off_screen() {
-        let parsed = ParsedDiff {
-            header: FileHeader {
+        let parsed = single_parsed(
+            FileHeader {
                 path: "x.rs".into(),
                 status: 'M',
                 added: 1,
@@ -764,12 +838,12 @@ mod tests {
                     })
                     .collect(),
             },
-            lines: std::iter::once(hunk_header(0))
+            std::iter::once(hunk_header(0))
                 .chain((0..10).map(|i| ctx_line(i, 0)))
                 .chain(std::iter::once(hunk_header(1)))
                 .chain(std::iter::once(ctx_line(10, 1)))
                 .collect(),
-        };
+        );
         let mut app = app_with_diff(parsed);
         app.focus = Focus::Diff;
         app.height = 3;
@@ -799,8 +873,8 @@ mod tests {
 
     #[test]
     fn up_scrolls_smoothly() {
-        let parsed = ParsedDiff {
-            header: FileHeader {
+        let parsed = single_parsed(
+            FileHeader {
                 path: "x.rs".into(),
                 status: 'M',
                 added: 1,
@@ -818,7 +892,7 @@ mod tests {
                     })
                     .collect(),
             },
-            lines: vec![
+            vec![
                 hunk_header(0),
                 ctx_line(0, 0),
                 hunk_header(1),
@@ -834,7 +908,7 @@ mod tests {
                 ctx_line(9, 2),
                 ctx_line(10, 2),
             ],
-        };
+        );
         let mut app = app_with_diff(parsed);
         app.focus = Focus::Diff;
         app.height = 3;
@@ -866,8 +940,8 @@ mod tests {
 
     #[test]
     fn scroll_activates_header_when_enters() {
-        let parsed = ParsedDiff {
-            header: FileHeader {
+        let parsed = single_parsed(
+            FileHeader {
                 path: "x.rs".into(),
                 status: 'M',
                 added: 1,
@@ -885,7 +959,7 @@ mod tests {
                     })
                     .collect(),
             },
-            lines: vec![
+            vec![
                 hunk_header(0),
                 ctx_line(0, 0),
                 ctx_line(1, 0),
@@ -893,7 +967,7 @@ mod tests {
                 ctx_line(2, 1),
                 ctx_line(3, 1),
             ],
-        };
+        );
         let mut app = app_with_diff(parsed);
         app.focus = Focus::Diff;
         app.height = 5;
@@ -951,5 +1025,181 @@ mod tests {
         app.apply_snapshot(sample_snapshot(tree2));
         let src_idx = app.flat[0];
         assert!(!app.tree.nodes[src_idx].expanded);
+    }
+
+    #[test]
+    fn navigate_skips_collapsed_file_sections() {
+        // A two-file folder diff: File sections 0 and 2, hunk sections 1 and 3.
+        let mk = |path: &str| crate::diff::FileHeader {
+            path: path.into(),
+            status: 'M',
+            added: 1,
+            deleted: 0,
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: false,
+            hunks: vec![HunkMeta {
+                section: None,
+                added: 1,
+                deleted: 0,
+            }],
+        };
+        let mut app = sample_app();
+        app.snapshot = snapshot_with_diff(ParsedDiff {
+            header: mk("src"),
+            files: vec![mk("src/a.rs"), mk("src/b.rs")],
+            sections: vec![
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::File,
+                    file: 0,
+                    hunk: None,
+                },
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::Hunk,
+                    file: 0,
+                    hunk: Some(0),
+                },
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::File,
+                    file: 1,
+                    hunk: None,
+                },
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::Hunk,
+                    file: 1,
+                    hunk: Some(0),
+                },
+            ],
+            lines: vec![
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::FileHeader,
+                    raw_text: "src/a.rs".into(),
+                    section: 0,
+                    word_runs: None,
+                },
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::HunkHeader,
+                    raw_text: "@@".into(),
+                    section: 1,
+                    word_runs: None,
+                },
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::FileHeader,
+                    raw_text: "src/b.rs".into(),
+                    section: 2,
+                    word_runs: None,
+                },
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::HunkHeader,
+                    raw_text: "@@".into(),
+                    section: 3,
+                    word_runs: None,
+                },
+            ],
+        });
+        app.active_chunk = Some(0); // File 0's header
+        app.height = 20;
+        app.last_header_height = 1;
+
+        // Collapse file 0: its hunk (section 1) disappears.
+        app.collapse_hunk(0);
+
+        // Moving down from the collapsed file must land on the next visible
+        // section (file 1, section 2), not the folded-away hunk.
+        app.navigate_chunk(1);
+        assert_eq!(app.active_chunk, Some(2));
+
+        // The same holds for the no-scroll path.
+        app.active_chunk = Some(0);
+        app.move_active_chunk(1);
+        assert_eq!(app.active_chunk, Some(2));
+    }
+
+    #[test]
+    fn navigate_up_brings_collapsed_file_into_view() {
+        // Two-file folder diff; file 0 (sections 0, 1) is collapsed.
+        let mk = |path: &str| crate::diff::FileHeader {
+            path: path.into(),
+            status: 'M',
+            added: 1,
+            deleted: 0,
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: false,
+            hunks: vec![HunkMeta {
+                section: None,
+                added: 1,
+                deleted: 0,
+            }],
+        };
+        let mut app = sample_app();
+        app.snapshot = snapshot_with_diff(ParsedDiff {
+            header: mk("src"),
+            files: vec![mk("src/a.rs"), mk("src/b.rs")],
+            sections: vec![
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::File,
+                    file: 0,
+                    hunk: None,
+                },
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::Hunk,
+                    file: 0,
+                    hunk: Some(0),
+                },
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::File,
+                    file: 1,
+                    hunk: None,
+                },
+                crate::diff::Section {
+                    kind: crate::diff::SectionKind::Hunk,
+                    file: 1,
+                    hunk: Some(0),
+                },
+            ],
+            lines: vec![
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::FileHeader,
+                    raw_text: "src/a.rs".into(),
+                    section: 0,
+                    word_runs: None,
+                },
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::HunkHeader,
+                    raw_text: "@@".into(),
+                    section: 1,
+                    word_runs: None,
+                },
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::FileHeader,
+                    raw_text: "src/b.rs".into(),
+                    section: 2,
+                    word_runs: None,
+                },
+                crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::HunkHeader,
+                    raw_text: "@@".into(),
+                    section: 3,
+                    word_runs: None,
+                },
+            ],
+        });
+        app.height = 2;
+        app.last_header_height = 1;
+        app.collapse_hunk(0); // Fold file 0; its header stays visible.
+        // Select file 1 and scroll it to the bottom so file 0's header is
+        // above the viewport.
+        app.active_chunk = Some(2);
+        app.diff_scroll = usize::MAX;
+
+        // Moving up must land on file 0 and bring its header into view.
+        app.navigate_chunk(-1);
+        assert_eq!(app.active_chunk, Some(0));
+        assert!(app.chunk_header_in_view(0), "file 0 header must be visible");
     }
 }

@@ -35,10 +35,13 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     app.height = body_height as usize;
 
     let diff = ratatui::layout::Rect::new(area.x, area.y, diff_w, body_height);
-    let tree = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y, tree_w, body_height);
+    let tree_h = body_height.saturating_sub(1);
+    let tree = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y, tree_w, tree_h);
+    let tree_footer = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y + tree_h, tree_w, 1);
 
     diff::render_diff(f, app, diff);
     tree::render_tree(f, app, tree);
+    tree::render_branch_footer(f, app, tree_footer);
 
     if let Some(msg) = status {
         let y = area.y + body_height;

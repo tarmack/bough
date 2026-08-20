@@ -55,17 +55,95 @@ pub fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().bg(row_bg),
         );
 
-        match &stat {
-            Some(s) => {
-                let sw = s.width() as u16;
-                let left_w = area.width.saturating_sub(sw).saturating_sub(1);
-                f.buffer_mut().set_line(area.x, y, &left, left_w);
-                let sx = area.x + area.width.saturating_sub(sw);
-                f.buffer_mut().set_line(sx, y, s, sw);
+        draw_aligned(f, area.x, y, area.width, &left, stat.as_ref());
+    }
+}
+
+/// Render the branch-state footer row at the bottom of the tree pane. Shows
+/// the current branch, its divergence from the base ref, and unpushed commits
+/// vs the upstream. Renders nothing when the area is too narrow or the branch
+/// state is empty (initial frame before the first worker snapshot).
+pub fn render_branch_footer(f: &mut Frame, app: &App, area: Rect) {
+    if area.width < 8 || area.height < 1 {
+        return;
+    }
+    let state = app.branch_state();
+    if state.name.is_none() && state.unpushed.is_none() && state.base.is_none() {
+        return;
+    }
+
+    let mut left: Vec<Span<'static>> = Vec::new();
+
+    match &state.name {
+        Some(name) => {
+            left.push(Span::styled(
+                format!("\u{e0a5} {name} "),
+                Style::default().fg(theme::DIR_FG),
+            ));
+        }
+        None => {
+            left.push(Span::styled(
+                "(detached) ",
+                Style::default().fg(theme::DIR_FG),
+            ));
+        }
+    }
+
+    if let (Some(a), Some(b)) = (state.ahead, state.behind) {
+            if a > 0 {
+                left.push(Span::styled(
+                    format!("\u{2191}{a} "),
+                    Style::default().fg(Color::Green),
+                ));
             }
-            None => {
-                f.buffer_mut().set_line(area.x, y, &left, area.width);
+            if b > 0 {
+                left.push(Span::styled(
+                    format!("\u{2193}{b} "),
+                    Style::default().fg(Color::Red),
+                ));
             }
+        }
+
+    if let Some(u) = state.unpushed {
+        left.push(Span::styled(
+            format!("\u{f06a}{u} "),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    let left = Line::from(left);
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if let Some(base) = state.base.as_deref() {
+        right.push(Span::styled(
+            base.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let right = Line::from(right);
+
+    draw_aligned(f, area.x, area.y, area.width, &left, Some(&right));
+}
+
+/// Draw `left` left-aligned at the pane origin and `right` right-aligned at
+/// the pane's right edge, leaving one separating cell, over `width` columns.
+/// When `right` is `None`, `left` spans the full width.
+fn draw_aligned(
+    f: &mut Frame,
+    x: u16,
+    y: u16,
+    width: u16,
+    left: &Line,
+    right: Option<&Line>,
+) {
+    match right {
+        Some(r) => {
+            let rw = r.width() as u16;
+            let left_w = width.saturating_sub(rw).saturating_sub(1);
+            f.buffer_mut().set_line(x, y, left, left_w);
+            f.buffer_mut().set_line(x + width.saturating_sub(rw), y, r, rw);
+        }
+        None => {
+            f.buffer_mut().set_line(x, y, left, width);
         }
     }
 }
@@ -127,8 +205,9 @@ fn tree_left(app: &App, node_idx: usize, bg: Color) -> Line<'static> {
 }
 
 /// File-type glyph for a tree row, chosen by extension (Nerd Font glyphs).
-/// Unknown extensions fall back to a generic file icon.
-fn file_icon(name: &str) -> &'static str {
+/// Unknown extensions fall back to a generic file icon. Shared with the diff
+/// header rows, which show the same icon for a file and its hunks.
+pub(crate) fn file_icon(name: &str) -> &'static str {
     match name.rsplit('.').next().unwrap_or("") {
         "rs" => "\u{e7a8}",                             // rust
         "toml" | "yaml" | "yml" | "json" => "\u{e615}", // config gear
@@ -170,6 +249,7 @@ fn stat_line(node: &TreeNode, bg: Color) -> Option<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::app::App;
     use crate::test_support::*;
     use ratatui::backend::TestBackend;
@@ -191,5 +271,25 @@ mod tests {
         terminal.draw(|f| super::super::ui(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         assert_eq!(buf.cell((54, 0)).unwrap().bg, Color::Rgb(0x34, 0x35, 0x2f));
+    }
+
+    #[test]
+    fn branch_footer_renders() {
+        let mut snap = sample_snapshot(crate::tree::Tree::build(vec![('M', "x.rs".to_string())]));
+        Arc::get_mut(&mut snap).unwrap().branch_state = crate::git::BranchState {
+            name: Some("feature/x".into()),
+            base: Some("main".into()),
+            ahead: Some(3),
+            behind: Some(0),
+            upstream: Some("origin/feature/x".into()),
+            unpushed: Some(2),
+        };
+        let mut app = App::new(snap, crossbeam_channel::bounded::<crate::snapshot::Request>(4).0, false);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| super::super::ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf.cell((54, 23)).unwrap().symbol(), "\u{e0a5}");
+        assert_eq!(buf.cell((57, 23)).unwrap().symbol(), "e");
     }
 }

@@ -228,7 +228,7 @@ fn focus_key(key: KeyEvent, app: &mut App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{FileHeader, HunkMeta, ParsedDiff};
+    use crate::diff::{FileHeader, HunkMeta};
     use crate::test_support::*;
     use ratatui::backend::TestBackend;
 
@@ -405,8 +405,8 @@ mod tests {
         let mut app = sample_app();
         app.focus = Focus::Diff;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: FileHeader {
+        app.snapshot = snapshot_with_diff(single_parsed(
+            FileHeader {
                 path: "x.rs".into(),
                 status: 'M',
                 added: 1,
@@ -422,27 +422,27 @@ mod tests {
                     deleted: 0,
                 }],
             },
-            lines: vec![
+            vec![
                 crate::diff::DiffLine {
                     kind: crate::diff::LineKind::HunkHeader,
                     raw_text: "@@ -1 +1 @@".into(),
-                    hunk_index: 0,
+                    section: 0,
                     word_runs: None,
                 },
                 crate::diff::DiffLine {
                     kind: crate::diff::LineKind::Added,
                     raw_text: "foo".into(),
-                    hunk_index: 0,
+                    section: 0,
                     word_runs: None,
                 },
                 crate::diff::DiffLine {
                     kind: crate::diff::LineKind::Added,
                     raw_text: "bar".into(),
-                    hunk_index: 0,
+                    section: 0,
                     word_runs: None,
                 },
             ],
-        });
+        ));
         app.active_chunk = Some(0);
 
         assert!(!handle_key(
@@ -508,10 +508,10 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: header_full(None, None),
-            lines: vec![hunk_header(0), ctx_line(0, 0)],
-        });
+        app.snapshot = snapshot_with_diff(single_parsed(
+            header_full(None, None),
+            vec![hunk_header(0), ctx_line(0, 0)],
+        ));
         app.active_chunk = Some(0);
         assert!(app.collapsed_hunks.is_empty());
 
@@ -534,10 +534,10 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: header_full(None, None),
-            lines: vec![hunk_header(0), ctx_line(0, 0)],
-        });
+        app.snapshot = snapshot_with_diff(single_parsed(
+            header_full(None, None),
+            vec![hunk_header(0), ctx_line(0, 0)],
+        ));
         app.active_chunk = Some(0);
 
         assert!(!handle_key(
@@ -570,10 +570,10 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: header_full(None, None),
-            lines: vec![hunk_header(0), ctx_line(0, 0)],
-        });
+        app.snapshot = snapshot_with_diff(single_parsed(
+            header_full(None, None),
+            vec![hunk_header(0), ctx_line(0, 0)],
+        ));
         app.active_chunk = Some(0);
 
         app.collapsed_hunks.insert(0);
@@ -607,8 +607,8 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: crate::diff::FileHeader {
+        app.snapshot = snapshot_with_diff(single_parsed(
+            crate::diff::FileHeader {
                 path: "x.rs".into(),
                 status: 'M',
                 added: 1,
@@ -631,13 +631,13 @@ mod tests {
                     },
                 ],
             },
-            lines: vec![
+            vec![
                 hunk_header(0),
                 ctx_line(0, 0),
                 hunk_header(1),
                 ctx_line(1, 1),
             ],
-        });
+        ));
         assert!(app.collapsed_hunks.is_empty());
 
         // zM closes all hunks.
@@ -691,15 +691,15 @@ mod tests {
         let mut app = sample_app();
         app.focus = Focus::Diff;
         app.selected_path = Some("x.rs".into());
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: header_full(None, None),
-            lines: vec![
+        app.snapshot = snapshot_with_diff(single_parsed(
+            header_full(None, None),
+            vec![
                 hunk_header(0),
                 ctx_line(0, 0),
                 ctx_line(1, 0),
                 ctx_line(2, 0),
             ],
-        });
+        ));
 
         // Render once so height/diff_width/last_header_height/sticky_line fill in.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -773,9 +773,9 @@ mod tests {
         let mut app = sample_app();
         app.focus = Focus::Diff;
         // Tall expanded chunk 0 (header + 5 ctx) then chunk 1.
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: header_full(None, None),
-            lines: vec![
+        app.snapshot = snapshot_with_diff(single_parsed(
+            header_full(None, None),
+            vec![
                 hunk_header(0),
                 ctx_line(0, 0),
                 ctx_line(1, 0),
@@ -785,7 +785,7 @@ mod tests {
                 hunk_header(1),
                 ctx_line(5, 1),
             ],
-        });
+        ));
         app.height = 3;
         app.last_header_height = 1;
         app.active_chunk = Some(0);
@@ -851,8 +851,8 @@ mod tests {
         app.last_header_height = 1;
         app.diff_scroll = 0;
         app.active_chunk = Some(0);
-        app.snapshot = snapshot_with_diff(ParsedDiff {
-            header: crate::diff::FileHeader {
+        app.snapshot = snapshot_with_diff(single_parsed(
+            crate::diff::FileHeader {
                 path: "x.rs".into(),
                 status: 'M',
                 added: 10,
@@ -868,10 +868,10 @@ mod tests {
                     deleted: 0,
                 }],
             },
-            lines: std::iter::once(hunk_header(0))
+            std::iter::once(hunk_header(0))
                 .chain((0..10).map(|i| ctx_line(i, 0)))
                 .collect(),
-        });
+        ));
         assert!(!app.diff_fits());
 
         assert!(!handle_key(

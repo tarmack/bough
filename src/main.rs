@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
 use clap::Parser;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -120,20 +119,13 @@ fn main() -> io::Result<()> {
 
     let mut tree = Tree::build(entries);
     tree.annotate_stats(&stats);
-    let flat = tree.flatten();
 
     let initial_snapshot: ArcSnapshot = Arc::new(Snapshot {
-        rev: revision.clone(),
         empty,
-        flat,
-        stats,
-        selected_path: None,
         selected_diff: None,
         selected_highlight: Vec::new(),
-        highlight_truncated_at: 0,
         error: None,
-        generated_at: Instant::now(),
-        seq: 0,
+        branch_state: crate::git::BranchState::default(),
         tree,
     });
 
