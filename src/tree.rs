@@ -125,7 +125,7 @@ fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
                 String::new()
             },
             children: Vec::new(),
-            expanded: false,
+            expanded: true,
             depth,
             added: 0,
             deleted: 0,
@@ -244,8 +244,10 @@ mod tests {
         let tree = Tree::build(entries());
         // root -> src (dir) and README.md (file)
         assert_eq!(tree.nodes[tree.root].children.len(), 2);
+        // Directories default expanded, so the full subtree is visible.
         let flat = tree.flatten();
-        assert_eq!(flat.len(), 2); // `src` and `README.md`, root omitted
+        assert_eq!(flat.len(), 5); // src, core, mod.rs, new.rs, README.md
+        assert_eq!(flat[0], tree.nodes[tree.root].children[0]);
     }
 
     #[test]
@@ -257,19 +259,30 @@ mod tests {
     }
 
     #[test]
-    fn expand_reveals_children() {
+    fn directories_default_expanded() {
+        let tree = Tree::build(entries());
+        let src_idx = tree.nodes[tree.root].children[0];
+        assert!(tree.nodes[src_idx].expanded);
+        // Full subtree visible without any manual expand.
+        assert_eq!(tree.flatten().len(), 5);
+    }
+
+    #[test]
+    fn collapse_hides_children_and_expand_restores() {
         let mut tree = Tree::build(entries());
         let src_idx = tree.nodes[tree.root].children[0];
-        tree.nodes[src_idx].expanded = true;
+        let core_idx = tree.nodes[src_idx].children[0];
+        assert!(tree.nodes[core_idx].expanded);
+
+        // Collapse src: its whole subtree hides.
+        tree.nodes[src_idx].expanded = false;
         let flat = tree.flatten();
-        // src, then its (still collapsed) child `core`, then README.md
-        assert_eq!(flat.len(), 3);
+        assert_eq!(flat.len(), 2); // src, README.md
         assert_eq!(flat[0], src_idx);
 
-        let core_idx = tree.nodes[src_idx].children[0];
-        tree.nodes[core_idx].expanded = true;
+        // Re-expand src: children return (core stays expanded).
+        tree.nodes[src_idx].expanded = true;
         let flat = tree.flatten();
-        // src, core, mod.rs, new.rs, README.md
-        assert_eq!(flat.len(), 5);
+        assert_eq!(flat.len(), 5); // src, core, mod.rs, new.rs, README.md
     }
 }
