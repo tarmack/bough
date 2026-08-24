@@ -24,7 +24,6 @@ mod view;
 mod watch;
 mod worker;
 
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,7 +65,10 @@ fn main() -> io::Result<()> {
         std::process::exit(0);
     }
 
-    if let Err(HighlightError::UnknownTheme { requested, available }) = Highlighter::new(&cli.theme)
+    if let Err(HighlightError::UnknownTheme {
+        requested,
+        available,
+    }) = Highlighter::new(&cli.theme)
     {
         eprintln!("bough: unknown theme {requested:?}. Available:");
         for t in available {
@@ -84,60 +86,36 @@ fn main() -> io::Result<()> {
         git::RepoState::Ready => false,
     };
 
-    let revision = resolve_revision(cli.revision.clone());
+    let default = git::default_branch();
+    let revision = resolve_revision(cli.revision.clone(), default.clone());
 
-    let entries = if empty {
-        match git::listing_empty() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("bough: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match git::changed_files(&revision) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("bough: {e}");
-                std::process::exit(1);
-            }
-        }
-    };
-
-    let stats: HashMap<String, (usize, usize)> = if empty {
-        let paths: Vec<String> = entries.iter().map(|(_, p)| p.clone()).collect();
-        git::empty_stats(&paths)
-    } else {
-        match git::diff_stats(&revision) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("bough: {e}");
-                std::process::exit(1);
-            }
-        }
-    };
-
-    let mut tree = Tree::build(entries);
-    tree.annotate_stats(&stats);
-
+    // The initial snapshot is empty: the worker owns the full changed-file scan
+    // and sends the real tree/diff on its own thread, so the UI starts without
+    // blocking on git work whose cost grows with the size of the diff.
     let initial_snapshot: ArcSnapshot = Arc::new(Snapshot {
         empty,
         selected_diff: None,
         selected_highlight: Vec::new(),
         error: None,
         branch_state: crate::git::BranchState::default(),
-        tree,
+        tree: Tree::build(Vec::new()),
     });
 
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let base_ref = git::default_branch();
-    let worker = Worker::spawn(revision, empty, repo_root, base_ref, cli.theme, initial_snapshot.tree.clone())
+    let base_ref = default;
+    let worker = Worker::spawn(revision.clone(), empty, repo_root, base_ref, cli.theme)
         .unwrap_or_else(|e| {
             eprintln!("bough: worker spawn failed: {e}");
             std::process::exit(1);
         });
 
-    let mut app = App::new(initial_snapshot, worker.request_tx.clone(), worker.poll_mode.load(std::sync::atomic::Ordering::Relaxed));
+    let mut app = App::new(
+        initial_snapshot,
+        worker.request_tx.clone(),
+        worker.poll_mode.load(std::sync::atomic::Ordering::Relaxed),
+        revision.clone(),
+        "HEAD".to_string(),
+    );
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -159,11 +137,11 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn resolve_revision(arg: Option<String>) -> String {
+fn resolve_revision(arg: Option<String>, default: Option<String>) -> String {
     match arg.filter(|s| !s.is_empty()) {
         Some(s) => s,
         None => {
-            let trunk = git::default_branch().unwrap_or_else(|| "main".to_string());
+            let trunk = default.unwrap_or_else(|| "main".to_string());
             match git::current_branch() {
                 Ok(Some(b)) if b == trunk => "HEAD".to_string(),
                 _ => format!("{trunk}...HEAD"),

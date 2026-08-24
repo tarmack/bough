@@ -14,8 +14,9 @@ use crossterm::event::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Focus, CONTEXT_STEP, HSCROLL_STEP};
+use crate::app::{App, CONTEXT_STEP, HSCROLL_STEP};
 use crate::snapshot::ArcSnapshot;
+use crate::theme::Focus;
 use crate::view;
 
 /// Drain the snapshot channel, keeping only the latest `ArcSnapshot`, and
@@ -39,6 +40,7 @@ pub fn run(
     loop {
         terminal.draw(|f| view::ui(f, app))?;
         drain_snapshots(snapshot_rx, app);
+        app.maybe_request_highlight();
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) => {
@@ -88,9 +90,13 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
 }
 
 fn handle_key(key: KeyEvent, app: &mut App) -> bool {
+    // Ctrl-C always quits, regardless of focus.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
+
+    // Modifier-prefix state: a second `z` (fold) or `g` (goto) chord consumes
+    // this very key before normal dispatch.
     if app.fold_key {
         app.fold_key = false;
         return handle_fold_key(key.code, app);
@@ -102,51 +108,57 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
         }
         return false; // the prefix consumed this key
     }
+
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char('q') | KeyCode::Esc => true,
         KeyCode::Char('w') => {
             app.word_diff_on = !app.word_diff_on;
-            return false;
+            false
+        }
+        KeyCode::Char('m') => {
+            app.toggle_mode();
+            false
         }
         KeyCode::Char('z') => {
             app.fold_key = true;
-            return false;
+            false
         }
         KeyCode::Char('g') => {
             app.g_key = true;
-            return false;
+            false
         }
         KeyCode::Char('G') => {
             app.go_last_chunk();
-            return false;
+            false
         }
         KeyCode::Char(' ') => {
             app.space_action();
-            return false;
+            false
         }
         KeyCode::Tab => {
             app.focus = match app.focus {
                 Focus::Tree => Focus::Diff,
                 Focus::Diff => Focus::Tree,
             };
-            return false;
+            false
         }
-        _ => {}
-    }
-
-    // Shift overrides scroll the diff even from tree focus.
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
-        match key.code {
-            KeyCode::Char('H') => app.diff_scroll_left(HSCROLL_STEP),
-            KeyCode::Char('J') => app.diff_scroll_down(1),
-            KeyCode::Char('K') => app.diff_scroll_up(1),
-            KeyCode::Char('L') => app.diff_scroll_right(HSCROLL_STEP),
-            _ => return focus_key(key, app),
+        // Any other key: shift overrides the diff even from tree focus, then
+        // fall through to focus-specific keys.
+        _ => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                match key.code {
+                    KeyCode::Char('H') => app.diff_scroll_left(HSCROLL_STEP),
+                    KeyCode::Char('J') => app.diff_scroll_down(1),
+                    KeyCode::Char('K') => app.diff_scroll_up(1),
+                    KeyCode::Char('L') => app.diff_scroll_right(HSCROLL_STEP),
+                    _ => return focus_key(key, app),
+                }
+                false
+            } else {
+                focus_key(key, app)
+            }
         }
-        return false;
     }
-
-    focus_key(key, app)
 }
 
 /// Handle the second key of a `z`-prefixed fold chord (vim fold controls).
@@ -228,7 +240,7 @@ fn focus_key(key: KeyEvent, app: &mut App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{FileHeader, HunkMeta};
+    use crate::diff::{FileHeader, FileStatus, HunkMeta};
     use crate::test_support::*;
     use ratatui::backend::TestBackend;
 
@@ -257,7 +269,7 @@ mod tests {
         app.diff_col = 0;
         app.height = 1;
         app.last_header_height = 1;
-        app.snapshot = snapshot_with_diff(sample_parsed(3));
+        app.snapshot = snapshot_with_diff(sample_diff(3));
 
         assert!(!handle_key(
             KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
@@ -301,7 +313,7 @@ mod tests {
         app.diff_col = 0;
         app.height = 1;
         app.last_header_height = 1;
-        app.snapshot = snapshot_with_diff(sample_parsed(3));
+        app.snapshot = snapshot_with_diff(sample_diff(3));
         app.active_chunk = Some(0);
 
         let sel = app.selection;
@@ -405,10 +417,10 @@ mod tests {
         let mut app = sample_app();
         app.focus = Focus::Diff;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             FileHeader {
                 path: "x.rs".into(),
-                status: 'M',
+                status: FileStatus::Modified,
                 added: 1,
                 deleted: 1,
                 old_path: None,
@@ -417,7 +429,6 @@ mod tests {
                 mode_new: None,
                 binary: false,
                 hunks: vec![HunkMeta {
-                    section: None,
                     added: 2,
                     deleted: 0,
                 }],
@@ -464,7 +475,13 @@ mod tests {
     fn space_toggles_dir() {
         let tree = crate::tree::Tree::build(vec![('M', "src/a.rs".to_string())]);
         let (tx, _rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(4);
-        let mut app = crate::app::App::new(crate::test_support::sample_snapshot(tree), tx, false);
+        let mut app = crate::app::App::new(
+            crate::test_support::sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
         app.focus = Focus::Tree;
         app.selection = 0;
         let idx = app.flat[0];
@@ -486,7 +503,13 @@ mod tests {
     fn space_on_file_loads_diff() {
         let tree = crate::tree::Tree::build(vec![('M', "Cargo.toml".to_string())]);
         let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(4);
-        let mut app = crate::app::App::new(crate::test_support::sample_snapshot(tree), tx, false);
+        let mut app = crate::app::App::new(
+            crate::test_support::sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
         app.focus = Focus::Tree;
         app.selection = 0;
 
@@ -508,7 +531,7 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(None, None),
             vec![hunk_header(0), ctx_line(0, 0)],
         ));
@@ -534,7 +557,7 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(None, None),
             vec![hunk_header(0), ctx_line(0, 0)],
         ));
@@ -570,7 +593,7 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(None, None),
             vec![hunk_header(0), ctx_line(0, 0)],
         ));
@@ -607,10 +630,10 @@ mod tests {
         app.height = 1;
         app.last_header_height = 1;
         app.diff_scroll = 0;
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             crate::diff::FileHeader {
                 path: "x.rs".into(),
-                status: 'M',
+                status: FileStatus::Modified,
                 added: 1,
                 deleted: 1,
                 old_path: None,
@@ -620,12 +643,10 @@ mod tests {
                 binary: false,
                 hunks: vec![
                     HunkMeta {
-                        section: None,
                         added: 1,
                         deleted: 1,
                     },
                     HunkMeta {
-                        section: None,
                         added: 1,
                         deleted: 1,
                     },
@@ -691,7 +712,7 @@ mod tests {
         let mut app = sample_app();
         app.focus = Focus::Diff;
         app.selected_path = Some("x.rs".into());
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(None, None),
             vec![
                 hunk_header(0),
@@ -701,7 +722,7 @@ mod tests {
             ],
         ));
 
-        // Render once so height/diff_width/last_header_height/sticky_line fill in.
+        // Render once so height/diff_width/last_header_height/sticky_file/sticky_hunk fill in.
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| view::ui(f, &mut app)).unwrap();
 
@@ -773,7 +794,7 @@ mod tests {
         let mut app = sample_app();
         app.focus = Focus::Diff;
         // Tall expanded chunk 0 (header + 5 ctx) then chunk 1.
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(None, None),
             vec![
                 hunk_header(0),
@@ -851,10 +872,10 @@ mod tests {
         app.last_header_height = 1;
         app.diff_scroll = 0;
         app.active_chunk = Some(0);
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             crate::diff::FileHeader {
                 path: "x.rs".into(),
-                status: 'M',
+                status: FileStatus::Modified,
                 added: 10,
                 deleted: 0,
                 old_path: None,
@@ -863,7 +884,6 @@ mod tests {
                 mode_new: None,
                 binary: false,
                 hunks: vec![HunkMeta {
-                    section: None,
                     added: 10,
                     deleted: 0,
                 }],

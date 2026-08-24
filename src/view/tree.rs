@@ -5,13 +5,16 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::app::{App, Focus};
+use crate::app::{App, Mode};
+use crate::diff::FileStatus;
 use crate::theme;
+use crate::theme::Focus;
 use crate::tree::{self, TreeNode};
 
 /// Render the file tree with the selection highlighted.
 pub fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
-    // Keep the selection within the visible window.
+    // Keep the selection within the visible window. Drawing clamps the
+    // selection and scroll into range as a side effect of layout.
     let visible = area.height as usize;
     if app.flat.is_empty() {
         let line = Line::styled("no changes", Style::default().fg(Color::DarkGray));
@@ -90,19 +93,19 @@ pub fn render_branch_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if let (Some(a), Some(b)) = (state.ahead, state.behind) {
-            if a > 0 {
-                left.push(Span::styled(
-                    format!("\u{2191}{a} "),
-                    Style::default().fg(Color::Green),
-                ));
-            }
-            if b > 0 {
-                left.push(Span::styled(
-                    format!("\u{2193}{b} "),
-                    Style::default().fg(Color::Red),
-                ));
-            }
+        if a > 0 {
+            left.push(Span::styled(
+                format!("\u{2191}{a} "),
+                Style::default().fg(Color::Green),
+            ));
         }
+        if b > 0 {
+            left.push(Span::styled(
+                format!("\u{2193}{b} "),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
 
     if let Some(u) = state.unpushed {
         left.push(Span::styled(
@@ -113,11 +116,18 @@ pub fn render_branch_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let left = Line::from(left);
     let mut right: Vec<Span<'static>> = Vec::new();
-    if let Some(base) = state.base.as_deref() {
-        right.push(Span::styled(
-            base.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
+    match app.mode {
+        Mode::DiffToMain => {
+            if let Some(base) = state.base.as_deref() {
+                right.push(Span::styled(
+                    base.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+        Mode::Uncommitted => {
+            right.push(Span::styled("wc", Style::default().fg(Color::DarkGray)));
+        }
     }
     let right = Line::from(right);
 
@@ -127,20 +137,14 @@ pub fn render_branch_footer(f: &mut Frame, app: &App, area: Rect) {
 /// Draw `left` left-aligned at the pane origin and `right` right-aligned at
 /// the pane's right edge, leaving one separating cell, over `width` columns.
 /// When `right` is `None`, `left` spans the full width.
-fn draw_aligned(
-    f: &mut Frame,
-    x: u16,
-    y: u16,
-    width: u16,
-    left: &Line,
-    right: Option<&Line>,
-) {
+fn draw_aligned(f: &mut Frame, x: u16, y: u16, width: u16, left: &Line, right: Option<&Line>) {
     match right {
         Some(r) => {
             let rw = r.width() as u16;
             let left_w = width.saturating_sub(rw).saturating_sub(1);
             f.buffer_mut().set_line(x, y, left, left_w);
-            f.buffer_mut().set_line(x + width.saturating_sub(rw), y, r, rw);
+            f.buffer_mut()
+                .set_line(x + width.saturating_sub(rw), y, r, rw);
         }
         None => {
             f.buffer_mut().set_line(x, y, left, width);
@@ -159,6 +163,7 @@ fn tree_left(app: &App, node_idx: usize, bg: Color) -> Line<'static> {
             .status
             .chars()
             .next()
+            .and_then(FileStatus::from_char)
             .map(theme::status_color)
             .unwrap_or(Color::Reset),
     };
@@ -213,7 +218,7 @@ pub(crate) fn file_icon(name: &str) -> &'static str {
         "toml" | "yaml" | "yml" | "json" => "\u{e615}", // config gear
         "py" => "\u{e795}",                             // python
         "js" | "jsx" | "mjs" | "cjs" => "\u{e8c8}",     // javascript
-        "ts" | "tsx" => "\u{e9a0}",                     // typescript
+        "ts" | "tsx" => "\u{e628}",                     // typescript (seti)
         "c" | "h" | "cpp" | "hpp" => "\u{e8a0}",        // c/c++
         "go" => "\u{e8bd}",                             // go
         "md" | "markdown" => "\u{e609}",                // markdown
@@ -249,16 +254,22 @@ fn stat_line(node: &TreeNode, bg: Color) -> Option<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::app::App;
     use crate::test_support::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::sync::Arc;
 
     #[test]
     fn tree_row_focus_colors() {
         let tree = crate::tree::Tree::build(vec![('M', "x.rs".to_string())]);
-        let mut app = App::new(sample_snapshot(tree), crossbeam_channel::bounded::<crate::snapshot::Request>(4).0, false);
+        let mut app = App::new(
+            sample_snapshot(tree),
+            crossbeam_channel::bounded::<crate::snapshot::Request>(4).0,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
         app.selected_path = Some("x.rs".into());
         app.selection = 0;
 
@@ -284,7 +295,13 @@ mod tests {
             upstream: Some("origin/feature/x".into()),
             unpushed: Some(2),
         };
-        let mut app = App::new(snap, crossbeam_channel::bounded::<crate::snapshot::Request>(4).0, false);
+        let mut app = App::new(
+            snap,
+            crossbeam_channel::bounded::<crate::snapshot::Request>(4).0,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| super::super::ui(f, &mut app)).unwrap();

@@ -8,9 +8,8 @@
 use std::sync::OnceLock;
 
 use ratatui::style::Color;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::Style;
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::highlighting::{self, HighlightIterator, HighlightState, Style};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use two_face::theme::LazyThemeSet;
 
 /// One colored span within a single highlighted line.
@@ -20,6 +19,18 @@ pub struct TokenOwned {
     pub text: String,
     /// The foreground color to render the span with.
     pub color: Color,
+}
+
+/// A checkpointed parse/scope state for one file, resumable at any line.
+///
+/// Cloning and restarting from a checkpoint is cheap, so the worker can jump
+/// to an arbitrary raw-line range of a diff without re-parsing from line 0.
+#[derive(Clone)]
+pub struct ResumeState {
+    /// The live syntect parser state.
+    pub parse: ParseState,
+    /// The scope stack at the end of the last parsed line.
+    pub scope: ScopeStack,
 }
 
 /// A failure during highlighter construction.
@@ -65,16 +76,16 @@ fn theme_set() -> &'static LazyThemeSet {
 
 /// Highlights lines of code into owned ratatui color tokens.
 ///
-/// Keeps the underlying syntect highlighter across calls so multi-line
-/// constructs (comments, strings) keep their state within a file, and
-/// recreates it when the grammar changes. It is reused per render and is not
-/// borrow-locked between calls.
+/// Keeps a reusable syntect [`highlighting::Highlighter`] (theme-driven style
+/// resolution) and lets callers drive the per-file [`ParseState`]/`ScopeStack`
+/// themselves via [`fresh_state`](Self::fresh_state),
+/// [`parse_only`](Self::parse_only), and [`highlight`](Self::highlight). The
+/// file's grammar is resolved once per fresh state, so multi-line constructs
+/// (comments, strings) render correctly across arbitrary line ranges. It is
+/// reused per render and is not borrow-locked between calls.
 pub struct Highlighter {
     syntaxes: &'static SyntaxSet,
-    theme: &'static syntect::highlighting::Theme,
-    /// The grammar currently loaded, plus its live highlighter. `None` until
-    /// the first line is highlighted.
-    current: Option<(&'static SyntaxReference, HighlightLines<'static>)>,
+    hl: highlighting::Highlighter<'static>,
 }
 
 impl Highlighter {
@@ -89,8 +100,7 @@ impl Highlighter {
             })?;
         Ok(Highlighter {
             syntaxes: syntaxes(),
-            theme,
-            current: None,
+            hl: highlighting::Highlighter::new(theme),
         })
     }
 
@@ -106,44 +116,65 @@ impl Highlighter {
         names
     }
 
-    /// Drop the current per-file syntect state so the next line starts fresh.
-    pub fn reset(&mut self) {
-        self.current = None;
+    /// A fresh, empty [`ResumeState`] for the file at `path`, or `None` when no
+    /// grammar matches its extension (the caller renders those lines
+    /// uncolored).
+    pub fn fresh_state(&self, path: &str) -> Option<ResumeState> {
+        let syntax = self.syntax_for_path(path)?;
+        Some(ResumeState {
+            parse: ParseState::new(syntax),
+            scope: ScopeStack::default(),
+        })
     }
 
-    /// Highlight one line of `text` for a file at `path`. Returns owned token
-    /// spans, or an empty `Vec` when no grammar matches the file extension
-    /// (the caller renders the line uncolored). Never panics.
-    pub fn line(&mut self, path: &str, text: &str) -> Vec<TokenOwned> {
-        let Some(syntax) = self.syntax_for_path(path) else {
-            return Vec::new();
-        };
-
-        // Recreate the underlying highlighter when the grammar changes (a new
-        // file). Reusing it keeps multi-line state intact within one file.
-        if self
-            .current
-            .as_ref()
-            .is_none_or(|tup| !std::ptr::eq(tup.0, syntax))
-        {
-            self.current = Some((syntax, HighlightLines::new(syntax, self.theme)));
+    /// Advance `resume` past each of `texts` without producing any tokens.
+    ///
+    /// This is the cheap path used to bridge a checkpoint to an arbitrary body
+    /// line: it mutates only the parse state and scope stack, never allocating
+    /// styles. On a parse error the remaining lines are skipped.
+    pub fn parse_only(&self, resume: &mut ResumeState, texts: &[&str]) {
+        for text in texts {
+            let Ok(ops) = resume.parse.parse_line(text, self.syntaxes) else {
+                return;
+            };
+            for (_, op) in ops {
+                let _ = resume.scope.apply(&op);
+            }
         }
+    }
 
-        // `current` was just set to `Some` above, so the unwrap is safe.
-        let (_, hl) = self.current.as_mut().unwrap();
-        let ranges = match hl.highlight_line(text, self.syntaxes) {
-            Ok(ranges) => ranges,
-            // Degraded mode by design: swallow the error and render uncolored.
+    /// Highlight one line, advancing `resume` to the end of that line's scope.
+    ///
+    /// Mirrors `syntect::easy::HighlightLines::highlight_line`: parse the line,
+    /// build a [`HighlightState`] from the previous scope stack, run a
+    /// [`HighlightIterator`], then capture its end-of-line `path` back into
+    /// `resume`. Returns owned token spans, or an empty `Vec` on a parse error.
+    pub fn highlight(&self, resume: &mut ResumeState, text: &str) -> Vec<TokenOwned> {
+        let ops = match resume.parse.parse_line(text, self.syntaxes) {
+            Ok(ops) => ops,
             Err(_) => return Vec::new(),
         };
-
-        ranges
-            .into_iter()
-            .map(|(style, text)| TokenOwned {
-                text: text.to_string(),
+        let mut hs = HighlightState::new(&self.hl, resume.scope.clone());
+        let iter = HighlightIterator::new(&mut hs, &ops, text, &self.hl);
+        let tokens = iter
+            .map(|(style, s)| TokenOwned {
+                text: s.to_string(),
                 color: ratatui_color(style),
             })
-            .collect()
+            .collect();
+        resume.scope = hs.path;
+        tokens
+    }
+
+    /// Highlight one line of `text` for a file at `path`, starting from a fresh
+    /// [`ResumeState`]. Returns owned token spans, or an empty `Vec` when no
+    /// grammar matches the file extension. Never panics.
+    #[allow(dead_code)] // convenience wrapper exercised by the in-file tests
+    pub fn line(&self, path: &str, text: &str) -> Vec<TokenOwned> {
+        let Some(mut resume) = self.fresh_state(path) else {
+            return Vec::new();
+        };
+        self.highlight(&mut resume, text)
     }
 
     /// Look up the grammar for `path` by its file extension.
@@ -177,7 +208,7 @@ mod tests {
 
     #[test]
     fn new_accepts_default_theme() {
-        let mut hl = Highlighter::new("Monokai Extended").unwrap();
+        let hl = Highlighter::new("Monokai Extended").unwrap();
         let tokens = hl.line("x.rs", "fn main() {}");
         assert!(!tokens.is_empty());
         assert!(tokens.iter().any(|t| matches!(t.color, Color::Rgb(..))));
@@ -202,12 +233,19 @@ mod tests {
 
     #[test]
     fn line_returns_empty_on_grammar_miss() {
-        let mut hl = Highlighter::new("Monokai Extended").unwrap();
+        let hl = Highlighter::new("Monokai Extended").unwrap();
         assert!(hl.line("x.unknownext", "anything").is_empty());
     }
 
     #[test]
     fn themes_includes_monokai() {
         assert!(Highlighter::themes().contains(&"Monokai Extended".to_string()));
+    }
+
+    #[test]
+    fn resume_state_roundtrips() {
+        let hl = Highlighter::new("Monokai Extended").unwrap();
+        assert!(hl.fresh_state("x.rs").is_some());
+        assert!(hl.fresh_state("x.unknownext").is_none());
     }
 }

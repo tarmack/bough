@@ -6,7 +6,9 @@ use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::diff::{DiffLine, FileHeader, HunkMeta, LineKind, ParsedDiff, SectionKind, WordRun};
+use crate::diff::{
+    Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LineKind, SectionKind, WordRun,
+};
 use crate::highlight::TokenOwned;
 use crate::text::{elide, max_scroll_for, render_centered};
 use crate::theme;
@@ -21,15 +23,21 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
         render_centered(f, area, "select a file to preview its diff", style);
         return;
     }
-    let Some(parsed) = app.snapshot.selected_diff.as_ref() else {
-        let msg = app.diff_error().unwrap_or("diff failed");
-        let line = Line::styled(format!("error: {msg}"), Style::default().fg(Color::Red));
+    let Some(diff) = app.snapshot.selected_diff.as_ref() else {
+        // No diff yet and no recorded error: the snapshot is still loading, so
+        // render a neutral placeholder rather than mislabel it as a failure.
+        let Some(err) = app.diff_error() else {
+            let style = Style::default().fg(Color::DarkGray);
+            render_centered(f, area, "loading…", style);
+            return;
+        };
+        let line = Line::styled(format!("error: {err}"), Style::default().fg(Color::Red));
         f.buffer_mut().set_line(area.x, area.y, &line, area.width);
         return;
     };
 
-    let multi = parsed.files.len() > 1;
-    let has_rename = !multi && parsed.header.old_path.is_some();
+    let multi = diff.files.len() > 1;
+    let has_rename = !multi && diff.header.old_path.is_some();
     let header_height = 1 + has_rename as u16;
     app.last_header_height = header_height;
 
@@ -46,9 +54,9 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     // Locked header: the single file's header, or a folder summary carrying
     // the path and total file count. Line 1 always, line 2 rename.
     let header_spans = if multi {
-        build_summary_header(parsed, area.width as usize)
+        build_summary_header(diff, area.width as usize)
     } else {
-        build_header_line(&parsed.header, current, area.width as usize)
+        build_header_line(&diff.header, current, area.width as usize)
     };
     f.buffer_mut().set_line(
         area.x,
@@ -58,7 +66,7 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let mut y = area.y + 1;
     if has_rename {
-        let rename = build_rename_line(&parsed.header);
+        let rename = build_rename_line(&diff.header);
         f.buffer_mut().set_line(
             area.x,
             y,
@@ -69,10 +77,10 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Empty body: centered messages below the header.
-    if parsed.lines.is_empty() {
-        let msg = if parsed.header.binary {
+    if diff.lines.is_empty() {
+        let msg = if diff.header.binary {
             "binary file"
-        } else if !multi && parsed.header.status == 'R' {
+        } else if !multi && diff.header.status == FileStatus::Renamed {
             "rename — no content changes"
         } else {
             "no content changes"
@@ -92,44 +100,79 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     // pinned independently: scrolling into the next file replaces the file
     // sticky, while the hunk sticky tracks the last hunk within it.
     let start = app.diff_scroll;
+    let (file_sticky, hunk_sticky, flow_height) =
+        sticky_headers(&visible, &diff.lines, start, body_height);
+    // Pinned sticky lines, for click-row mapping.
+    app.sticky_file = file_sticky;
+    app.sticky_hunk = hunk_sticky;
 
-    let file_sticky = if start > 0 {
-        visible
-            .iter()
-            .take(start)
-            .rev()
-            .find(|&&li| parsed.lines[li].kind == LineKind::FileHeader)
-            .copied()
-    } else {
-        None
-    };
-    let hunk_sticky = if start > 0 {
-        visible
-            .iter()
-            .take(start)
-            .rev()
-            .find(|&&li| parsed.lines[li].kind == LineKind::HunkHeader)
-            .copied()
-    } else {
-        None
-    };
-    // Topmost pinned sticky line, for click-row mapping.
-    app.sticky_line = file_sticky.or(hunk_sticky);
-    let sticky_rows = file_sticky.map(|_| 1u16).unwrap_or(0) + hunk_sticky.map(|_| 1u16).unwrap_or(0);
-    let flow_height = body_height.saturating_sub(sticky_rows);
-
+    // Render pinned sticky rows, then the visible flow rows below them.
     if let Some(idx) = file_sticky {
-        y = render_section_header(f, app, area, y, idx, parsed);
+        y = render_section_header(f, app, area, y, idx, diff);
     }
     if let Some(idx) = hunk_sticky {
-        y = render_section_header(f, app, area, y, idx, parsed);
+        y = render_section_header(f, app, area, y, idx, diff);
     }
-
     let end = (start + flow_height as usize).min(visible.len());
-    for &line_idx in &visible[start..end] {
-        let line = &parsed.lines[line_idx];
+    emit_visible_rows(f, app, area, y, diff, &visible[start..end]);
+}
+
+/// The last sticky header of `kind` that scrolls off above the body top. Only
+/// lines in `visible[..start]` can be sticky; `None` when the body top is at
+/// the very start (no row scrolled away yet).
+fn last_sticky(
+    visible: &[usize],
+    lines: &[DiffLine],
+    kind: LineKind,
+    start: usize,
+) -> Option<usize> {
+    if start == 0 {
+        return None;
+    }
+    visible
+        .iter()
+        .take(start)
+        .rev()
+        .find(|&&li| lines[li].kind == kind)
+        .copied()
+}
+
+/// Compute the sticky file/hunk header layout for the body. Returns the two
+/// sticky indices plus the flow height left below them. The caller writes
+/// `app.sticky_file`/`app.sticky_hunk` (the pinned sticky lines, for click-row
+/// mapping).
+fn sticky_headers(
+    visible: &[usize],
+    lines: &[DiffLine],
+    start: usize,
+    body_height: u16,
+) -> (Option<usize>, Option<usize>, u16) {
+    let file_sticky = last_sticky(visible, lines, LineKind::FileHeader, start);
+    let hunk_sticky = last_sticky(visible, lines, LineKind::HunkHeader, start);
+    let sticky_rows =
+        file_sticky.map(|_| 1u16).unwrap_or(0) + hunk_sticky.map(|_| 1u16).unwrap_or(0);
+    (
+        file_sticky,
+        hunk_sticky,
+        body_height.saturating_sub(sticky_rows),
+    )
+}
+
+/// Render the visible flow rows (`rows`), drawing section headers via
+/// `render_section_header` and body lines via `diff_body_line`. Returns the
+/// `y` below the last rendered row.
+fn emit_visible_rows(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    mut y: u16,
+    diff: &Diff,
+    rows: &[usize],
+) -> u16 {
+    for &line_idx in rows {
+        let line = &diff.lines[line_idx];
         if line.kind.is_header() {
-            y = render_section_header(f, app, area, y, line_idx, parsed);
+            y = render_section_header(f, app, area, y, line_idx, diff);
         } else {
             let base_bg = theme::bg_for(line.kind);
             let tokens = app
@@ -143,35 +186,26 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
             y += 1;
         }
     }
+    y
 }
 
 /// Locked header for a multi-file (folder) diff: `<path>  N files` with the
 /// aggregate diffstat right-aligned.
-fn build_summary_header(parsed: &ParsedDiff, width: usize) -> Vec<Span<'static>> {
+fn build_summary_header(diff: &Diff, width: usize) -> Vec<Span<'static>> {
     let mut left = vec![
         Span::styled(
-            parsed.header.path.clone(),
+            diff.header.path.clone(),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{} files", parsed.files.len()),
+            format!("{} files", diff.files.len()),
             Style::default().fg(Color::DarkGray),
         ),
     ];
-    let mut right = vec![Span::styled(
-        format!("+{}", parsed.header.added),
-        Style::default().fg(Color::Green),
-    )];
-    right.push(Span::styled(
-        format!(" -{}", parsed.header.deleted),
-        Style::default().fg(Color::Red),
-    ));
-    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let right = stat_spans(diff.header.added, diff.header.deleted, false, None);
     let right_w: usize = right.iter().map(|s| s.width()).sum();
-    if width > left_w + 1 + right_w {
-        left.push(Span::raw(" ".repeat(width - left_w - right_w)));
-    }
+    right_align(&mut left, right_w, width);
     left.extend(right);
     left
 }
@@ -198,33 +232,21 @@ fn build_header_line(header: &FileHeader, current_hunk: usize, width: usize) -> 
     let mut right: Vec<Span<'static>> = Vec::new();
     if let (Some(old), Some(new)) = (header.mode_old, header.mode_new) {
         if old != new {
-            right.push(Span::styled(
-                format!("{old:o} → {new:o}"),
-                Style::default().fg(Color::DarkGray),
-            ));
+            right.push(mode_change_span(old, new, None));
             right.push(Span::raw("  "));
         }
     }
-    if header.binary {
-        right.push(Span::styled("binary", Style::default().fg(Color::DarkGray)));
-    } else {
-        right.push(Span::styled(
-            format!("+{}", header.added),
-            Style::default().fg(Color::Green),
-        ));
-        right.push(Span::styled(
-            format!(" -{}", header.deleted),
-            Style::default().fg(Color::Red),
-        ));
-    }
+    right.extend(stat_spans(
+        header.added,
+        header.deleted,
+        header.binary,
+        None,
+    ));
 
-    let left_w: usize = left.iter().map(|s| s.width()).sum();
     let right_w: usize = right.iter().map(|s| s.width()).sum();
     // Right-align the block when there is room (at least one space of pad);
     // otherwise append it and let elide truncate the overflow.
-    if width > left_w + 1 + right_w {
-        left.push(Span::raw(" ".repeat(width - left_w - right_w)));
-    }
+    right_align(&mut left, right_w, width);
     left.extend(right);
     left
 }
@@ -244,6 +266,51 @@ fn build_rename_line(header: &FileHeader) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+/// The `old → new` mode change (octal) span, coloured `DarkGray` over an
+/// optional background. Caller handles surrounding spacing.
+fn mode_change_span(old: u32, new: u32, bg: Option<Color>) -> Span<'static> {
+    let style = match bg {
+        Some(c) => Style::default().fg(Color::DarkGray).bg(c),
+        None => Style::default().fg(Color::DarkGray),
+    };
+    Span::styled(format!("{old:o} → {new:o}"), style)
+}
+
+/// The `+A -D` diffstat spans (green add / red delete), or a single `binary`
+/// span when the file is binary. `bg` tints the spans for a header row with a
+/// painted background; `None` leaves them on the plain locked-header style.
+fn stat_spans(added: usize, deleted: usize, binary: bool, bg: Option<Color>) -> Vec<Span<'static>> {
+    if binary {
+        let style = match bg {
+            Some(c) => Style::default().fg(Color::DarkGray).bg(c),
+            None => Style::default().fg(Color::DarkGray),
+        };
+        return vec![Span::styled("binary", style)];
+    }
+    let add_style = match bg {
+        Some(c) => Style::default().fg(Color::Green).bg(c),
+        None => Style::default().fg(Color::Green),
+    };
+    let del_style = match bg {
+        Some(c) => Style::default().fg(Color::Red).bg(c),
+        None => Style::default().fg(Color::Red),
+    };
+    vec![
+        Span::styled(format!("+{added}"), add_style),
+        Span::styled(format!(" -{deleted}"), del_style),
+    ]
+}
+
+/// Right-align a `right` block against a `left` block over `width` columns:
+/// pad when there is at least one space of room, otherwise leave `left` alone
+/// and let the caller's elide truncate the overflow.
+fn right_align(left: &mut Vec<Span<'static>>, right_w: usize, width: usize) {
+    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    if width > left_w + 1 + right_w {
+        left.push(Span::raw(" ".repeat(width - left_w - right_w)));
+    }
 }
 
 /// Compose a body line's spans: syntax tokens tinted with the line's
@@ -364,48 +431,26 @@ fn overlay_word_runs(
 /// Nerd Font glyph for a hunk (`@@`) header row — a block of changed lines.
 const HUNK_ICON: &str = "\u{f0c9}";
 
-/// The owning file's icon and the syntax-highlighted section name; scrolls
-/// horizontally.
-fn hunk_name_spans(meta: &HunkMeta, name_tokens: &[TokenOwned], bg: Color) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
+/// The hunk icon glyph; scrolls horizontally.
+fn hunk_name_spans(bg: Color) -> Vec<Span<'static>> {
+    vec![Span::styled(
         // One leading space indents hunks beneath their file header.
         format!(" {} ", HUNK_ICON),
         Style::default().fg(Color::Blue).bg(bg),
-    )];
-    if let Some(section) = &meta.section {
-        if name_tokens.is_empty() {
-            spans.push(Span::styled(
-                section.clone(),
-                Style::default().fg(Color::DarkGray).bg(bg),
-            ));
-        } else {
-            for t in name_tokens {
-                spans.push(Span::styled(
-                    t.text.clone(),
-                    Style::default().fg(t.color).bg(bg),
-                ));
-            }
-        }
-    }
-    spans
+    )]
 }
 
 /// The `+A -D` diffstat, a spacer, and the fold arrow. Pinned to the pane's
 /// right edge (does not scroll).
 fn hunk_stat_spans(meta: &HunkMeta, bg: Color, collapsed: bool) -> Vec<Span<'static>> {
     let glyph = if collapsed { "▶" } else { "▼" };
-    vec![
-        Span::styled(
-            format!("+{}", meta.added),
-            Style::default().fg(Color::Green).bg(bg),
-        ),
-        Span::styled(
-            format!(" -{}", meta.deleted),
-            Style::default().fg(Color::Red).bg(bg),
-        ),
-        Span::styled(" ".to_string(), Style::default().bg(bg)),
-        Span::styled(glyph.to_string(), Style::default().fg(Color::Blue).bg(bg)),
-    ]
+    let mut spans = stat_spans(meta.added, meta.deleted, false, Some(bg));
+    spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
+    spans.push(Span::styled(
+        glyph.to_string(),
+        Style::default().fg(Color::Blue).bg(bg),
+    ));
+    spans
 }
 
 /// Content of a navigable section header: a hunk (`@@ …`) or a file header
@@ -413,17 +458,14 @@ fn hunk_stat_spans(meta: &HunkMeta, bg: Color, collapsed: bool) -> Vec<Span<'sta
 /// scrolls/elides on the left and a right-pinned diffstat + fold arrow.
 enum HeaderContent<'a> {
     File { file: &'a FileHeader },
-    Hunk {
-        meta: &'a HunkMeta,
-        name_tokens: &'a [TokenOwned],
-    },
+    Hunk { meta: &'a HunkMeta },
 }
 
 impl<'a> HeaderContent<'a> {
     fn name_spans(&self, bg: Color) -> Vec<Span<'static>> {
         match self {
             HeaderContent::File { file } => file_header_name_spans(file, bg),
-            HeaderContent::Hunk { meta, name_tokens } => hunk_name_spans(meta, name_tokens, bg),
+            HeaderContent::Hunk { .. } => hunk_name_spans(bg),
         }
     }
 
@@ -444,13 +486,13 @@ fn render_section_header(
     area: Rect,
     y: u16,
     line_idx: usize,
-    parsed: &ParsedDiff,
+    diff: &Diff,
 ) -> u16 {
-    let line = &parsed.lines[line_idx];
+    let line = &diff.lines[line_idx];
     let collapsed = app.collapsed_hunks.contains(&line.section);
     let bg = theme::hunk_header_bg(app.active_chunk == Some(line.section), app.focus);
 
-    match header_content(app, line_idx, parsed, line) {
+    match header_content(diff, line) {
         Some(content) => draw_section_header(f, app, area, y, bg, collapsed, &content),
         None => {
             let l = Line::styled(
@@ -464,24 +506,14 @@ fn render_section_header(
 }
 
 /// Resolve the content a header line's section describes.
-fn header_content<'a>(
-    app: &'a App,
-    line_idx: usize,
-    parsed: &'a ParsedDiff,
-    line: &DiffLine,
-) -> Option<HeaderContent<'a>> {
-    let section = parsed.sections.get(line.section)?;
-    let file = parsed.files.get(section.file)?;
+fn header_content<'a>(diff: &'a Diff, line: &DiffLine) -> Option<HeaderContent<'a>> {
+    let section = diff.sections.get(line.section)?;
+    let file = diff.files.get(section.file)?;
     match section.kind {
         SectionKind::File => Some(HeaderContent::File { file }),
         SectionKind::Hunk => {
             let meta = file.hunks.get(section.hunk?)?;
-            let name_tokens = app
-                .highlighted()
-                .get(line_idx)
-                .and_then(|opt| opt.as_deref())
-                .unwrap_or(&[]);
-            Some(HeaderContent::Hunk { meta, name_tokens })
+            Some(HeaderContent::Hunk { meta })
         }
     }
 }
@@ -534,10 +566,8 @@ fn file_header_name_spans(file: &FileHeader, bg: Color) -> Vec<Span<'static>> {
     ));
     if let (Some(old), Some(new)) = (file.mode_old, file.mode_new) {
         if old != new {
-            spans.push(Span::styled(
-                format!("  {old:o} → {new:o}"),
-                Style::default().fg(Color::DarkGray).bg(bg),
-            ));
+            spans.push(Span::styled("  ".to_string(), Style::default().bg(bg)));
+            spans.push(mode_change_span(old, new, Some(bg)));
         }
     }
     spans
@@ -555,20 +585,7 @@ fn header_icon(file: &FileHeader, color: Color, bg: Color) -> Vec<Span<'static>>
 /// Right-pinned stat + fold arrow for a file-header row.
 fn file_header_stat_spans(file: &FileHeader, bg: Color, collapsed: bool) -> Vec<Span<'static>> {
     let glyph = if collapsed { "▶" } else { "▼" };
-    let mut spans = if file.binary {
-        vec![Span::styled("binary", Style::default().fg(Color::DarkGray).bg(bg))]
-    } else {
-        vec![
-            Span::styled(
-                format!("+{}", file.added),
-                Style::default().fg(Color::Green).bg(bg),
-            ),
-            Span::styled(
-                format!(" -{}", file.deleted),
-                Style::default().fg(Color::Red).bg(bg),
-            ),
-        ]
-    };
+    let mut spans = stat_spans(file.added, file.deleted, file.binary, Some(bg));
     spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
     spans.push(Span::styled(
         glyph.to_string(),
@@ -580,7 +597,9 @@ fn file_header_stat_spans(file: &FileHeader, bg: Color, collapsed: bool) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{DiffLine, FileHeader, HunkMeta, LineKind, ParsedDiff, Section, SectionKind};
+    use crate::diff::{
+        Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LineKind, Section, SectionKind,
+    };
     use crate::test_support::*;
     use crate::theme::BG_HUNK;
     use ratatui::backend::TestBackend;
@@ -589,7 +608,7 @@ mod tests {
     fn file_header(path: &str, added: usize, deleted: usize) -> FileHeader {
         FileHeader {
             path: path.into(),
-            status: 'M',
+            status: FileStatus::Modified,
             added,
             deleted,
             old_path: None,
@@ -597,11 +616,7 @@ mod tests {
             mode_old: None,
             mode_new: None,
             binary: false,
-            hunks: vec![HunkMeta {
-                section: None,
-                added,
-                deleted,
-            }],
+            hunks: vec![HunkMeta { added, deleted }],
         }
     }
 
@@ -609,11 +624,11 @@ mod tests {
     fn renders_file_headers_in_folder_diff() {
         let fa = file_header("src/a.rs", 1, 0);
         let fb = file_header("src/b.rs", 2, 0);
-        let parsed = ParsedDiff {
+        let diff = Diff {
             header: FileHeader {
                 path: "src".into(),
                 old_path: None,
-                status: 'M',
+                status: FileStatus::Modified,
                 added: 3,
                 deleted: 0,
                 rename_percent: None,
@@ -686,7 +701,7 @@ mod tests {
         };
         let mut app = sample_app();
         app.selected_path = Some("src".into());
-        app.snapshot = snapshot_with_diff(parsed);
+        app.snapshot = snapshot_with_diff(diff);
 
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
@@ -698,7 +713,10 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect();
         assert!(text.contains("src"), "folder path in locked header: {text}");
-        assert!(text.contains("2 files"), "file count in locked header: {text}");
+        assert!(
+            text.contains("2 files"),
+            "file count in locked header: {text}"
+        );
         assert!(text.contains("src/a.rs"), "file header row a: {text}");
         assert!(text.contains("src/b.rs"), "file header row b: {text}");
     }
@@ -707,10 +725,10 @@ mod tests {
     fn render_diff_smoke() {
         let mut app = sample_app();
         app.selected_path = Some("x.rs".into());
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             FileHeader {
                 path: "x.rs".into(),
-                status: 'M',
+                status: FileStatus::Modified,
                 added: 1,
                 deleted: 1,
                 old_path: None,
@@ -719,7 +737,6 @@ mod tests {
                 mode_new: None,
                 binary: false,
                 hunks: vec![HunkMeta {
-                    section: None,
                     added: 1,
                     deleted: 1,
                 }],
@@ -756,10 +773,10 @@ mod tests {
 
     #[test]
     fn render_diff_with_word_runs() {
-        let parsed = single_parsed(
+        let diff = single_diff(
             FileHeader {
                 path: "x.rs".into(),
-                status: 'M',
+                status: FileStatus::Modified,
                 added: 2,
                 deleted: 2,
                 old_path: None,
@@ -768,7 +785,6 @@ mod tests {
                 mode_new: None,
                 binary: false,
                 hunks: vec![HunkMeta {
-                    section: None,
                     added: 2,
                     deleted: 2,
                 }],
@@ -855,7 +871,7 @@ mod tests {
         app.selected_path = Some("x.rs".into());
         app.word_diff_on = true;
         app.last_header_height = 1;
-        app.snapshot = snapshot_with_diff(parsed);
+        app.snapshot = snapshot_with_diff(diff);
 
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
@@ -891,7 +907,7 @@ mod tests {
     fn mode_hidden_when_unchanged() {
         let mut app = sample_app();
         app.selected_path = Some("x.rs".into());
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(Some(0o100644), Some(0o100644)),
             vec![hunk_header(0), ctx_line(0, 0)],
         ));
@@ -913,7 +929,7 @@ mod tests {
     fn mode_shown_when_changed() {
         let mut app = sample_app();
         app.selected_path = Some("x.rs".into());
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(Some(0o100644), Some(0o100755)),
             vec![hunk_header(0), ctx_line(0, 0)],
         ));
@@ -954,10 +970,7 @@ mod tests {
         let lines: Vec<DiffLine> = std::iter::once(hunk_header(0))
             .chain((0..n).map(|i| ctx_line(i, 0)))
             .collect();
-        app.snapshot = snapshot_with_diff(single_parsed(
-            header_full(None, None),
-            lines,
-        ));
+        app.snapshot = snapshot_with_diff(single_diff(header_full(None, None), lines));
         // Scroll the `@@` header off above the body top.
         app.diff_scroll = 25;
 
@@ -983,10 +996,7 @@ mod tests {
         let lines: Vec<DiffLine> = std::iter::once(hunk_header(0))
             .chain((0..n).map(|i| ctx_line(i, 0)))
             .collect();
-        app.snapshot = snapshot_with_diff(single_parsed(
-            header_full(None, None),
-            lines,
-        ));
+        app.snapshot = snapshot_with_diff(single_diff(header_full(None, None), lines));
         app.diff_scroll = 0; // header at top, in flow.
 
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
@@ -1006,18 +1016,12 @@ mod tests {
     }
 
     #[test]
-fn hunk_header_restyle() {
+    fn hunk_header_restyle() {
         let meta = HunkMeta {
-            section: Some("fn main()".into()),
             added: 3,
             deleted: 1,
         };
-        let name_tokens = vec![TokenOwned {
-            text: "fn".into(),
-            color: Color::Rgb(1, 2, 3),
-        }];
-        let name = hunk_name_spans(&meta, &name_tokens, BG_HUNK);
-        assert!(name.iter().any(|s| s.content.as_ref() == "fn")); // syntax-highlighted name
+        let name = hunk_name_spans(BG_HUNK);
         // The `@@` marker is replaced by a dedicated hunk icon.
         assert!(!name.iter().any(|s| s.content.as_ref() == "@@"));
         assert!(name.iter().any(|s| s.content.as_ref().contains(HUNK_ICON)));
@@ -1039,7 +1043,7 @@ fn hunk_header_restyle() {
     fn active_highlight_bg() {
         let mut app = sample_app();
         app.selected_path = Some("x.rs".into());
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(None, None),
             vec![
                 hunk_header(0),
@@ -1053,7 +1057,7 @@ fn hunk_header_restyle() {
         app.active_chunk = Some(0);
         // Focus the diff pane so the active chunk uses the full selection
         // color (#464741); otherwise focus-based dimming would render it dim.
-        app.focus = crate::app::Focus::Diff;
+        app.focus = crate::theme::Focus::Diff;
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
@@ -1069,7 +1073,7 @@ fn hunk_header_restyle() {
     fn focus_dims_active_chunk() {
         let mut app = sample_app();
         app.selected_path = Some("x.rs".into());
-        app.snapshot = snapshot_with_diff(single_parsed(
+        app.snapshot = snapshot_with_diff(single_diff(
             header_full(None, None),
             vec![
                 hunk_header(0),
@@ -1083,7 +1087,7 @@ fn hunk_header_restyle() {
         app.active_chunk = Some(0);
         // Focus on the tree: the active chunk header is the unfocused pane's
         // active item, so it renders at the dimmed color #3d3e38.
-        app.focus = crate::app::Focus::Tree;
+        app.focus = crate::theme::Focus::Tree;
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
@@ -1095,7 +1099,7 @@ fn hunk_header_restyle() {
     #[test]
     fn render_leaves_active_chunk_alone() {
         let mut app = sample_app();
-        app.focus = crate::app::Focus::Diff;
+        app.focus = crate::theme::Focus::Diff;
         app.snapshot = snapshot_with_diff(fitting_hunk());
         app.height = 20;
         app.last_header_height = 1;
@@ -1116,10 +1120,7 @@ fn hunk_header_restyle() {
         let lines: Vec<DiffLine> = std::iter::once(hunk_header(0))
             .chain((0..n).map(|i| ctx_line(i, 0)))
             .collect();
-        app.snapshot = snapshot_with_diff(single_parsed(
-            header_full(None, None),
-            lines,
-        ));
+        app.snapshot = snapshot_with_diff(single_diff(header_full(None, None), lines));
         // Scroll to the absolute bottom; render must clamp so the last line
         // (raw_text `l19`) is visible despite the sticky header row.
         app.diff_scroll = usize::MAX;

@@ -2,8 +2,14 @@
 
 use ratatui::style::Color;
 
-use crate::app::Focus;
-use crate::diff::LineKind;
+use crate::diff::{FileStatus, LineKind};
+
+/// Which pane has keyboard focus; drives the active/unfocused styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Tree,
+    Diff,
+}
 
 pub const BG_ADDED: Color = Color::Rgb(0x1a, 0x33, 0x26);
 pub const BG_REMOVED: Color = Color::Rgb(0x3a, 0x1f, 0x1f);
@@ -23,15 +29,14 @@ pub const BG_RUN_REMOVED: Color = Color::Rgb(0x5a, 0x2f, 0x2f);
 pub const DIR_FG: Color = Color::Rgb(0x66, 0xd9, 0xef);
 
 /// Foreground color for a diff/file status letter.
-pub fn status_color(ch: char) -> Color {
-    match ch {
-        'A' => Color::Green,
-        'M' => Color::Yellow,
-        'D' => Color::Red,
-        'R' => Color::Magenta,
-        'C' => Color::Cyan,
-        'T' => Color::Blue,
-        _ => Color::Reset,
+pub fn status_color(status: FileStatus) -> Color {
+    match status {
+        FileStatus::Added => Color::Green,
+        FileStatus::Modified => Color::Yellow,
+        FileStatus::Deleted => Color::Red,
+        FileStatus::Renamed => Color::Magenta,
+        FileStatus::Copied => Color::Cyan,
+        FileStatus::TypeChanged => Color::Blue,
     }
 }
 

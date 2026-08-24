@@ -7,9 +7,14 @@
 
 use std::sync::Arc;
 
-use crate::diff::ParsedDiff;
+use crate::diff::Diff;
 use crate::highlight::TokenOwned;
 use crate::tree::Tree;
+
+/// Per-line highlight tokens for the selected diff; `None` means a line was
+/// not highlighted (binary line, or beyond the highlight cap). Parallel to
+/// `Diff::lines`.
+pub type HighlightLines = Vec<Option<Vec<TokenOwned>>>;
 
 /// Monotonic sequence number stamped onto each `Request::Diff` so the worker
 /// can drop stale asks.
@@ -23,12 +28,12 @@ pub struct Snapshot {
     /// Changed-file tree (worker-side default expansion; the UI re-applies its
     /// own `expanded_dirs` on swap).
     pub tree: Tree,
-    /// Parsed diff for the selected path, if any.
-    pub selected_diff: Option<ParsedDiff>,
+    /// Diff for the selected path, if any.
+    pub selected_diff: Option<Diff>,
     /// Per-body-line syntax tokens, parallel to `selected_diff.lines`.
-    /// `None`  = not yet highlighted (e.g. past the >10k-line cap).
+    /// `None` = not yet highlighted (filled in as the viewport moves).
     /// `Some([])` = highlighted but uncolored (grammar miss / no highlighter).
-    pub selected_highlight: Vec<Option<Vec<TokenOwned>>>,
+    pub selected_highlight: HighlightLines,
     /// Last git error text, surfaced in the status line. `None` when healthy.
     pub error: Option<String>,
     /// Current branch state (branch name, ahead/behind vs base, unpushed vs
@@ -42,13 +47,22 @@ pub type ArcSnapshot = Arc<Snapshot>;
 /// Request the UI sends to the worker thread.
 #[derive(Debug, Clone)]
 pub enum Request {
-    /// The selection moved to `path`; parse + highlight its diff at context
+    /// The selection moved to `path`; build + highlight its diff at context
     /// `ctx`. `seq` lets the worker drop stale asks.
-    Diff {
+    Diff { path: String, ctx: u32, seq: Seq },
+    /// Highlight the selected diff's sparse line range `from..to` (exclusive,
+    /// raw `diff.lines` indices). Sent when the viewport shifts so the worker
+    /// colors exactly the visible region plus lookahead.
+    Highlight {
         path: String,
         ctx: u32,
+        from: usize,
+        to: usize,
         seq: Seq,
     },
+    /// Switch the base the diffs are computed against (e.g. between `HEAD`
+    /// and `main...HEAD`) and recompute the whole tree + diff.
+    SetRev { rev: String },
     /// Tear the worker down cleanly (UI is exiting).
     Shutdown,
 }
@@ -59,32 +73,19 @@ mod tests {
 
     #[test]
     fn snapshot_round_trips_fields() {
-        let tree = Tree::build(vec![('M', "src/a.rs".to_string())]);
-        let snap = Snapshot {
-            empty: false,
-            selected_diff: None,
-            selected_highlight: Vec::new(),
-            error: None,
-            branch_state: crate::git::BranchState::default(),
-            tree,
-        };
-        assert!(!snap.empty);
-        assert!(snap.selected_diff.is_none());
-    }
+        // Non-default `selected_diff`/`tree`, built via the shared fixture
+        // helper, must round-trip intact onto the carried `ArcSnapshot`.
+        let diff = crate::test_support::sample_diff(2);
+        let snap = crate::test_support::snapshot_with_diff(diff.clone());
 
-    #[test]
-    fn arc_snapshot_clones_cheaply() {
-        let tree = Tree::build(Vec::new());
-        let snap = Arc::new(Snapshot {
-            empty: false,
-            selected_diff: None,
-            selected_highlight: Vec::new(),
-            error: None,
-            branch_state: crate::git::BranchState::default(),
-            tree,
-        });
-        let clone: ArcSnapshot = snap.clone();
-        assert!(Arc::ptr_eq(&snap, &clone));
+        assert!(!snap.empty);
+        assert_eq!(snap.selected_diff.as_ref(), Some(&diff));
+        assert_eq!(snap.selected_diff.as_ref().unwrap().header.path, "x.rs");
+        // Per-line highlight slots mirror the diff's lines.
+        assert_eq!(snap.selected_highlight.len(), 2);
+        assert!(snap.selected_highlight.iter().all(Option::is_some));
+        // The tree carries the fixture's single file.
+        assert_eq!(snap.tree.flatten().len(), 1);
     }
 
     #[test]

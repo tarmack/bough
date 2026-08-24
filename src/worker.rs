@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, Receiver, Sender};
 
-use crate::diff::{self, LineKind, ParsedDiff};
+use crate::diff::Diff;
 use crate::git;
-use crate::highlight::{Highlighter, TokenOwned};
-use crate::snapshot::{ArcSnapshot, Request, Seq, Snapshot};
+use crate::highlight::{Highlighter, ResumeState};
+use crate::snapshot::{ArcSnapshot, HighlightLines, Request, Seq, Snapshot};
 use crate::tree::Tree;
 use crate::watch::{Watcher, WorkerEvent};
 
@@ -32,8 +32,6 @@ const HARD_CEILING: Duration = Duration::from_millis(100);
 const LARGE_DIFF_THRESHOLD: usize = 2000;
 /// Above this git wall time the floor raises to the ceiling.
 const SLOW_GIT_THRESHOLD: Duration = Duration::from_millis(200);
-/// Highlight at most this many body lines; the rest render uncolored.
-pub const HIGHLIGHT_CAP: usize = 2000;
 
 /// Compile-time proof that the worker's cross-thread types are `Send`. The
 /// `Highlighter` is intentionally NOT asserted here: syntect's onig backend
@@ -70,16 +68,16 @@ pub struct Worker {
 
 impl Worker {
     /// Spawn the worker thread. `initial_theme` selects the syntect theme;
-    /// an unknown theme degrades to no-color (the worker still parses diffs).
-    /// `repo_root` is where `notify` watches; `base_ref` is the local branch
-    /// name whose ref file is watched for movement (e.g. `main`), or `None`.
+    /// an unknown theme degrades to no-color (the worker still builds structured
+    /// diffs). `repo_root` is where `notify` watches; `base_ref` is the local
+    /// branch name whose ref file is watched for movement (e.g. `main`), or
+    /// `None`.
     pub fn spawn(
         rev: String,
         empty: bool,
         repo_root: PathBuf,
         base_ref: Option<String>,
         initial_theme: String,
-        initial_tree: Tree,
     ) -> Result<Worker, WorkerError> {
         let watcher = match Watcher::start(repo_root.clone(), base_ref.clone()) {
             Ok(w) => w,
@@ -87,7 +85,7 @@ impl Worker {
                 // No watcher: surface via the first snapshot's error and run
                 // request-only. poll_mode stays false (watcher is off, not
                 // degraded to a workdir poll).
-                return spawn_no_watcher(rev, empty, initial_theme, e.to_string(), initial_tree);
+                return spawn_no_watcher(rev, empty, initial_theme, e.to_string());
             }
         };
         let poll_mode = watcher_poll_mode(&watcher);
@@ -109,7 +107,6 @@ impl Worker {
                     event_rx,
                     request_rx,
                     snapshot_tx,
-                    initial_tree,
                 );
             })
             .map_err(|e| WorkerError {
@@ -148,7 +145,6 @@ fn spawn_no_watcher(
     empty: bool,
     theme: String,
     watch_err: String,
-    initial_tree: Tree,
 ) -> Result<Worker, WorkerError> {
     let (request_tx, request_rx) = crossbeam_channel::bounded::<Request>(64);
     let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded::<ArcSnapshot>(16);
@@ -160,7 +156,7 @@ fn spawn_no_watcher(
             let highlighter = Highlighter::new(&theme).ok();
             // Emit one initial snapshot carrying the watcher error so the UI
             // status line surfaces it, then serve Diff requests only.
-            let mut state = WorkerState::new(rev.clone(), empty, highlighter, initial_tree);
+            let mut state = WorkerState::new(rev.clone(), empty, highlighter);
             state.last_error = Some(first_error);
             state.send_initial(&snapshot_tx);
 
@@ -192,8 +188,74 @@ fn spawn_no_watcher(
     })
 }
 
-/// Cached parsed diff + its highlight, keyed by `(path, ctx)`.
-type CachedDiff = (ParsedDiff, Vec<Option<Vec<TokenOwned>>>);
+/// Cached diff plus its sparse viewport-driven highlight, keyed by `(path,
+/// ctx)`. Highlight entries are `Some` once the line has been highlighted;
+/// `None` otherwise. The UI only ever asks for the visible region, so `hl`
+/// stays sparse and each request colors exactly the new viewport.
+struct CachedDiff {
+    diff: Diff,
+    hl: HighlightLines,
+    /// Global line -> (file index, body offset of that file), `None` for
+    /// headers.
+    body_idx: Vec<Option<(usize, usize)>>,
+    files: Vec<FileCache>,
+}
+
+/// Body lines between parse-state checkpoints. Smaller = cheaper jumps, larger
+/// = less memory; 256 keeps a jump to any line under ~256 parse-only lines
+/// while a 100k-line file costs only ~400 checkpoints.
+const CKPT_STRIDE: usize = 256;
+
+/// A parse-state checkpoint within one file's body-line stream.
+struct Checkpoint {
+    /// Body offset (within its file's body-line stream) this state precedes.
+    body: usize,
+    resume: ResumeState,
+}
+
+/// Per-file body-line and checkpoint bookkeeping within a [`CachedDiff`].
+struct FileCache {
+    /// Global `diff.lines` indices of this file's body lines, in diff order.
+    body_lines: Vec<usize>,
+    /// Checkpoints at body offsets 0, CKPT_STRIDE, 2*CKPT_STRIDE, ... built
+    /// lazily.
+    checkpoints: Vec<Checkpoint>,
+}
+
+/// Build sparse highlight + per-file body/checkpoint bookkeeping for `diff`.
+fn new_cached_diff(diff: &Diff, highlighter: Option<&Highlighter>) -> CachedDiff {
+    let mut body_idx = vec![None; diff.lines.len()];
+    let mut files: Vec<FileCache> = diff
+        .files
+        .iter()
+        .map(|_| FileCache {
+            body_lines: Vec::new(),
+            checkpoints: Vec::new(),
+        })
+        .collect();
+    for (i, line) in diff.lines.iter().enumerate() {
+        if line.kind.is_header() {
+            continue;
+        }
+        let file = diff.sections[line.section].file;
+        let body = files[file].body_lines.len();
+        body_idx[i] = Some((file, body));
+        files[file].body_lines.push(i);
+    }
+    if let Some(h) = highlighter {
+        for (fi, fc) in files.iter_mut().enumerate() {
+            if let Some(resume) = h.fresh_state(&diff.files[fi].path) {
+                fc.checkpoints.push(Checkpoint { body: 0, resume });
+            }
+        }
+    }
+    CachedDiff {
+        diff: diff.clone(),
+        hl: vec![None; diff.lines.len()],
+        body_idx,
+        files,
+    }
+}
 
 /// Mutable worker-thread state.
 struct WorkerState {
@@ -205,7 +267,6 @@ struct WorkerState {
     latest_request_seq: Seq,
     last_tree: Option<Tree>,
     last_error: Option<String>,
-    last_stats: HashMap<String, (usize, usize)>,
     cache: LruCache<(String, u32), CachedDiff>,
     /// When the floor was last raised; `None` when floor is at the baseline.
     floor_raised_at: Option<Instant>,
@@ -213,15 +274,13 @@ struct WorkerState {
     last_git_wall: Duration,
     /// Cached branch state (ahead/behind vs base, unpushed vs upstream).
     last_branch: git::BranchState,
+    /// Full per-file metadata from the last recompute, keyed by path. Lets a
+    /// single-file diff reuse the scan instead of re-scanning the repository.
+    last_changes: HashMap<String, git::ChangeInfo>,
 }
 
 impl WorkerState {
-    fn new(
-        rev: String,
-        empty: bool,
-        highlighter: Option<Highlighter>,
-        initial_tree: Tree,
-    ) -> Self {
+    fn new(rev: String, empty: bool, highlighter: Option<Highlighter>) -> Self {
         // Compute once up front so the first worker snapshot already shows
         // real branch state; later recomputes refresh it.
         let initial_branch = git::branch_state(&rev);
@@ -232,22 +291,20 @@ impl WorkerState {
             selected_path: None,
             ctx: 3,
             latest_request_seq: 0,
-            last_tree: Some(initial_tree),
+            last_tree: None,
             last_error: None,
-            last_stats: HashMap::new(),
             cache: LruCache::new(8),
             floor_raised_at: None,
             last_git_wall: Duration::ZERO,
             last_branch: initial_branch,
+            last_changes: HashMap::new(),
         }
     }
 
     /// Send an initial empty-ish snapshot so the UI's first frame isn't blank
     /// while the first recompute is debouncing.
     fn send_initial(&mut self, tx: &Sender<ArcSnapshot>) {
-        let tree = self.last_tree.clone().unwrap_or_else(|| Tree::build(Vec::new()));
-        let snap = self.snapshot(tree, None, Vec::new(), self.last_error.clone());
-        let _ = tx.send(Arc::new(snap));
+        send_snapshot(self, tx, None, Vec::new(), self.last_error.clone());
     }
 
     /// Assemble a `Snapshot` from the current worker state plus the caller's
@@ -255,8 +312,8 @@ impl WorkerState {
     fn snapshot(
         &mut self,
         tree: Tree,
-        selected_diff: Option<ParsedDiff>,
-        selected_highlight: Vec<Option<Vec<TokenOwned>>>,
+        selected_diff: Option<Diff>,
+        selected_highlight: HighlightLines,
         error: Option<String>,
     ) -> Snapshot {
         Snapshot {
@@ -279,11 +336,14 @@ fn run_loop(
     event_rx: Receiver<WorkerEvent>,
     request_rx: Receiver<Request>,
     snapshot_tx: Sender<ArcSnapshot>,
-    initial_tree: Tree,
 ) {
     let _watcher = watcher; // keep alive for the life of the loop
-    let mut state = WorkerState::new(rev, empty, highlighter, initial_tree);
+    let mut state = WorkerState::new(rev, empty, highlighter);
     state.send_initial(&snapshot_tx);
+    // First real snapshot comes from the initial recompute, so startup never
+    // blocks the main thread on the git scan (whose cost scales with the total
+    // diff size).
+    recompute(&mut state, &snapshot_tx);
 
     let mut last_event: Option<Instant> = None;
     let mut last_recompute: Option<Instant> = None;
@@ -317,7 +377,11 @@ fn run_loop(
         }
 
         let now = Instant::now();
-        if debounce_due && last_event.map(|le| should_fire(le, now, floor)).unwrap_or(false) {
+        if debounce_due
+            && last_event
+                .map(|le| should_fire(le, now, floor))
+                .unwrap_or(false)
+        {
             if last_recompute
                 .map(|lr| now.duration_since(lr) < HARD_CEILING)
                 .unwrap_or(false)
@@ -377,6 +441,17 @@ fn is_stale(latest: Seq, incoming: Seq) -> bool {
 fn handle_request(req: Request, state: &mut WorkerState, tx: &Sender<ArcSnapshot>) -> bool {
     match req {
         Request::Shutdown => true,
+        Request::SetRev { rev } => {
+            if rev != state.rev {
+                state.rev = rev;
+                // Diffs and highlights are cached by `(path, ctx)`; they no
+                // longer apply once the base changes, so drop them.
+                state.cache = LruCache::new(8);
+                state.last_error = None;
+                recompute(state, tx);
+            }
+            false
+        }
         Request::Diff { path, ctx, seq } => {
             if is_stale(state.latest_request_seq, seq) {
                 return false;
@@ -387,28 +462,80 @@ fn handle_request(req: Request, state: &mut WorkerState, tx: &Sender<ArcSnapshot
             serve_diff(state, &path, ctx, tx);
             false
         }
+        Request::Highlight {
+            path,
+            ctx,
+            from,
+            to,
+            seq,
+        } => {
+            if is_stale(state.latest_request_seq, seq) {
+                return false;
+            }
+            // Only highlight the currently-selected file at the current context;
+            // a highlight for a stale selection would clobber the live view.
+            if state.selected_path.as_deref() != Some(path.as_str()) || state.ctx != ctx {
+                return false;
+            }
+            state.latest_request_seq = seq;
+            fill_highlight_range(state, &path, ctx, from, to, tx);
+            false
+        }
+    }
+}
+
+/// A `(status, path)` listing entry.
+type Entry = (char, String);
+/// Per-path `(added, deleted)` line stats.
+type LineStats = HashMap<String, (usize, usize)>;
+
+/// Scan the working tree into `(status, path)` entries plus per-path
+/// `(added, deleted)` stats. Empty repos read the untracked listing; otherwise
+/// the full change set is read and cached for per-file diff reuse.
+fn scan_entries(state: &mut WorkerState) -> Result<(Vec<Entry>, LineStats), String> {
+    if state.empty {
+        let entries = git::initial_listing().map_err(|e| e.to_string())?;
+        let paths: Vec<String> = entries.iter().map(|(_, p)| p.clone()).collect();
+        let stats = git::initial_stats(&paths);
+        state.last_changes.clear();
+        Ok((entries, stats))
+    } else {
+        let changes = git::all_changes(&state.rev).map_err(|e| e.to_string())?;
+        state.last_changes = changes
+            .iter()
+            .map(|c| (c.path.clone(), c.clone()))
+            .collect();
+        let entries: Vec<(char, String)> = changes
+            .iter()
+            .map(|c| (c.status.as_char(), c.path.clone()))
+            .collect();
+        let stats: HashMap<_, _> = changes
+            .iter()
+            .map(|c| (c.path.clone(), (c.added, c.deleted)))
+            .collect();
+        Ok((entries, stats))
     }
 }
 
 /// Full recompute: changed-files, tree, stats, selected file's diff.
+///
+/// Runs one scan of the working tree and derives the entries, per-file stats,
+/// and per-file metadata (for the diff header) from it, so nothing is rescanned
+/// on file selection.
 fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
     let t0 = Instant::now();
-    let entries = if state.empty {
-        git::listing_empty()
-    } else {
-        git::changed_files(&state.rev)
-    };
-    state.last_git_wall = t0.elapsed();
-    state.last_branch = git::branch_state(&state.rev);
 
-    let entries = match entries {
-        Ok(e) => e,
+    let (entries, stats) = match scan_entries(state) {
+        Ok(x) => x,
         Err(err) => {
-            state.last_error = Some(err.to_string());
+            state.last_error = Some(err);
             send_error_snapshot(state, tx);
             return;
         }
     };
+
+    state.last_git_wall = t0.elapsed();
+    state.last_branch = git::branch_state(&state.rev);
 
     // Adaptive floor: slow git or huge diff raises the floor for 10s.
     if state.last_git_wall > SLOW_GIT_THRESHOLD || entries.len() > LARGE_DIFF_THRESHOLD {
@@ -416,28 +543,15 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
     }
 
     let mut tree = Tree::build(entries);
-    let stats = if state.empty {
-        let paths: Vec<String> = tree
-            .nodes
-            .iter()
-            .filter(|n| n.kind == crate::tree::Kind::File)
-            .map(|n| n.path.clone())
-            .collect();
-        git::empty_stats(&paths)
-    } else {
-        git::diff_stats(&state.rev).unwrap_or_default()
-    };
     tree.annotate_stats(&stats);
     state.last_tree = Some(clone_tree(&tree));
 
     let (selected_diff, selected_highlight) = {
         let rev = state.rev.clone();
-        let empty = state.empty;
         let ctx = state.ctx;
-        build_selected_diff(state, &tree, &rev, empty, ctx)
+        build_selected_diff(state, &tree, &rev, ctx)
     };
 
-    state.last_stats = stats;
     state.last_error = None;
     let snap = state.snapshot(tree, selected_diff, selected_highlight, None);
     let _ = tx.send(Arc::new(snap));
@@ -445,11 +559,24 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
 
 /// Send a snapshot that carries `error` but preserves the last known tree.
 fn send_error_snapshot(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
+    send_snapshot(state, tx, None, Vec::new(), state.last_error.clone());
+}
+
+/// Assemble and send a snapshot from the current worker state plus the
+/// caller's diff/highlight/error specifics. Builds from the last known tree
+/// (an empty one if none) so the UI keeps showing the previous state.
+fn send_snapshot(
+    state: &mut WorkerState,
+    tx: &Sender<ArcSnapshot>,
+    diff: Option<Diff>,
+    highlight: HighlightLines,
+    error: Option<String>,
+) {
     let tree = state
         .last_tree
         .clone()
         .unwrap_or_else(|| Tree::build(Vec::new()));
-    let snap = state.snapshot(tree, None, Vec::new(), state.last_error.clone());
+    let snap = state.snapshot(tree, diff, highlight, error);
     let _ = tx.send(Arc::new(snap));
 }
 
@@ -459,9 +586,8 @@ fn build_selected_diff(
     state: &mut WorkerState,
     tree: &Tree,
     rev: &str,
-    empty: bool,
     ctx: u32,
-) -> (Option<ParsedDiff>, Vec<Option<Vec<TokenOwned>>>) {
+) -> (Option<Diff>, HighlightLines) {
     let Some(path) = state.selected_path.clone() else {
         return (None, Vec::new());
     };
@@ -469,157 +595,231 @@ fn build_selected_diff(
     if !in_tree {
         return (None, Vec::new());
     }
-    build_diff_for(&path, state, rev, empty, ctx)
+    build_diff_for(&path, state, rev, ctx)
 }
 
-/// Parse + highlight one file's diff. Uses the LRU cache when hit; on miss
-/// parses fresh and caches. Mutates `state.cache` and borrows
-/// `state.highlighter`.
+/// Parse one file's diff. Uses the LRU cache when hit; on miss parses fresh
+/// and caches it un-highlighted (highlighting is filled progressively via
+/// [`fill_highlight`] as the UI scrolls). Mutates `state.cache`.
 fn build_diff_for(
     path: &str,
     state: &mut WorkerState,
     rev: &str,
-    empty: bool,
     ctx: u32,
-) -> (Option<ParsedDiff>, Vec<Option<Vec<TokenOwned>>>) {
+) -> (Option<Diff>, HighlightLines) {
     let key = (path.to_string(), ctx);
-    if let Some((parsed, hl)) = state.cache.get(&key) {
-        return (Some(parsed.clone()), hl.clone());
+    if let Some(e) = state.cache.get(&key) {
+        return (Some(e.diff.clone()), e.hl.clone());
     }
 
-    let new_file = empty || git::is_untracked(path);
-    let raw = if new_file {
-        git::file_diff_no_index(path, ctx)
+    let diff = if is_directory(state, path) {
+        build_directory_diff(path, state, rev, ctx)
     } else {
-        git::file_diff_ctx(rev, path, ctx)
+        build_single_file_diff(path, state, rev, ctx)
     };
-    let meta = if new_file {
-        git::file_meta_untracked(path)
-    } else {
-        git::file_meta(rev, path)
-    };
-    match (raw, meta) {
-        (Ok(raw), Ok(meta)) => {
-            let mut parsed = diff::parse_diff(&raw, path, meta.status);
-            // Authoritative per-file metadata (numstat-based) applies only to a
-            // single-file diff; a directory diff carries per-file metadata
-            // parsed straight from its raw body.
-            if parsed.files.len() == 1 {
-                apply_file_meta(&mut parsed.header, &meta, path);
-                if let Some(f) = parsed.files.first_mut() {
-                    apply_file_meta(f, &meta, path);
-                }
-            }
-            let hl = build_highlight(&parsed, &mut state.highlighter);
-            state.cache.put(key, (parsed.clone(), hl.clone()));
-            (Some(parsed), hl)
+
+    match diff {
+        Ok(diff) => {
+            // No highlighting yet: every line is `None` until the UI nudges the
+            // worker to fill the viewport. The diff itself renders instantly.
+            let cached = new_cached_diff(&diff, state.highlighter.as_ref());
+            let hl = cached.hl.clone();
+            state.cache.put(key, cached);
+            (Some(diff), hl)
         }
-        (Err(e), _) | (_, Err(e)) => {
+        Err(e) => {
             state.last_error = Some(e.to_string());
             (None, Vec::new())
         }
     }
 }
 
-/// Override a parsed file header with the authoritative `git::FileMeta`.
-fn apply_file_meta(header: &mut diff::FileHeader, meta: &git::FileMeta, path: &str) {
-    header.path = path.to_string();
-    header.added = meta.added;
-    header.deleted = meta.deleted;
-    header.old_path = meta.old_path.clone();
-    header.rename_percent = meta.rename_percent;
-    header.mode_old = meta.mode_old;
-    header.mode_new = meta.mode_new;
-    header.binary = meta.binary;
-    header.status = meta.status;
+/// Whether `path` names a directory in the scan: it has no direct entry but at
+/// least one changed file beneath it.
+fn is_directory(state: &WorkerState, path: &str) -> bool {
+    if state.last_changes.contains_key(path) {
+        return false;
+    }
+    let prefix = format!("{path}/");
+    state.last_changes.keys().any(|p| p.starts_with(&prefix))
 }
 
-/// Serve a `Request::Diff`: LRU hit → send a snapshot with the cached diff
-/// immediately, then refresh in the background and resend. Miss → fetch fresh.
-fn serve_diff(state: &mut WorkerState, path: &str, ctx: u32, tx: &Sender<ArcSnapshot>) {
-    let key = (path.to_string(), ctx);
-    let cached = state.cache.get(&key).map(|(p, h)| (p.clone(), h.clone()));
-
-    if let Some((parsed, hl)) = cached {
-        send_diff_snapshot(state, Some(parsed), hl, tx);
+/// Metadata for a single changed path: the scan's cached [`ChangeInfo`] when
+/// present, else the untracked lookup.
+fn meta_for(path: &str, state: &WorkerState) -> Result<git::FileMeta, git::GitError> {
+    if let Some(ci) = state.last_changes.get(path) {
+        return Ok(ci.clone().into_meta());
     }
+    git::file_meta_untracked(path)
+}
 
-    // Fresh fetch (also repopulates the cache). If we sent a cached entry
-    // above, this resend carries the up-to-date content ~150ms later.
+/// Build a single file's structured diff.
+fn build_single_file_diff(
+    path: &str,
+    state: &WorkerState,
+    rev: &str,
+    ctx: u32,
+) -> Result<Diff, git::GitError> {
+    let meta = meta_for(path, state)?;
+    git::diff_file(rev, path, &meta, ctx)
+}
+
+/// Build the multi-file diff for a selected directory: every changed file
+/// beneath it (including new files), in path order, combined under a summary
+/// header.
+fn build_directory_diff(
+    path: &str,
+    state: &WorkerState,
+    rev: &str,
+    ctx: u32,
+) -> Result<Diff, git::GitError> {
+    let prefix = format!("{path}/");
+    let mut entries: Vec<(&String, &git::ChangeInfo)> = state
+        .last_changes
+        .iter()
+        .filter(|(p, _)| p.starts_with(&prefix))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    // Open the repo once up front instead of re-discovering it per file.
+    let repo = git::open_repo().map_err(|e| git::GitError::message(e.to_string()))?;
+
+    let mut diffs = Vec::with_capacity(entries.len());
+    for (p, ci) in entries {
+        diffs.push(git::diff_file_in(
+            &repo,
+            rev,
+            p,
+            &ci.clone().into_meta(),
+            ctx,
+        )?);
+    }
+    Ok(Diff::from_directory(path, diffs))
+}
+
+/// Serve a `Request::Diff`: fetch the (cached or freshly-built) diff and send
+/// a snapshot immediately, un-highlighted on first visit. Highlighting then
+/// fills in via `Request::Highlight` nudges from the UI, so a larger file's
+/// diff appears right away and colors in as it scrolls.
+fn serve_diff(state: &mut WorkerState, path: &str, ctx: u32, tx: &Sender<ArcSnapshot>) {
     let rev = state.rev.clone();
-    let empty = state.empty;
-    let (parsed, hl) = build_diff_for(path, state, &rev, empty, ctx);
-    send_diff_snapshot(state, parsed, hl, tx);
+    let (diff, hl) = build_diff_for(path, state, &rev, ctx);
+    send_diff_snapshot(state, diff, hl, tx);
 }
 
 /// Assemble and send a snapshot whose only changed field vs the last full
 /// recompute is the selected diff (plus error).
 fn send_diff_snapshot(
     state: &mut WorkerState,
-    parsed: Option<ParsedDiff>,
-    hl: Vec<Option<Vec<TokenOwned>>>,
+    diff: Option<Diff>,
+    hl: HighlightLines,
     tx: &Sender<ArcSnapshot>,
 ) {
-    let tree = state
-        .last_tree
-        .clone()
-        .unwrap_or_else(|| Tree::build(Vec::new()));
-    let snap = state.snapshot(tree, parsed, hl, state.last_error.clone());
-    let _ = tx.send(Arc::new(snap));
+    send_snapshot(state, tx, diff, hl, state.last_error.clone());
 }
 
-/// Highlight a parsed diff's body lines up to `HIGHLIGHT_CAP`; lines past the
-/// cap get `None` (rendered uncolored). Each line is highlighted against its
-/// owning file's grammar; file-header rows are never colored.
-fn build_highlight(
-    parsed: &ParsedDiff,
-    highlighter: &mut Option<Highlighter>,
-) -> Vec<Option<Vec<TokenOwned>>> {
-    let total = parsed.lines.len();
-    let cap = total.min(HIGHLIGHT_CAP);
-    let mut out: Vec<Option<Vec<TokenOwned>>> = Vec::with_capacity(total);
+/// Ensure a checkpoint exists at `(body / CKPT_STRIDE) * CKPT_STRIDE`, then
+/// parse-only from it to `body`, returning the exact state preceding that body
+/// line. Builds checkpoints forward lazily (parse-only, no styling).
+fn ensure_resume(
+    fc: &mut FileCache,
+    diff: &Diff,
+    body: usize,
+    highlighter: &Highlighter,
+) -> Option<ResumeState> {
+    let base = (body / CKPT_STRIDE) * CKPT_STRIDE;
+    // Advance checkpoints until the last one covers `base`.
+    loop {
+        let last = fc.checkpoints.last()?;
+        if last.body >= base {
+            break;
+        }
+        let end = (last.body + CKPT_STRIDE).min(base);
+        let mut resume = last.resume.clone();
+        let texts: Vec<&str> = fc.body_lines[last.body..end]
+            .iter()
+            .map(|&i| diff.lines[i].raw_text.as_str())
+            .collect();
+        highlighter.parse_only(&mut resume, &texts);
+        fc.checkpoints.push(Checkpoint {
+            body: end,
+            resume: resume.clone(),
+        });
+    }
+    let ck = fc.checkpoints.iter().rev().find(|c| c.body == base)?;
+    let mut resume = ck.resume.clone();
+    if base < body {
+        let texts: Vec<&str> = fc.body_lines[base..body]
+            .iter()
+            .map(|&i| diff.lines[i].raw_text.as_str())
+            .collect();
+        highlighter.parse_only(&mut resume, &texts);
+    }
+    Some(resume)
+}
 
-    for line in parsed.lines.iter().take(cap) {
-        let file = parsed.sections.get(line.section).map(|s| s.file).unwrap_or(0);
-        let file_path = parsed.files.get(file).map(|f| f.path.as_str()).unwrap_or("");
+/// Highlight a cached diff's sparse range `from..to` (the visible viewport plus
+/// lookahead), resuming from checkpoints so any range is correct in isolation,
+/// then re-sends the snapshot. The cost is proportional to the visible region
+/// plus at most one CKPT_STRIDE parse-only bridge, independent of file size, so
+/// jumps to any part of a large file color in immediately.
+fn fill_highlight_range(
+    state: &mut WorkerState,
+    path: &str,
+    ctx: u32,
+    from: usize,
+    to: usize,
+    tx: &Sender<ArcSnapshot>,
+) {
+    let key = (path.to_string(), ctx);
+    {
+        let WorkerState {
+            cache, highlighter, ..
+        } = &mut *state;
+        let Some(entry) = cache.get(&key) else {
+            return;
+        };
+        let total = entry.diff.lines.len();
+        let to = to.min(total);
+        if from >= to {
+            return;
+        }
 
-        if line.kind == LineKind::HunkHeader {
-            let hunk_idx = parsed
-                .sections
-                .get(line.section)
-                .and_then(|s| s.hunk)
-                .unwrap_or(0);
-            let section = parsed
-                .files
-                .get(file)
-                .and_then(|f| f.hunks.get(hunk_idx))
-                .and_then(|m| m.section.as_deref());
-            match highlighter.as_mut() {
-                Some(h) => {
-                    h.reset();
-                    let tokens = match section {
-                        Some(sec) => h.line(file_path, sec),
+        let CachedDiff {
+            diff,
+            hl,
+            body_idx,
+            files,
+        } = entry;
+        let mut cur_file: Option<usize> = None;
+        let mut cur_resume: Option<ResumeState> = None;
+
+        for i in from..to {
+            match body_idx[i] {
+                None => hl[i] = Some(Vec::new()),
+                Some((file, body)) => {
+                    let Some(h) = highlighter.as_ref() else {
+                        hl[i] = Some(Vec::new());
+                        continue;
+                    };
+                    if cur_file != Some(file) {
+                        cur_resume = ensure_resume(&mut files[file], diff, body, h);
+                        cur_file = Some(file);
+                    }
+                    let tokens = match cur_resume.as_mut() {
+                        Some(r) => h.highlight(r, &diff.lines[i].raw_text),
                         None => Vec::new(),
                     };
-                    out.push(Some(tokens));
+                    hl[i] = Some(tokens);
                 }
-                None => out.push(Some(Vec::new())),
             }
-            continue;
-        }
-        if line.kind == LineKind::FileHeader {
-            out.push(Some(Vec::new()));
-            continue;
-        }
-        match highlighter.as_mut() {
-            Some(h) => out.push(Some(h.line(file_path, &line.raw_text))),
-            None => out.push(Some(Vec::new())),
         }
     }
-
-    // Lines past the cap stay `None` (rendered uncolored).
-    out.resize(total, None);
-    out
+    let (diff, hl) = match state.cache.get(&key) {
+        Some(e) => (e.diff.clone(), e.hl.clone()),
+        None => return,
+    };
+    send_diff_snapshot(state, Some(diff), hl, tx);
 }
 
 /// Deep-clone a `Tree` (its nodes hold owned `Vec`s and `String`s).
@@ -666,7 +866,7 @@ impl<K: Eq + Clone, V> LruCache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::sample_parsed;
+    use crate::test_support::sample_diff;
 
     #[test]
     fn lru_evicts_oldest() {
@@ -727,83 +927,35 @@ mod tests {
     }
 
     #[test]
-    fn build_highlight_wraps_each_line_in_some() {
-        let parsed = sample_parsed(3);
-        let mut hl = Highlighter::new("Monokai Extended").ok();
-        let out = build_highlight(&parsed, &mut hl);
-        assert_eq!(out.len(), parsed.lines.len());
-        assert!(out.iter().all(|e| e.is_some()));
-    }
+    fn fill_highlight_range_highlights_only_requested_slice() {
+        let diff = sample_diff(40);
+        let (snap_tx, _snap_rx) = crossbeam_channel::bounded::<ArcSnapshot>(16);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            Highlighter::new("Monokai Extended").ok(),
+        );
+        let key = ("x.rs".to_string(), 3u32);
+        state.cache.put(
+            key.clone(),
+            new_cached_diff(&diff, state.highlighter.as_ref()),
+        );
+        state.selected_path = Some("x.rs".into());
+        state.ctx = 3;
 
-    #[test]
-    fn build_highlight_caps_at_highlight_cap() {
-        // Build a parsed diff with 2 * HIGHLIGHT_CAP context lines.
-        let lines = (0..(2 * HIGHLIGHT_CAP))
-            .map(|_| crate::diff::DiffLine {
-                kind: LineKind::Context,
-                raw_text: "x".into(),
-                section: 0,
-                word_runs: None,
-            })
-            .collect();
-        let parsed = ParsedDiff {
-            header: crate::diff::FileHeader {
-                path: "x.rs".into(),
-                status: 'M',
-                added: 1,
-                deleted: 1,
-                old_path: None,
-                rename_percent: None,
-                mode_old: None,
-                mode_new: None,
-                binary: false,
-                hunks: vec![crate::diff::HunkMeta {
-                    section: None,
-                    added: 1,
-                    deleted: 1,
-                }],
-            },
-            files: vec![crate::diff::FileHeader {
-                path: "x.rs".into(),
-                status: 'M',
-                added: 1,
-                deleted: 1,
-                old_path: None,
-                rename_percent: None,
-                mode_old: None,
-                mode_new: None,
-                binary: false,
-                hunks: vec![crate::diff::HunkMeta {
-                    section: None,
-                    added: 1,
-                    deleted: 1,
-                }],
-            }],
-            sections: vec![crate::diff::Section {
-                kind: crate::diff::SectionKind::File,
-                file: 0,
-                hunk: None,
-            }],
-            lines,
-        };
-        let mut hl = Highlighter::new("Monokai Extended").ok();
-        let out = build_highlight(&parsed, &mut hl);
-        assert_eq!(out.len(), 2 * HIGHLIGHT_CAP);
-        // First HIGHLIGHT_CAP entries are Some(...).
-        assert!(out.iter().take(HIGHLIGHT_CAP).all(|e| e.is_some()));
-        // The rest are None (truncated).
-        assert!(out
-            .iter()
-            .skip(HIGHLIGHT_CAP)
-            .all(|e| e.is_none()));
+        fill_highlight_range(&mut state, "x.rs", 3, 10, 20, &snap_tx);
+
+        let entry = state.cache.get(&key).unwrap();
+        assert!(entry.hl.iter().take(10).all(|e| e.is_none()));
+        assert!(entry.hl[10..20].iter().all(|e| e.is_some()));
+        assert!(entry.hl.iter().skip(20).all(|e| e.is_none()));
     }
 
     #[test]
     fn worker_state_new_populates_branch() {
         // This repo is a git repo, so the first worker state must already
         // carry a branch name (the footer depends on it before any recompute).
-        let tree = Tree::build(Vec::new());
-        let state = WorkerState::new("main...HEAD".into(), false, None, tree);
+        let state = WorkerState::new("main...HEAD".into(), false, None);
         assert!(state.last_branch.name.is_some());
     }
 }

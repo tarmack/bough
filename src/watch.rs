@@ -75,7 +75,15 @@ impl Watcher {
         let shutdown_t = shutdown.clone();
         let handle = thread::Builder::new()
             .name("bough-watch".into())
-            .spawn(move || run_loop(repo_root, base_ref, tx, poll_mode_t, shutdown_t))
+            .spawn(move || {
+                let io = WatchIo {
+                    repo_root,
+                    base_ref,
+                    out_tx: tx,
+                    shutdown: shutdown_t,
+                };
+                run_loop(io, poll_mode_t);
+            })
             .map_err(|e| WatchError {
                 message: format!("failed to spawn watch thread: {e}"),
             })?;
@@ -108,67 +116,72 @@ impl Drop for Watcher {
     }
 }
 
-/// Thread entry: try `notify`; on success run the forward+backstop loop, else
-/// fall back to the 1s poll loop.
-fn run_loop(
+/// Shared thread inputs threaded through the orchestration: where to watch,
+/// the base ref to watch, where to emit events, and the shutdown flag.
+struct WatchIo {
     repo_root: PathBuf,
     base_ref: Option<String>,
     out_tx: Sender<WorkerEvent>,
-    poll_mode: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-) {
+}
+
+/// Thread entry: try `notify`; on success run the forward+backstop loop, else
+/// fall back to the 1s poll loop.
+fn run_loop(io: WatchIo, poll_mode: Arc<AtomicBool>) {
     let (raw_tx, raw_rx) = bounded::<notify::Result<notify::Event>>(128);
     match recommended_watcher(move |res: notify::Result<notify::Event>| {
         let _ = raw_tx.send(res);
     }) {
         Ok(mut watcher) => {
-            if notify::Watcher::watch(&mut watcher, &repo_root, RecursiveMode::Recursive)
+            if notify::Watcher::watch(&mut watcher, &io.repo_root, RecursiveMode::Recursive)
                 .is_err()
             {
                 poll_mode.store(true, Ordering::Relaxed);
                 drop(watcher);
-                run_poll_loop(repo_root, base_ref, out_tx, &shutdown);
+                run_poll_loop(&io);
                 return;
             }
-            run_notify_loop(repo_root, base_ref, watcher, raw_rx, out_tx, &shutdown);
+            run_notify_loop(&io, watcher, raw_rx);
         }
-        Err(_) => {
+        Err(_err) => {
+            // `notify` silently failed on this platform; degrade to the 1s poll
+            // loop. The reason (`_err`) is intentionally not surfaced: there is
+            // no logging channel, so only the poll-mode flag the UI reads is
+            // set. Binding it here documents why it is dropped.
             poll_mode.store(true, Ordering::Relaxed);
-            run_poll_loop(repo_root, base_ref, out_tx, &shutdown);
+            run_poll_loop(&io);
         }
     }
 }
 
 /// `notify`-driven forward loop plus the 2s backstop ref poll.
 fn run_notify_loop(
-    repo_root: PathBuf,
-    base_ref: Option<String>,
+    io: &WatchIo,
     watcher: notify::RecommendedWatcher,
     raw_rx: Receiver<notify::Result<notify::Event>>,
-    out_tx: Sender<WorkerEvent>,
-    shutdown: &AtomicBool,
 ) {
     // Keep the watcher alive for the life of the loop.
     let _watcher = watcher;
 
-    let head_path = repo_root.join(".git/HEAD");
-    let base_path = base_ref
+    let head_path = io.repo_root.join(".git/HEAD");
+    let base_path = io
+        .base_ref
         .as_ref()
-        .map(|n| repo_root.join(format!(".git/refs/heads/{n}")));
+        .map(|n| io.repo_root.join(format!(".git/refs/heads/{n}")));
     let mut last_head = stat_mtime(&head_path);
     let mut last_base = base_path.as_deref().and_then(stat_mtime);
     let mut last_poll = Instant::now();
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if io.shutdown.load(Ordering::Relaxed) {
             break;
         }
         match raw_rx.recv_timeout(SHUTDOWN_TICK) {
             Ok(Ok(event)) => {
                 for path in &event.paths {
-                    let rel = path.strip_prefix(&repo_root).unwrap_or(path);
-                    if let Some(ev) = classify(rel, base_ref.as_deref()) {
-                        let _ = out_tx.send(ev);
+                    let rel = path.strip_prefix(&io.repo_root).unwrap_or(path);
+                    if let Some(ev) = classify(rel, io.base_ref.as_deref()) {
+                        let _ = io.out_tx.send(ev);
                     }
                 }
             }
@@ -177,64 +190,74 @@ fn run_notify_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        if last_poll.elapsed() >= BACKSTOP_INTERVAL {
-            last_poll = Instant::now();
-            let h = stat_mtime(&head_path);
-            if mtime_changed(last_head, h) {
-                last_head = h;
-                let _ = out_tx.send(WorkerEvent::RefsChanged);
-            }
-            if let Some(bp) = base_path.as_deref() {
-                let b = stat_mtime(bp);
-                if mtime_changed(last_base, b) {
-                    last_base = b;
-                    let _ = out_tx.send(WorkerEvent::RefsChanged);
-                }
-            }
-        }
+        poll_refs(
+            &head_path,
+            base_path.as_deref(),
+            &mut last_head,
+            &mut last_base,
+            &io.out_tx,
+            &mut last_poll,
+        );
     }
 }
 
 /// Degraded loop when `notify` is unavailable: emit `WorkdirChanged` every
 /// second and run the same 2s backstop ref poll.
-fn run_poll_loop(
-    repo_root: PathBuf,
-    base_ref: Option<String>,
-    out_tx: Sender<WorkerEvent>,
-    shutdown: &AtomicBool,
-) {
-    let head_path = repo_root.join(".git/HEAD");
-    let base_path = base_ref
+fn run_poll_loop(io: &WatchIo) {
+    let head_path = io.repo_root.join(".git/HEAD");
+    let base_path = io
+        .base_ref
         .as_ref()
-        .map(|n| repo_root.join(format!(".git/refs/heads/{n}")));
+        .map(|n| io.repo_root.join(format!(".git/refs/heads/{n}")));
     let mut last_head = stat_mtime(&head_path);
     let mut last_base = base_path.as_deref().and_then(stat_mtime);
     let mut last_workdir = Instant::now();
     let mut last_refs = Instant::now();
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if io.shutdown.load(Ordering::Relaxed) {
             break;
         }
         thread::sleep(SHUTDOWN_TICK);
 
         if last_workdir.elapsed() >= POLL_INTERVAL {
             last_workdir = Instant::now();
-            let _ = out_tx.send(WorkerEvent::WorkdirChanged);
+            let _ = io.out_tx.send(WorkerEvent::WorkdirChanged);
         }
-        if last_refs.elapsed() >= BACKSTOP_INTERVAL {
-            last_refs = Instant::now();
-            let h = stat_mtime(&head_path);
-            if mtime_changed(last_head, h) {
-                last_head = h;
+        poll_refs(
+            &head_path,
+            base_path.as_deref(),
+            &mut last_head,
+            &mut last_base,
+            &io.out_tx,
+            &mut last_refs,
+        );
+    }
+}
+
+/// Backstop ref poll shared by both loops: on the cadence gated by
+/// `last_poll`, stat `HEAD` and the base ref and emit `RefsChanged` when
+/// either moved.
+fn poll_refs(
+    head_path: &Path,
+    base_path: Option<&Path>,
+    last_head: &mut Option<SystemTime>,
+    last_base: &mut Option<SystemTime>,
+    out_tx: &Sender<WorkerEvent>,
+    last_poll: &mut Instant,
+) {
+    if last_poll.elapsed() >= BACKSTOP_INTERVAL {
+        *last_poll = Instant::now();
+        let h = stat_mtime(head_path);
+        if mtime_changed(*last_head, h) {
+            *last_head = h;
+            let _ = out_tx.send(WorkerEvent::RefsChanged);
+        }
+        if let Some(bp) = base_path {
+            let b = stat_mtime(bp);
+            if mtime_changed(*last_base, b) {
+                *last_base = b;
                 let _ = out_tx.send(WorkerEvent::RefsChanged);
-            }
-            if let Some(bp) = base_path.as_deref() {
-                let b = stat_mtime(bp);
-                if mtime_changed(last_base, b) {
-                    last_base = b;
-                    let _ = out_tx.send(WorkerEvent::RefsChanged);
-                }
             }
         }
     }
@@ -329,7 +352,10 @@ mod tests {
 
     #[test]
     fn classify_head_without_base_config_is_still_refs() {
-        assert_eq!(classify(Path::new(".git/HEAD"), None), Some(WorkerEvent::RefsChanged));
+        assert_eq!(
+            classify(Path::new(".git/HEAD"), None),
+            Some(WorkerEvent::RefsChanged)
+        );
     }
 
     #[test]
@@ -352,6 +378,9 @@ mod tests {
     #[test]
     fn mtime_changed_stable_when_equal() {
         assert!(!mtime_changed(None, None));
-        assert!(!mtime_changed(Some(SystemTime::UNIX_EPOCH), Some(SystemTime::UNIX_EPOCH)));
+        assert!(!mtime_changed(
+            Some(SystemTime::UNIX_EPOCH),
+            Some(SystemTime::UNIX_EPOCH)
+        ));
     }
 }

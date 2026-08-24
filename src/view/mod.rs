@@ -2,7 +2,10 @@
 //!
 //! This is the presentation layer. It reads `crate::app::App` state and writes
 //! only the transient view-derived fields (`diff_width`, `height`,
-//! `last_header_height`, `sticky_line`). No application logic lives here.
+//! `last_header_height`, `sticky_file`/`sticky_hunk`). During draw it also clamps the
+//! selection/cursor state used to lay out the panes as a side effect
+//! (`app.selection` and `app.tree_scroll` in the tree pane; `app.diff_scroll`
+//! in the diff pane). No application logic lives here.
 
 mod diff;
 mod tree;
