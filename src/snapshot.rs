@@ -16,8 +16,9 @@ use crate::tree::Tree;
 /// `Diff::lines`.
 pub type HighlightLines = Vec<Option<Vec<TokenOwned>>>;
 
-/// Monotonic sequence number stamped onto each `Request::Diff` so the worker
-/// can drop stale asks.
+/// Monotonic sequence number stamped onto each `Request::Diff`,
+/// `Request::Highlight`, and `Request::LoadImage` so the worker can drop stale
+/// asks.
 pub type Seq = u64;
 
 /// An immutable snapshot of the whole tree + currently-selected diff, built
@@ -25,8 +26,8 @@ pub type Seq = u64;
 pub struct Snapshot {
     /// Whether the repo has no commits yet (`empty` mode): every file is new.
     pub empty: bool,
-    /// Changed-file tree (worker-side default expansion; the UI re-applies its
-    /// own `expanded_dirs` on swap).
+    /// Changed-file tree. Directories are built collapsed; the UI re-applies
+    /// its own `expanded_dirs` on swap.
     pub tree: Tree,
     /// Diff for the selected path, if any.
     pub selected_diff: Option<Diff>,

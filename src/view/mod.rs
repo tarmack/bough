@@ -44,6 +44,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     let tree_footer = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y + tree_h, tree_w, 1);
 
     if app.preview.active() {
+        // The diff is not rendered: no sticky rows are pinned, so clear any
+        // stale click-row mapping from the previous frame.
+        app.sticky_file = None;
+        app.sticky_hunk = None;
         preview::render(f, app, diff);
     } else {
         app.preview.area = None;

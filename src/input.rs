@@ -4,9 +4,10 @@
 //! state lives in `crate::app::App` and all drawing in `crate::view`.
 
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, TryRecvError};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -16,19 +17,30 @@ use ratatui::Terminal;
 
 use crate::app::{App, CONTEXT_STEP, HSCROLL_STEP};
 use crate::preview::{self, PreviewImage};
-use crate::snapshot::ArcSnapshot;
+use crate::snapshot::{ArcSnapshot, Snapshot};
 use crate::theme::Focus;
 use crate::view;
 
 /// Drain the snapshot channel, keeping only the latest `ArcSnapshot`, and
 /// apply it to `app`. Called between key events so the UI stays fresh.
-fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App) {
+fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App, worker_dead: &mut bool) {
     let mut latest: Option<ArcSnapshot> = None;
     while let Ok(snap) = rx.try_recv() {
         latest = Some(snap);
     }
     if let Some(snap) = latest {
         app.apply_snapshot(snap);
+    }
+    if !*worker_dead && matches!(rx.try_recv(), Err(TryRecvError::Disconnected)) {
+        *worker_dead = true;
+        app.snapshot = Arc::new(Snapshot {
+            empty: app.snapshot.empty,
+            tree: app.snapshot.tree.clone(),
+            selected_diff: None,
+            selected_highlight: Vec::new(),
+            error: Some("worker stopped: live updates disabled".into()),
+            branch_state: app.snapshot.branch_state.clone(),
+        });
     }
 }
 
@@ -39,12 +51,13 @@ pub fn run(
     snapshot_rx: &Receiver<ArcSnapshot>,
     image_rx: &Receiver<PreviewImage>,
 ) -> io::Result<()> {
+    let mut worker_dead = false;
     loop {
         terminal.draw(|f| view::ui(f, app))?;
         let _ = preview::sync(&mut io::stdout(), &mut app.preview);
-        drain_snapshots(snapshot_rx, app);
-        if let Some(img) = preview::drain_previews(image_rx, &mut app.preview) {
-            app.apply_preview(img);
+        drain_snapshots(snapshot_rx, app, &mut worker_dead);
+        if let Some(img) = preview::drain_previews(image_rx) {
+            app.preview.accept(img);
         }
         app.maybe_request_highlight();
         if event::poll(Duration::from_millis(16))? {
@@ -57,7 +70,15 @@ pub fn run(
                         break;
                     }
                 }
-                Event::Mouse(m) => handle_mouse(m, app),
+                Event::Mouse(m) => {
+                    app.fold_key = false;
+                    app.g_key = false;
+                    handle_mouse(m, app);
+                }
+                Event::Resize(..) => {
+                    app.fold_key = false;
+                    app.g_key = false;
+                }
                 _ => {}
             }
         }
@@ -80,7 +101,8 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {}
         _ => return,
     }
-    let in_tree = mouse.column >= app.diff_width.saturating_add(1);
+    let tree_start = app.diff_width.saturating_add(1);
+    let in_tree = mouse.column >= tree_start;
     let direction = matches!(mouse.kind, MouseEventKind::ScrollUp);
     if in_tree {
         if direction {
@@ -491,18 +513,20 @@ mod tests {
         app.focus = Focus::Tree;
         app.selection = 0;
         let idx = app.flat[0];
-        assert!(app.tree.nodes[idx].expanded);
+        assert!(!app.tree.nodes[idx].expanded);
 
+        // First Space expands the collapsed dir.
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.tree.nodes[idx].expanded);
+        // Second Space collapses it again.
         assert!(!handle_key(
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
             &mut app
         ));
         assert!(!app.tree.nodes[idx].expanded);
-        assert!(!handle_key(
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-            &mut app
-        ));
-        assert!(app.tree.nodes[idx].expanded);
     }
 
     #[test]

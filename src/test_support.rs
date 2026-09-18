@@ -67,7 +67,7 @@ pub fn snapshot_with_diff(diff: Diff) -> ArcSnapshot {
     let hl = std::iter::repeat_with(|| Some(Vec::new()))
         .take(diff.lines.len())
         .collect();
-    let tree = Tree::build(vec![('M', "x.rs".to_string())]);
+    let tree = Tree::build(vec![('M', diff.header.path.clone())]);
     Arc::new(Snapshot {
         empty: false,
         selected_diff: Some(diff),
@@ -162,4 +162,22 @@ pub fn fitting_hunk() -> Diff {
             ctx_line(2, 2),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_tree_follows_diff_path() {
+        let header = FileHeader {
+            path: "src/other.rs".into(),
+            ..header_full(None, None)
+        };
+        let snap = snapshot_with_diff(single_diff(header, Vec::new()));
+        let src_idx = snap.tree.nodes[snap.tree.root].children[0];
+        assert_eq!(snap.tree.nodes[src_idx].path, "src");
+        let file_idx = snap.tree.nodes[src_idx].children[0];
+        assert_eq!(snap.tree.nodes[file_idx].path, "src/other.rs");
+    }
 }

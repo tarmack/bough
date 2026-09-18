@@ -186,9 +186,11 @@ fn build_file_diff(
                 .consume()
                 .map_err(|e| GitError::message(format!("diff {path}: {e}")))?
             }
-            Operation::SourceOrDestinationIsBinary | Operation::ExternalCommand { .. } => {
-                (Vec::new(), Vec::new(), Vec::new())
-            }
+            Operation::SourceOrDestinationIsBinary => (Vec::new(), Vec::new(), Vec::new()),
+            // gix only selects an external diff command after ruling out binary
+            // content, so the file is not binary. bough does not run the
+            // external command; render no hunks.
+            Operation::ExternalCommand { .. } => (Vec::new(), Vec::new(), Vec::new()),
         },
         Err(e) => return Err(GitError::message(format!("diff {path}: {e}"))),
     };

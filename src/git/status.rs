@@ -3,7 +3,8 @@
 //! per-file metadata used to annotate the tree/diff views.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use gix::diff::blob::platform::prepare_diff::Operation;
 use gix::status::index_worktree::iter::Summary;
@@ -55,9 +56,13 @@ pub(crate) fn all_changes(revision: &str) -> Result<Vec<ChangeInfo>, GitError> {
 /// For a no-commit repo: every file is added; count its lines as the added
 /// count and 0 deletions.
 pub fn initial_stats(paths: &[String]) -> HashMap<String, (usize, usize)> {
+    let repo = open_repo().ok();
     let mut map = HashMap::new();
     for path in paths {
-        let lines = line_count(path);
+        let lines = match repo.as_ref() {
+            Some(repo) => line_count(&workdir_path(repo, path)),
+            None => line_count(Path::new(path)),
+        };
         map.insert(path.clone(), (lines, 0));
     }
     map
@@ -65,16 +70,18 @@ pub fn initial_stats(paths: &[String]) -> HashMap<String, (usize, usize)> {
 
 /// Metadata for an untracked file: a pure addition against the empty tree.
 pub fn file_meta_untracked(path: &str) -> Result<FileMeta, GitError> {
-    let added = line_count(path);
+    let repo = open_repo()?;
+    let mut cache = resource_cache(&repo)?;
+    let (added, deleted, binary) = count_changes(&mut cache, &repo, None, path)?;
     Ok(FileMeta {
         status: FileStatus::Added,
         added,
-        deleted: 0,
+        deleted,
         old_path: None,
         rename_percent: None,
         mode_old: None,
         mode_new: None,
-        binary: false,
+        binary,
     })
 }
 
@@ -114,7 +121,8 @@ fn untracked_paths(repo: &gix::Repository) -> Result<Vec<String>, GitError> {
         Err(e) => return Err(GitError::message(format!("untracked scan: {e}"))),
     };
     let mut out = Vec::new();
-    for item in iter.flatten() {
+    for item in iter {
+        let item = item.map_err(|e| GitError::message(format!("untracked scan: {e}")))?;
         if matches!(item.summary(), Some(Summary::Added)) && !is_directory_item(&item) {
             out.push(item.rela_path().to_string());
         }
@@ -134,18 +142,7 @@ pub(crate) fn collect_changes(
     let base_tree = base_tree_id(repo, revision)?;
     let index = index_from_tree_permissive(repo, &base_tree)?;
 
-    let roots = repo
-        .workdir()
-        .map(|p| diff::blob::pipeline::WorktreeRoots {
-            // The source side is always resolved from the object database by id;
-            // only the destination is read from the working tree.
-            old_root: None,
-            new_root: Some(p.to_path_buf()),
-        })
-        .unwrap_or_default();
-    let mut cache = repo
-        .diff_resource_cache(diff::blob::pipeline::Mode::ToGit, roots)
-        .map_err(|e| GitError::message(e.to_string()))?;
+    let mut cache = resource_cache(repo)?;
 
     let platform = repo
         .status(progress::Discard)
@@ -162,10 +159,6 @@ pub(crate) fn collect_changes(
         .map_err(|e| GitError::message(e.to_string()))?;
 
     let mut changes = Vec::new();
-    let workdir = repo
-        .workdir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     for res in iter {
         let item = res.map_err(|e| GitError::message(e.to_string()))?;
         let summary = match item.summary() {
@@ -200,53 +193,70 @@ pub(crate) fn collect_changes(
                 Some(entry.mode.bits()),
                 Some(entry.mode.bits()),
             ),
-            (IWItem::Rewrite { source, .. }, Summary::Renamed) => (
+            (IWItem::Rewrite { source, diff, .. }, Summary::Renamed) => (
                 FileStatus::Renamed,
                 Some(rewrite_source_path(source)),
-                None,
+                diff.as_ref().map(rename_percent),
                 Some(rewrite_source_id(source)),
                 None,
                 None,
             ),
-            (IWItem::Rewrite { source, .. }, Summary::Copied) => (
+            (IWItem::Rewrite { source, diff, .. }, Summary::Copied) => (
                 FileStatus::Copied,
                 Some(rewrite_source_path(source)),
-                None,
+                diff.as_ref().map(rename_percent),
                 Some(rewrite_source_id(source)),
                 None,
                 None,
             ),
-            _ => {
-                if summary == Summary::Added && !is_directory_item(&item) {
-                    changes.push(ChangeInfo {
-                        status: FileStatus::Added,
-                        path: path.clone(),
-                        old_path: None,
-                        rename_percent: None,
-                        mode_old: None,
-                        mode_new: None,
-                        added: line_count(workdir.join(&path).to_str().unwrap_or(path.as_str())),
-                        deleted: 0,
-                        binary: false,
-                    });
-                }
-                // The remaining summaries that can reach this fall-through are
-                // `Added` (handled above for files; directories are skipped
-                // here), `IntentToAdd` (staged for intent-to-add only, nothing
-                // changed), and `Conflict` (unmerged entry, out of scope for a
-                // diff viewer). None of those are emitted here.
-                debug_assert!(
-                    matches!(
-                        summary,
-                        Summary::Added | Summary::IntentToAdd | Summary::Conflict
-                    ),
-                    "unexpected summary {summary:?} reached the catch-all arm"
-                );
+            // A conflicted (unmerged) entry has no unambiguous base content to
+            // diff against, so report it as modified with no line stats.
+            (IWItem::Modification { .. }, Summary::Conflict) => {
+                changes.push(ChangeInfo {
+                    status: FileStatus::Modified,
+                    path: path.clone(),
+                    old_path: None,
+                    rename_percent: None,
+                    mode_old: None,
+                    mode_new: None,
+                    added: 0,
+                    deleted: 0,
+                    binary: false,
+                });
+                continue;
+            }
+            // An untracked or intent-to-add file is a pure addition. Count it
+            // against the empty tree like the other statuses so binary files are
+            // detected rather than counted by scanning for newline bytes.
+            (IWItem::DirectoryContents { .. }, Summary::Added) if !is_directory_item(&item) => (
+                FileStatus::Added,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (IWItem::Modification { .. }, Summary::IntentToAdd) => (
+                FileStatus::Added,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            // Untracked directories and nested repositories are not files; skip
+            // them rather than emit a bogus tree node.
+            (IWItem::DirectoryContents { .. }, Summary::Added) => continue,
+            (_, _other) => {
+                // Unmapped summary (e.g. an unhandled conflict/rename combo):
+                // skip the entry rather than fail the whole scan — one odd
+                // entry must not blank the tree.
                 continue;
             }
         };
 
         let (added, deleted, binary) = count_changes(&mut cache, repo, old_id, &path)?;
+        cache.clear_resource_cache_keep_allocation();
         changes.push(ChangeInfo {
             status,
             path,
@@ -260,6 +270,21 @@ pub(crate) fn collect_changes(
         });
     }
     Ok(changes)
+}
+
+/// A blob-diff resource cache rooted at the repository's working tree. The
+/// source side always resolves from the object database by id; only the
+/// destination side is read from the working tree.
+fn resource_cache(repo: &gix::Repository) -> Result<diff::blob::Platform, GitError> {
+    let roots = repo
+        .workdir()
+        .map(|p| diff::blob::pipeline::WorktreeRoots {
+            old_root: None,
+            new_root: Some(p.to_path_buf()),
+        })
+        .unwrap_or_default();
+    repo.diff_resource_cache(diff::blob::pipeline::Mode::ToGit, roots)
+        .map_err(|e| GitError::message(e.to_string()))
 }
 
 /// Build an in-memory index from `tree`'s contents using git's permissive
@@ -295,6 +320,13 @@ pub(crate) fn base_tree_id(
     repo: &gix::Repository,
     revision: &str,
 ) -> Result<gix::ObjectId, GitError> {
+    // The two-dot (`main..HEAD`) form has no single unambiguous base to diff
+    // against; reject it clearly instead of surfacing an opaque gix error.
+    if revision.contains("..") && !revision.contains("...") {
+        return Err(GitError::message(format!(
+            "unsupported revision {revision:?}: use base...HEAD"
+        )));
+    }
     if let Some((base, head)) = revision.split_once("...") {
         let base = base.trim();
         let head = head.trim();
@@ -349,9 +381,11 @@ fn count_changes(
                     false,
                 ))
             }
-            Operation::SourceOrDestinationIsBinary | Operation::ExternalCommand { .. } => {
-                Ok((0, 0, true))
-            }
+            Operation::SourceOrDestinationIsBinary => Ok((0, 0, true)),
+            // gix only reports an external diff command after ruling out binary
+            // content, so a path with a custom diff driver is text, not binary.
+            // bough does not run the external command; report no line counts.
+            Operation::ExternalCommand { .. } => Ok((0, 0, false)),
         },
         Err(e) => Err(GitError::message(format!("diff {path}: {e}"))),
     }
@@ -381,6 +415,11 @@ fn rewrite_source_path(source: &RewriteSource) -> String {
     }
 }
 
+/// A rewrite's similarity as a whole-number percentage (0–100).
+fn rename_percent(stats: &diff::blob::DiffLineStats) -> u8 {
+    (stats.similarity * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
 /// Whether an untracked item is a directory entry (an untracked directory or a
 /// nested repository). bough treats every change as a file, so directories must
 /// be skipped rather than emitted as bogus file tree-nodes.
@@ -399,17 +438,45 @@ fn is_directory_item(item: &IWItem) -> bool {
     )
 }
 
-/// Count the lines (LF) in a file; 0 when it can't be read.
-fn line_count(path: &str) -> usize {
-    std::fs::read(path)
-        .map(|bytes| {
-            if bytes.is_empty() {
-                0
-            } else {
-                bytes.iter().filter(|&&b| b == b'\n').count() + usize::from(!bytes.ends_with(b"\n"))
-            }
-        })
-        .unwrap_or(0)
+/// Read cap for line counting: enough for any source file, small enough that a
+/// huge file cannot exhaust memory.
+const MAX_COUNT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Resolve a repository-relative path against `repo`'s working tree, falling
+/// back to the path as-is when the repository is bare.
+fn workdir_path(repo: &gix::Repository, path: &str) -> PathBuf {
+    repo.workdir()
+        .map(|root| root.join(path))
+        .unwrap_or_else(|| PathBuf::from(path))
+}
+
+/// Count the lines (LF) in a regular file; 0 when it is missing, is not a
+/// regular file (so symlinks, FIFOs and devices are never followed or read), or
+/// cannot be read. At most [`MAX_COUNT_BYTES`] are read.
+fn line_count(path: &Path) -> usize {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.file_type().is_file() {
+        return 0;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .by_ref()
+        .take(MAX_COUNT_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return 0;
+    }
+    if bytes.is_empty() {
+        0
+    } else {
+        bytes.iter().filter(|&&b| b == b'\n').count() + usize::from(!bytes.ends_with(b"\n"))
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -527,5 +594,53 @@ mod tests {
         // uncommitted "three".
         assert_eq!(by_path["base.txt"].added, 2);
         assert_eq!(by_path["base.txt"].deleted, 0);
+    }
+
+    #[test]
+    fn line_count_never_follows_links_or_reads_non_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), "one\ntwo\n").unwrap();
+
+        assert_eq!(line_count(&dir.path().join("real.txt")), 2);
+        assert_eq!(line_count(&dir.path().join("missing")), 0);
+        // A directory is not a regular file.
+        assert_eq!(line_count(dir.path()), 0);
+
+        #[cfg(unix)]
+        {
+            // A symlink to a device must not be followed or read.
+            std::os::unix::fs::symlink("/dev/zero", dir.path().join("evil")).unwrap();
+            assert_eq!(line_count(&dir.path().join("evil")), 0);
+        }
+    }
+
+    #[test]
+    fn untracked_binary_file_is_flagged_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["one"]);
+        let repo = gix::discover(dir.path()).unwrap();
+        // PNG signature: contains a NUL byte, so gix detects it as binary.
+        std::fs::write(
+            dir.path().join("img.png"),
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x00",
+        )
+        .unwrap();
+
+        let changes = collect_changes(&repo, "HEAD").unwrap();
+        let by_path: HashMap<_, _> = changes.into_iter().map(|c| (c.path.clone(), c)).collect();
+        let img = &by_path["img.png"];
+        assert_eq!(img.status, FileStatus::Added);
+        assert!(img.binary);
+        assert_eq!(img.added, 0);
+        assert_eq!(img.deleted, 0);
+    }
+
+    #[test]
+    fn two_dot_revision_is_rejected_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["one"]);
+        let repo = gix::discover(dir.path()).unwrap();
+        let err = base_tree_id(&repo, "HEAD..HEAD").unwrap_err();
+        assert!(err.to_string().contains("unsupported revision"));
     }
 }

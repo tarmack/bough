@@ -5,8 +5,9 @@
 //! viewed `(path, ctx)` diffs so rapid `j`-mashing fills the pane instantly.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -33,6 +34,14 @@ const HARD_CEILING: Duration = Duration::from_millis(100);
 const LARGE_DIFF_THRESHOLD: usize = 2000;
 /// Above this git wall time the floor raises to the ceiling.
 const SLOW_GIT_THRESHOLD: Duration = Duration::from_millis(200);
+/// Maximum number of `(path, ctx)` diffs kept in the worker's LRU.
+const CACHE_CAP: usize = 8;
+/// Hard cap on how many bytes of a preview image are read from disk.
+const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
+/// Hard cap on decoded preview pixels, mirrored on the `ImageReader`.
+const MAX_PREVIEW_DIM: u32 = 16384;
+/// Hard cap on decoder allocation while building a preview.
+const MAX_PREVIEW_ALLOC: u64 = 64 * 1024 * 1024;
 
 /// Compile-time proof that the worker's cross-thread types are `Send`. The
 /// `Highlighter` is intentionally NOT asserted here: syntect's onig backend
@@ -65,6 +74,8 @@ pub struct Worker {
     pub snapshot_rx: Receiver<ArcSnapshot>,
     pub image_rx: Receiver<PreviewImage>,
     pub poll_mode: Arc<AtomicBool>,
+    /// Set before `Shutdown` is queued so a backlogged loop exits promptly.
+    shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -96,6 +107,8 @@ impl Worker {
         let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
         let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
         let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_t = shutdown.clone();
 
         let theme = initial_theme;
         let handle = thread::Builder::new()
@@ -108,6 +121,7 @@ impl Worker {
                     highlighter,
                     repo_root,
                     watcher,
+                    shutdown_t,
                     LoopChannels {
                         event_rx,
                         request_rx,
@@ -125,6 +139,7 @@ impl Worker {
             snapshot_rx,
             image_rx,
             poll_mode,
+            shutdown,
             handle: Some(handle),
         })
     }
@@ -132,6 +147,8 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // Flag first so a busy loop stops before draining queued requests.
+        self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.request_tx.send(Request::Shutdown);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -158,6 +175,8 @@ fn spawn_no_watcher(
     let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
     let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
     let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_t = shutdown.clone();
 
     let first_error = watch_err.clone();
     let handle = thread::Builder::new()
@@ -171,11 +190,14 @@ fn spawn_no_watcher(
             state.send_initial(&snapshot_tx);
 
             loop {
+                if shutdown_t.load(Ordering::Relaxed) {
+                    break;
+                }
                 crossbeam_channel::select! {
                     recv(request_rx) -> msg => {
                         match msg {
                             Ok(req) => {
-                                if handle_request(req, &mut state, &snapshot_tx, &image_tx) {
+                                if handle_request(req, &mut state, &snapshot_tx, &image_tx, &shutdown_t) {
                                     break;
                                 }
                             }
@@ -195,6 +217,7 @@ fn spawn_no_watcher(
         snapshot_rx,
         image_rx,
         poll_mode: Arc::new(AtomicBool::new(false)),
+        shutdown,
         handle: Some(handle),
     })
 }
@@ -290,6 +313,9 @@ struct WorkerState {
     /// Full per-file metadata from the last recompute, keyed by path. Lets a
     /// single-file diff reuse the scan instead of re-scanning the repository.
     last_changes: HashMap<String, git::ChangeInfo>,
+    /// True once the UI has sent a `LoadImage` request: recomputes then also
+    /// refresh the selected image preview when it changed on disk.
+    preview_active: bool,
 }
 
 impl WorkerState {
@@ -312,11 +338,12 @@ impl WorkerState {
             latest_request_seq: 0,
             last_tree: None,
             last_error: None,
-            cache: LruCache::new(8),
+            cache: LruCache::new(CACHE_CAP),
             floor_raised_at: None,
             last_git_wall: Duration::ZERO,
             last_branch: initial_branch,
             last_changes: HashMap::new(),
+            preview_active: false,
         }
     }
 
@@ -362,10 +389,11 @@ fn run_loop(
     highlighter: Option<Highlighter>,
     repo_root: PathBuf,
     watcher: Watcher,
+    shutdown: Arc<AtomicBool>,
     channels: LoopChannels,
 ) {
     let LoopChannels {
-        event_rx,
+        mut event_rx,
         request_rx,
         snapshot_tx,
         image_tx,
@@ -376,12 +404,19 @@ fn run_loop(
     // First real snapshot comes from the initial recompute, so startup never
     // blocks the main thread on the git scan (whose cost scales with the total
     // diff size).
-    recompute(&mut state, &snapshot_tx);
+    recompute(&mut state, &snapshot_tx, &image_tx);
 
     let mut last_event: Option<Instant> = None;
     let mut last_recompute: Option<Instant> = None;
+    // Set when the watcher channel closes; the receiver is swapped for a
+    // never-ready one so `select!` blocks on requests/timeout instead of
+    // spinning on the permanently-ready disconnected arm.
+    let mut event_closed = false;
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let now = Instant::now();
         let floor = current_floor(&state, now);
         let debounce_due = last_event
@@ -396,17 +431,24 @@ fn run_loop(
                 Ok(_we) => {
                     last_event = Some(Instant::now());
                 }
-                Err(_) => { /* watcher closed; keep serving requests */ }
+                Err(_) => {
+                    // Watcher closed; stop watching the never-ready channel.
+                    event_closed = true;
+                }
             },
             recv(request_rx) -> req => match req {
                 Ok(r) => {
-                    if handle_request(r, &mut state, &snapshot_tx, &image_tx) {
+                    if handle_request(r, &mut state, &snapshot_tx, &image_tx, &shutdown) {
                         break;
                     }
                 }
                 Err(_) => break,
             },
             default(timeout) => {}
+        }
+        if event_closed {
+            event_rx = crossbeam_channel::never();
+            event_closed = false;
         }
 
         let now = Instant::now();
@@ -422,7 +464,7 @@ fn run_loop(
                 // Hard ceiling: too soon since the last recompute. Reschedule.
                 continue;
             }
-            recompute(&mut state, &snapshot_tx);
+            recompute(&mut state, &snapshot_tx, &image_tx);
             last_recompute = Some(Instant::now());
             last_event = None;
         }
@@ -445,18 +487,25 @@ fn next_tick(
     now: Instant,
     floor: Duration,
 ) -> Duration {
-    if let Some(le) = last_event {
+    let tick = if let Some(le) = last_event {
         let remaining = floor.saturating_sub(now.duration_since(le));
         if let Some(lr) = last_recompute {
             let since_recompute = now.duration_since(lr);
             if since_recompute < HARD_CEILING {
                 let ceiling_remaining = HARD_CEILING - since_recompute;
-                return remaining.min(ceiling_remaining);
+                remaining.min(ceiling_remaining)
+            } else {
+                remaining
             }
+        } else {
+            remaining
         }
-        return remaining;
-    }
-    HARD_CEILING
+    } else {
+        HARD_CEILING
+    };
+    // A due-but-ceiling-deferred recompute can yield zero; a zero `default`
+    // returns immediately and busy-spins until `HARD_CEILING` elapses.
+    tick.max(Duration::from_millis(1))
 }
 
 /// True when `now - last_event >= floor`.
@@ -476,7 +525,12 @@ fn handle_request(
     state: &mut WorkerState,
     tx: &Sender<ArcSnapshot>,
     image_tx: &Sender<PreviewImage>,
+    shutdown: &AtomicBool,
 ) -> bool {
+    // Don't start expensive work once the UI has begun tearing us down.
+    if shutdown.load(Ordering::Relaxed) {
+        return true;
+    }
     match req {
         Request::Shutdown => true,
         Request::SetRev { rev } => {
@@ -484,9 +538,9 @@ fn handle_request(
                 state.rev = rev;
                 // Diffs and highlights are cached by `(path, ctx)`; they no
                 // longer apply once the base changes, so drop them.
-                state.cache = LruCache::new(8);
+                state.cache = LruCache::new(CACHE_CAP);
                 state.last_error = None;
-                recompute(state, tx);
+                recompute(state, tx, image_tx);
             }
             false
         }
@@ -524,22 +578,63 @@ fn handle_request(
                 return false;
             }
             state.latest_request_seq = seq;
-            load_preview(state, &path, image_tx);
+            state.preview_active = true;
+            load_preview(state, &path, image_tx, tx);
             false
         }
     }
 }
 
 /// Read and decode the image at `path` (relative to the repo root) and send the
-/// finished preview on `tx`. Any read/decode failure is silent: the pane simply
-/// keeps showing whatever it had.
-fn load_preview(state: &WorkerState, path: &str, tx: &Sender<PreviewImage>) {
-    let Ok(bytes) = std::fs::read(state.repo_root.join(path)) else {
-        return;
-    };
-    if let Ok(img) = build_preview_bytes(&bytes, path.to_string()) {
-        let _ = tx.send(img);
+/// finished preview on `tx`. A read/decode failure is surfaced in the status
+/// line via a snapshot that keeps the cached diff for `path` intact, so the
+/// pane never blanks on a bad image.
+fn load_preview(
+    state: &mut WorkerState,
+    path: &str,
+    tx: &Sender<PreviewImage>,
+    snapshot_tx: &Sender<ArcSnapshot>,
+) {
+    let result = read_preview_bytes(&state.repo_root, path)
+        .and_then(|bytes| build_preview_bytes(&bytes, path.to_string()));
+    match result {
+        Ok(img) => {
+            let _ = tx.send(img);
+        }
+        Err(e) => {
+            state.last_error = Some(format!("preview {path}: {e}"));
+            let key = (path.to_string(), state.ctx);
+            let cached = state
+                .cache
+                .get(&key)
+                .map(|entry| (entry.diff.clone(), entry.hl.clone()));
+            match cached {
+                Some((diff, hl)) => send_diff_snapshot(state, Some(diff), hl, snapshot_tx),
+                None => send_error_snapshot(state, snapshot_tx),
+            }
+        }
     }
+}
+
+/// Read a preview image from disk, rejecting symlinks/non-regular files and
+/// capping the read so a device file (e.g. `/dev/zero`) can't hang or OOM the
+/// worker.
+fn read_preview_bytes(
+    repo_root: &Path,
+    path: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let full = repo_root.join(path);
+    let meta = std::fs::symlink_metadata(&full)?;
+    if !meta.file_type().is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > MAX_PREVIEW_BYTES {
+        return Err(format!("{} bytes exceeds cap", meta.len()).into());
+    }
+    let file = std::fs::File::open(&full)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PREVIEW_BYTES).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Decode image bytes and re-encode them as a PNG preview, downscaling when the
@@ -548,9 +643,13 @@ pub fn build_preview_bytes(
     bytes: &[u8],
     path: String,
 ) -> Result<PreviewImage, Box<dyn std::error::Error + Send + Sync>> {
-    let img = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()?
-        .decode()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PREVIEW_DIM);
+    limits.max_image_height = Some(MAX_PREVIEW_DIM);
+    limits.max_alloc = Some(MAX_PREVIEW_ALLOC);
+    reader.limits(limits);
+    let img = reader.decode()?;
     let rgba = if img.width().max(img.height()) > 1024 {
         let long = img.width().max(img.height()) as f64;
         let scale = 1024.0 / long;
@@ -615,7 +714,7 @@ fn scan_entries(state: &mut WorkerState) -> Result<(Vec<Entry>, LineStats), Stri
 /// Runs one scan of the working tree and derives the entries, per-file stats,
 /// and per-file metadata (for the diff header) from it, so nothing is rescanned
 /// on file selection.
-fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
+fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>, image_tx: &Sender<PreviewImage>) {
     let t0 = Instant::now();
 
     let (entries, stats) = match scan_entries(state) {
@@ -626,6 +725,11 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
             return;
         }
     };
+
+    // A watcher recompute may have changed files whose old diffs are cached;
+    // evict just those so the pane shows fresh content without discarding
+    // highlight progress for every other file.
+    evict_changed(state);
 
     state.last_git_wall = t0.elapsed();
     state.last_branch = git::branch_state(&state.rev);
@@ -648,6 +752,35 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
     state.last_error = None;
     let snap = state.snapshot(tree, selected_diff, selected_highlight, None);
     let _ = tx.send(Arc::new(snap));
+
+    // Refresh an image preview when the selected image changed on disk: its
+    // binary diff is content-identical, so nothing else in the snapshot
+    // signals the edit. Only fires once the UI has opted in via a
+    // `LoadImage` request, and only for files the scan reports as changed.
+    if state.preview_active {
+        if let Some(path) = state.selected_path.clone() {
+            if state.last_changes.contains_key(&path) && crate::preview::is_image_path(&path) {
+                load_preview(state, &path, image_tx, tx);
+            }
+        }
+    }
+}
+
+/// Drop cached diffs for paths that changed in the latest scan, leaving the
+/// rest of the cache (and their highlight progress) intact. Directory diffs
+/// are evicted when any file beneath them changed.
+fn evict_changed(state: &mut WorkerState) {
+    if state.empty {
+        // Empty-repo mode never populates `last_changes`; every file is new,
+        // so nothing cached can be trusted.
+        state.cache.clear();
+        return;
+    }
+    let changed = &state.last_changes;
+    state.cache.retain(|(p, _)| {
+        !changed.contains_key(p)
+            && !changed.keys().any(|c| c.starts_with(&format!("{p}/")))
+    });
 }
 
 /// Send a snapshot that carries `error` but preserves the last known tree.
@@ -718,6 +851,7 @@ fn build_diff_for(
             let cached = new_cached_diff(&diff, state.highlighter.as_ref());
             let hl = cached.hl.clone();
             state.cache.put(key, cached);
+            state.last_error = None;
             (Some(diff), hl)
         }
         Err(e) => {
@@ -954,6 +1088,15 @@ impl<K: Eq + Clone, V> LruCache<K, V> {
         }
         self.entries.push_back((key, value));
     }
+
+    /// Drop every entry whose key fails `keep`, preserving order and cap.
+    fn retain<F: FnMut(&K) -> bool>(&mut self, mut keep: F) {
+        self.entries.retain(|(k, _)| keep(k));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 #[cfg(test)]
@@ -988,6 +1131,94 @@ mod tests {
         c.put(5, "e");
         assert!(c.get(&2).is_none());
         assert!(c.get(&1).is_some());
+    }
+
+    #[test]
+    fn lru_retain_drops_matching_only() {
+        let mut c: LruCache<u32, &str> = LruCache::new(8);
+        c.put(1, "a");
+        c.put(2, "b");
+        c.put(3, "c");
+        c.retain(|k| k % 2 == 0);
+        assert!(c.get(&1).is_none());
+        assert!(c.get(&3).is_none());
+        assert!(c.get(&2).is_some());
+    }
+
+    #[test]
+    fn evict_changed_drops_only_changed_paths() {
+        let diff = sample_diff(4);
+        let mut state = WorkerState::new("main...HEAD".into(), false, None, PathBuf::from("."));
+        state
+            .cache
+            .put(("a.rs".into(), 3u32), new_cached_diff(&diff, None));
+        state
+            .cache
+            .put(("b.rs".into(), 3u32), new_cached_diff(&diff, None));
+        state
+            .last_changes
+            .insert("a.rs".into(), change_info("a.rs"));
+
+        evict_changed(&mut state);
+
+        assert!(state.cache.get(&("a.rs".to_string(), 3)).is_none());
+        assert!(state.cache.get(&("b.rs".to_string(), 3)).is_some());
+    }
+
+    #[test]
+    fn evict_changed_drops_directory_keys_for_child_paths() {
+        let diff = sample_diff(4);
+        let mut state = WorkerState::new("main...HEAD".into(), false, None, PathBuf::from("."));
+        state
+            .cache
+            .put(("src".into(), 3u32), new_cached_diff(&diff, None));
+        state
+            .cache
+            .put(("doc".into(), 3u32), new_cached_diff(&diff, None));
+        state
+            .last_changes
+            .insert("src/a.rs".into(), change_info("src/a.rs"));
+
+        evict_changed(&mut state);
+
+        assert!(state.cache.get(&("src".to_string(), 3)).is_none());
+        assert!(state.cache.get(&("doc".to_string(), 3)).is_some());
+    }
+
+    #[test]
+    fn evict_changed_clears_cache_in_empty_repo_mode() {
+        let diff = sample_diff(4);
+        let mut state = WorkerState::new("HEAD".into(), true, None, PathBuf::from("."));
+        state
+            .cache
+            .put(("a.rs".into(), 3u32), new_cached_diff(&diff, None));
+
+        evict_changed(&mut state);
+
+        assert!(state.cache.get(&("a.rs".to_string(), 3)).is_none());
+    }
+
+    fn change_info(path: &str) -> crate::git::ChangeInfo {
+        crate::git::ChangeInfo {
+            status: crate::diff::FileStatus::Modified,
+            path: path.into(),
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            added: 1,
+            deleted: 0,
+            binary: false,
+        }
+    }
+
+    #[test]
+    fn next_tick_never_returns_zero() {
+        let now = Instant::now();
+        // A due event with no recent recompute: remaining is zero.
+        let last_event = now - Duration::from_millis(200);
+        let tick = next_tick(Some(last_event), None, now, Duration::from_millis(100));
+        assert_eq!(tick, Duration::from_millis(1));
     }
 
     #[test]

@@ -125,12 +125,6 @@ impl FileStatus {
     }
 }
 
-impl std::fmt::Display for FileStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_char())
-    }
-}
-
 /// Per-file metadata populated by the git engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileHeader {
@@ -192,6 +186,11 @@ impl Diff {
         let mut lines = Vec::new();
 
         for (file, d) in file_diffs.into_iter().enumerate() {
+            debug_assert_eq!(d.files.len(), 1, "from_directory expects single-file diffs");
+            debug_assert!(
+                d.sections.iter().all(|s| s.kind == SectionKind::Hunk),
+                "from_directory expects hunk-only sections"
+            );
             files.push(d.header.clone());
 
             // A `File` section opens this file's block.
@@ -323,14 +322,17 @@ fn word_diff(old: &str, new: &str) -> Option<Vec<WordRun>> {
         return None;
     }
 
-    // dp[i][j] = LCS length of old_tokens[i..] and new_tokens[j..].
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    // LCS length of old_tokens[i..] and new_tokens[j..], stored flat in a
+    // single `(n + 1) * (m + 1)` table at `dp[i * stride + j]`. The LCS is at
+    // most `min(n, m) <= WORD_DIFF_MAX_TOKENS`, so a `u16` entry suffices.
+    let stride = m + 1;
+    let mut dp = vec![0u16; (n + 1) * (m + 1)];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if old_tokens[i] == new_tokens[j] {
-                dp[i + 1][j + 1] + 1
+            dp[i * stride + j] = if old_tokens[i] == new_tokens[j] {
+                dp[(i + 1) * stride + (j + 1)] + 1
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
+                dp[(i + 1) * stride + j].max(dp[i * stride + (j + 1)])
             };
         }
     }
@@ -349,7 +351,7 @@ fn word_diff(old: &str, new: &str) -> Option<Vec<WordRun>> {
             );
             i += 1;
             j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
+        } else if dp[(i + 1) * stride + j] >= dp[i * stride + (j + 1)] {
             push_run(
                 &mut runs,
                 WordRun {
@@ -497,6 +499,22 @@ mod tests {
         // Eight distinct word swaps, each an interleaved changed run, exceed
         // WORD_DIFF_MAX_RUNS.
         assert_eq!(word_diff("a b c d e f g h", "x y z w q r s t"), None);
+    }
+
+    #[test]
+    fn word_diff_at_token_cap() {
+        // 128 word tokens + 128 space tokens == the exact cap; the flattened
+        // table allocation must work at the boundary.
+        let line = "a ".repeat(WORD_DIFF_MAX_TOKENS / 2);
+        assert_eq!(tokenize_words(&line).len(), WORD_DIFF_MAX_TOKENS);
+        assert_eq!(
+            word_diff(&line, &line),
+            Some(vec![WordRun {
+                text: line.clone(),
+                changed: false,
+                kind: LineKind::Context,
+            }])
+        );
     }
 
     fn line(kind: LineKind, text: &str) -> DiffLine {

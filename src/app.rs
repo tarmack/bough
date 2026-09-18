@@ -8,13 +8,14 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 
 use crate::diff::{Diff, LineKind};
 use crate::highlight::TokenOwned;
-use crate::preview::{self, PreviewImage};
+use crate::preview;
 use crate::snapshot::{ArcSnapshot, Request, Seq};
 use crate::text::max_scroll_for;
 use crate::theme::Focus;
@@ -51,7 +52,7 @@ struct VisibleCache {
     snap: ArcSnapshot,
     /// `collapsed_hunks` the cached lines were computed for.
     collapsed: HashSet<usize>,
-    lines: Vec<usize>,
+    lines: Rc<Vec<usize>>,
     /// Max `chars().count()` over all `diff.lines` at the time `lines` was
     /// computed (used for horizontal-scroll clamping).
     max_width: usize,
@@ -70,10 +71,6 @@ pub struct App {
     pub selected_path: Option<String>,
     /// Set of expanded dir paths; survives tree rebuilds.
     pub expanded_dirs: HashSet<String>,
-    /// True once a real (non-empty) tree has been applied; used to capture the
-    /// worker's first tree's default expansion state (the initial snapshot has
-    /// an empty tree because startup is deferred off the main thread).
-    first_tree_seen: bool,
 
     pub tree_scroll: usize,
     pub diff_scroll: usize,
@@ -114,7 +111,7 @@ pub struct App {
     main_rev: String,
     /// Revision for `Mode::Uncommitted` (`HEAD`).
     uncommitted_rev: String,
-    /// Memoized `visible_line_indices` (see [`VisibleLine`]).
+    /// Memoized `visible_line_indices` (see [`VisibleCache`]).
     visible_cache: RefCell<VisibleCache>,
     /// Kitty-protocol image preview state for the selected file.
     pub preview: crate::preview::Preview,
@@ -143,9 +140,6 @@ impl App {
                 Some(n.path.clone())
             }
         });
-        // If the initial snapshot already carried a real tree, `expanded_dirs`
-        // above reflects it and must not be re-collected on the first swap.
-        let first_tree_seen = !snapshot.tree.nodes.is_empty();
         // The initial snapshot Arc; also seed the visibility cache's fingerprint
         // (an owned clone, compared by `Arc::ptr_eq`).
         let init_snap = snapshot.clone();
@@ -156,7 +150,6 @@ impl App {
             selection: 0,
             selected_path,
             expanded_dirs,
-            first_tree_seen,
             tree_scroll: 0,
             diff_scroll: 0,
             diff_col: 0,
@@ -182,7 +175,7 @@ impl App {
             visible_cache: RefCell::new(VisibleCache {
                 snap: init_snap,
                 collapsed: HashSet::new(),
-                lines: Vec::new(),
+                lines: Rc::new(Vec::new()),
                 max_width: 0,
             }),
             preview: crate::preview::Preview::new(),
@@ -203,12 +196,8 @@ impl App {
         let old_path = self.selected_path.clone();
 
         self.snapshot = snap;
-        if !self.first_tree_seen && !self.snapshot.tree.nodes.is_empty() {
-            // Adopt the worker's first real tree's default expansion (the
-            // initial snapshot carried an empty tree).
-            self.expanded_dirs = collect_expanded(&self.snapshot.tree);
-            self.first_tree_seen = true;
-        }
+        // Trees are born collapsed; only dirs the user has expanded live in
+        // `expanded_dirs`, so a fresh snapshot can never open new folders.
         let mut tree = self.snapshot.tree.clone();
         tree.expand_paths(&self.expanded_dirs);
         self.flat = tree.flatten();
@@ -312,15 +301,21 @@ impl App {
             self.preview.requested = None;
             return;
         }
-        let path = path.unwrap();
+        let Some(path) = path else {
+            return;
+        };
         self.seq = self.seq.saturating_add(1);
         let _ = self.request_tx.send(Request::LoadImage {
             path: path.clone(),
             seq: self.seq,
         });
-        self.preview.requested = Some(path);
-        // Hide the old image while the new one is in flight.
-        self.preview.current = None;
+        self.preview.requested = Some(path.clone());
+        // Keep the old image on screen while the same file re-decodes (its
+        // `accept` bumps the generation so `sync` re-places on arrival); a
+        // different file hides it immediately.
+        if self.preview.current.as_ref().map(|c| c.path.as_str()) != Some(path.as_str()) {
+            self.preview.current = None;
+        }
     }
 
     /// Enable or disable image previews (called once at startup after the kitty
@@ -328,14 +323,6 @@ impl App {
     pub fn set_preview_enabled(&mut self, on: bool) {
         self.preview.set_enabled(on);
         self.request_preview();
-    }
-
-    /// Accept a decoded preview, but only if it matches the currently-requested
-    /// path (stale images from an earlier selection are dropped).
-    pub fn apply_preview(&mut self, img: PreviewImage) {
-        if self.preview.requested.as_deref() == Some(img.path.as_str()) {
-            self.preview.current = Some(img);
-        }
     }
 
     /// Ask the worker to highlight the currently-visible diff region (viewport
@@ -441,16 +428,24 @@ impl App {
     /// Load a fresh diff for the selected file. Each file switch starts a
     /// clean pane: no horizontal scroll, nothing collapsed, default context.
     pub fn load_diff(&mut self) {
-        self.diff_col = 0;
-        self.collapsed_hunks.clear();
-        self.context_lines = 3;
-        self.diff_scroll = 0;
+        self.reset_diff_view();
         self.active_chunk = if self.diff().is_some_and(|p| !p.sections.is_empty()) {
             Some(0)
         } else {
             None
         };
         self.request_diff();
+    }
+
+    /// Reset per-file view state (`collapsed_hunks`, `diff_col`,
+    /// `context_lines`, `diff_scroll`, `active_chunk`) so a file switch never
+    /// inherits stale section indices from the previous file.
+    fn reset_diff_view(&mut self) {
+        self.diff_col = 0;
+        self.collapsed_hunks.clear();
+        self.context_lines = 3;
+        self.diff_scroll = 0;
+        self.active_chunk = None;
     }
 
     /// Update `selected_path` from the current flat selection, then send a
@@ -460,6 +455,7 @@ impl App {
             .flat
             .get(self.selection)
             .map(|&idx| self.tree.nodes[idx].path.clone());
+        self.reset_diff_view();
         self.request_diff();
     }
 
@@ -468,12 +464,20 @@ impl App {
             return;
         }
         let last = self.flat.len() - 1;
-        self.selection = self.selection.saturating_add(n).min(last);
+        let new = self.selection.saturating_add(n).min(last);
+        if new == self.selection {
+            return;
+        }
+        self.selection = new;
         self.select_and_request();
     }
 
     pub fn move_up(&mut self, n: usize) {
-        self.selection = self.selection.saturating_sub(n);
+        let new = self.selection.saturating_sub(n);
+        if new == self.selection {
+            return;
+        }
+        self.selection = new;
         self.select_and_request();
     }
 
@@ -519,7 +523,11 @@ impl App {
             self.move_active_chunk(n as i32);
             return;
         }
-        let max = max_scroll_for(self.visible_line_indices().len(), self.diff_page_size());
+        let max = max_scroll_for(
+            self.visible_line_indices().len(),
+            self.diff_page_size(),
+            self.sticky_row_count(),
+        );
         self.diff_scroll = self.diff_scroll.saturating_add(n).min(max);
     }
 
@@ -713,28 +721,25 @@ impl App {
     }
 
     /// Number of pinned sticky rows at the current scroll position, mirroring
-    /// the render path: at most one file header and one hunk header among
-    /// `visible[..start]`.
-    fn sticky_row_count(&self) -> usize {
+    /// `view::diff::sticky_headers`: at most one file header, plus one hunk
+    /// header only when it falls after the pinned file header.
+    pub(crate) fn sticky_row_count(&self) -> usize {
         let Some(diff) = self.diff() else {
             return 0;
         };
         let visible = self.visible_line_indices();
-        let start = self.diff_scroll;
+        let start = self.diff_scroll.min(visible.len());
         if start == 0 {
             return 0;
         }
-        let file = visible
-            .iter()
-            .take(start)
+        let file_pos = (0..start)
             .rev()
-            .any(|&li| diff.lines[li].kind == LineKind::FileHeader);
-        let hunk = visible
-            .iter()
-            .take(start)
+            .find(|&p| diff.lines[visible[p]].kind == LineKind::FileHeader);
+        let hunk_start = file_pos.map_or(0, |p| p + 1);
+        let hunk = (hunk_start..start)
             .rev()
-            .any(|&li| diff.lines[li].kind == LineKind::HunkHeader);
-        usize::from(file) + usize::from(hunk)
+            .any(|p| diff.lines[visible[p]].kind == LineKind::HunkHeader);
+        usize::from(file_pos.is_some()) + usize::from(hunk)
     }
 
     /// `diff.lines` index of the last rendered body line, subtracting the
@@ -776,26 +781,31 @@ impl App {
     ///
     /// Memoized: the set depends only on the current snapshot's diff and the
     /// `collapsed_hunks` set, so it is recomputed only when those change
-    /// (not on every frame). The caller gets an owned `Vec` (a cheap `memcpy`);
-    /// the O(n) scan happens only on cache misses.
-    pub fn visible_line_indices(&self) -> Vec<usize> {
+    /// (not on every frame). The caller gets a cheap `Rc` clone; the O(n) scan
+    /// happens only on cache misses.
+    pub fn visible_line_indices(&self) -> Rc<Vec<usize>> {
         let mut cache = self.visible_cache.borrow_mut();
-        if !Arc::ptr_eq(&cache.snap, &self.snapshot) || cache.collapsed != self.collapsed_hunks {
+        let same_snapshot = Arc::ptr_eq(&cache.snap, &self.snapshot);
+        if !same_snapshot || cache.collapsed != self.collapsed_hunks {
+            // `max_width` depends only on the snapshot, not on folding, so a
+            // collapse-only change can reuse the cached value.
+            if !same_snapshot {
+                cache.max_width = self.compute_max_width();
+            }
             cache.snap = self.snapshot.clone();
             cache.collapsed = self.collapsed_hunks.clone();
-            cache.lines = self.compute_visible_lines();
-            cache.max_width = self.compute_max_width();
+            cache.lines = Rc::new(self.compute_visible_lines());
         }
-        cache.lines.clone()
+        Rc::clone(&cache.lines)
     }
 
-    /// Max `chars().count()` over all `diff.lines`, regardless of folding. 0
-    /// when there is no diff.
+    /// Max display width over all `diff.lines` in terminal cells (wide
+    /// glyphs count as 2), regardless of folding. 0 when there is no diff.
     fn compute_max_width(&self) -> usize {
         self.diff().map_or(0, |p| {
             p.lines
                 .iter()
-                .map(|l| l.raw_text.chars().count())
+                .map(|l| crate::text::display_width(&l.raw_text))
                 .max()
                 .unwrap_or(0)
         })
@@ -833,7 +843,11 @@ impl App {
     }
 
     pub fn clamp_diff_scroll(&mut self) {
-        let max = max_scroll_for(self.visible_line_indices().len(), self.diff_page_size());
+        let max = max_scroll_for(
+            self.visible_line_indices().len(),
+            self.diff_page_size(),
+            self.sticky_row_count(),
+        );
         self.diff_scroll = self.diff_scroll.min(max);
     }
 
@@ -1016,6 +1030,10 @@ impl App {
             return;
         }
         self.context_lines = new_ctx;
+        // A context change renumbers sections, so the old fold/cursor indices
+        // no longer refer to the same hunks.
+        self.collapsed_hunks.clear();
+        self.active_chunk = None;
         self.request_diff();
         self.clamp_diff_scroll();
     }
@@ -1549,5 +1567,25 @@ mod tests {
         app.navigate_chunk(-1);
         assert_eq!(app.active_chunk, Some(0));
         assert!(app.chunk_header_in_view(0), "file 0 header must be visible");
+    }
+
+    #[test]
+    fn move_between_files_resets_view_state() {
+        let mut app = sample_app();
+        app.selected_path = Some("a.rs".into());
+        app.collapsed_hunks = [3].into_iter().collect();
+        app.diff_col = 7;
+        app.context_lines = 10;
+        app.active_chunk = Some(5);
+        app.diff_scroll = 4;
+
+        app.move_down(1);
+
+        assert_eq!(app.selected_path.as_deref(), Some("b.rs"));
+        assert!(app.collapsed_hunks.is_empty());
+        assert_eq!(app.diff_col, 0);
+        assert_eq!(app.context_lines, 3);
+        assert_eq!(app.diff_scroll, 0);
+        assert_eq!(app.active_chunk, None);
     }
 }

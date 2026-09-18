@@ -3,6 +3,16 @@
 
 use crate::git::{open_repo, resolve_id, GitError};
 
+/// True when `name` names a local branch. Only local branches can be watched
+/// for live updates (the watcher polls `.git/refs/heads/<name>`).
+pub fn local_branch_exists(name: &str) -> bool {
+    let full = format!("refs/heads/{name}");
+    match open_repo() {
+        Ok(repo) => repo.find_reference(full.as_str()).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Coarse state of the current working directory with respect to git.
 #[derive(Debug)]
 pub enum RepoState {
@@ -113,11 +123,15 @@ fn count_reachable(
     tip: &gix::ObjectId,
     hidden: &gix::ObjectId,
 ) -> Option<u32> {
-    repo.rev_walk([*tip])
+    let walker = repo
+        .rev_walk([*tip])
         .with_hidden([*hidden])
         .all()
-        .ok()
-        .map(|w| w.count() as u32)
+        .ok()?;
+    // Count in `u64` and convert checked so an enormous walk is reported as
+    // not-computable rather than silently truncated to `u32`.
+    let count = u64::try_from(walker.count()).ok()?;
+    u32::try_from(count).ok()
 }
 
 /// Detect the repository's default branch: `origin/HEAD` first, then a local

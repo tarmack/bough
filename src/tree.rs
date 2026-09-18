@@ -38,7 +38,9 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// Build a tree from a flat list of `(status, path)` entries.
+    /// Build a tree from a flat list of `(status, path)` entries. Directories
+    /// start collapsed — the caller decides what is visible via
+    /// [`TreeNode::expanded`] or [`Tree::expand_paths`].
     pub fn build(entries: Vec<(char, String)>) -> Self {
         let mut nodes = vec![TreeNode {
             name: String::new(),
@@ -103,8 +105,11 @@ impl Tree {
     /// collapse. Used by the UI after swapping in a fresh `Snapshot` so the
     /// user's collapse/expand choices survive a tree rebuild.
     pub fn expand_paths(&mut self, paths: &HashSet<String>) {
-        for node in &mut self.nodes {
-            if node.kind == Kind::Dir {
+        for (idx, node) in self.nodes.iter_mut().enumerate() {
+            // The virtual root is not a user-collapsible directory; leaving it
+            // expanded keeps the whole tree reachable even when `paths` omits
+            // its empty-string path.
+            if idx != self.root && node.kind == Kind::Dir {
                 node.expanded = paths.contains(&node.path);
             }
         }
@@ -120,6 +125,11 @@ fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
         let kind = if is_file { Kind::File } else { Kind::Dir };
 
         if let Some(existing) = find_child(nodes, cur, part) {
+            // A repeated `(status, path)` entry: the newer file status wins.
+            debug_assert_eq!(nodes[existing].kind, kind);
+            if is_file && nodes[existing].kind == Kind::File {
+                nodes[existing].status = status.to_string();
+            }
             cur = existing;
             continue;
         }
@@ -137,7 +147,7 @@ fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
                 String::new()
             },
             children: Vec::new(),
-            expanded: true,
+            expanded: false,
             depth,
             added: 0,
             deleted: 0,
@@ -256,10 +266,13 @@ mod tests {
         let tree = Tree::build(entries());
         // root -> src (dir) and README.md (file)
         assert_eq!(tree.nodes[tree.root].children.len(), 2);
-        // Directories default expanded, so the full subtree is visible.
+        // src -> core (dir) -> mod.rs, new.rs
+        let src_idx = tree.nodes[tree.root].children[0];
+        assert_eq!(tree.nodes[src_idx].children.len(), 1);
+        // Directories default collapsed, so only the top level is visible.
         let flat = tree.flatten();
-        assert_eq!(flat.len(), 5); // src, core, mod.rs, new.rs, README.md
-        assert_eq!(flat[0], tree.nodes[tree.root].children[0]);
+        assert_eq!(flat.len(), 2); // src, README.md
+        assert_eq!(flat[0], src_idx);
     }
 
     #[test]
@@ -271,12 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn directories_default_expanded() {
+    fn directories_default_collapsed() {
         let tree = Tree::build(entries());
         let src_idx = tree.nodes[tree.root].children[0];
-        assert!(tree.nodes[src_idx].expanded);
-        // Full subtree visible without any manual expand.
-        assert_eq!(tree.flatten().len(), 5);
+        assert!(!tree.nodes[src_idx].expanded);
+        // Only the top level is visible without a manual expand.
+        assert_eq!(tree.flatten().len(), 2); // src, README.md
     }
 
     #[test]
@@ -284,17 +297,46 @@ mod tests {
         let mut tree = Tree::build(entries());
         let src_idx = tree.nodes[tree.root].children[0];
         let core_idx = tree.nodes[src_idx].children[0];
-        assert!(tree.nodes[core_idx].expanded);
+        assert!(!tree.nodes[core_idx].expanded);
+
+        // Expand src: its child dir shows, but core stays collapsed.
+        tree.nodes[src_idx].expanded = true;
+        let flat = tree.flatten();
+        assert_eq!(flat.len(), 3); // src, core, README.md
+        assert_eq!(flat[0], src_idx);
 
         // Collapse src: its whole subtree hides.
         tree.nodes[src_idx].expanded = false;
         let flat = tree.flatten();
         assert_eq!(flat.len(), 2); // src, README.md
-        assert_eq!(flat[0], src_idx);
 
-        // Re-expand src: children return (core stays expanded).
+        // Expand src again (core is still collapsed from its own default).
         tree.nodes[src_idx].expanded = true;
-        let flat = tree.flatten();
-        assert_eq!(flat.len(), 5); // src, core, mod.rs, new.rs, README.md
+        assert_eq!(tree.flatten().len(), 3); // src, core, README.md
+
+        // Expanding core too surfaces the files.
+        tree.nodes[core_idx].expanded = true;
+        assert_eq!(tree.flatten().len(), 5); // src, core, mod.rs, new.rs, README.md
+    }
+
+    #[test]
+    fn expand_paths_keeps_root_expanded() {
+        let mut tree = Tree::build(entries());
+        // A set without the root's empty path must not collapse the root,
+        // otherwise the whole tree becomes invisible.
+        tree.expand_paths(&HashSet::new());
+        assert!(tree.nodes[tree.root].expanded);
+        assert_eq!(tree.flatten().len(), 2); // src, README.md
+    }
+
+    #[test]
+    fn duplicate_file_entry_keeps_latest_status() {
+        let tree = Tree::build(vec![
+            ('M', "a.rs".to_string()),
+            ('A', "a.rs".to_string()),
+        ]);
+        let file_idx = tree.nodes[tree.root].children[0];
+        assert_eq!(tree.nodes[file_idx].kind, Kind::File);
+        assert_eq!(tree.nodes[file_idx].status, "A");
     }
 }

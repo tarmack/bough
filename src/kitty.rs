@@ -5,7 +5,7 @@
 //! state is owned here. The caller must have raw mode active for the probe's
 //! reply to arrive unmodified.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
@@ -36,6 +36,9 @@ pub fn probe() -> bool {
         .unwrap_or(false)
     {
         return true;
+    }
+    if !std::io::stdin().is_terminal() {
+        return false;
     }
     probe_escape()
 }
@@ -69,24 +72,38 @@ fn probe_escape() -> bool {
         if !buf.is_empty() && since_read >= QUIET {
             break;
         }
-        let wait = BUDGET
-            .saturating_sub(elapsed)
-            .min(QUIET.saturating_sub(since_read));
+        let wait = if buf.is_empty() {
+            BUDGET.saturating_sub(elapsed)
+        } else {
+            BUDGET
+                .saturating_sub(elapsed)
+                .min(QUIET.saturating_sub(since_read))
+        };
         let mut pfd = libc::pollfd {
             fd: 0,
             events: libc::POLLIN,
             revents: 0,
         };
-        let ready = unsafe { libc::poll(&mut pfd, 1, wait.as_millis() as libc::c_int) };
-        if ready <= 0 {
-            if last_read.elapsed() >= QUIET {
-                break;
+        let ready =
+            unsafe { libc::poll(&mut pfd, 1, wait.as_millis().max(1) as libc::c_int) };
+        if ready == -1 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
             }
+            break;
+        }
+        if ready == 0 {
             continue;
         }
         let mut chunk = [0u8; 256];
         let n = unsafe { libc::read(0, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
-        if n <= 0 {
+        if n == -1 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n as usize]);
@@ -140,7 +157,7 @@ pub fn place(
     let chunks: Vec<&[u8]> = b64.as_bytes().chunks(CHUNK_B64).collect();
     if chunks.is_empty() {
         let control = format!(
-            "a=T,f=100,t=d,C=1,i={id},s={src_w},v={src_h},c={c},r={r},m=0"
+            "a=T,f=100,t=d,C=1,i={id},s={src_w},v={src_h},c={c},r={r},m=0,q=1"
         );
         write!(w, "\x1b_G{};\x1b\\", control)?;
         return Ok(());
@@ -150,7 +167,7 @@ pub fn place(
     for (i, chunk) in chunks.iter().enumerate() {
         let control = if i == 0 {
             let m = if n > 1 { 1 } else { 0 };
-            format!("a=T,f=100,t=d,C=1,i={id},s={src_w},v={src_h},c={c},r={r},m={m}")
+            format!("a=T,f=100,t=d,C=1,i={id},s={src_w},v={src_h},c={c},r={r},m={m},q=1")
         } else {
             let m = if i + 1 < n { 1 } else { 0 };
             format!("m={m}")
@@ -166,18 +183,30 @@ pub fn place(
 
 /// Delete a single placed image by id.
 pub fn delete(w: &mut impl Write, id: u32) -> io::Result<()> {
-    write!(w, "\x1b_Ga=d,d=I,i={id}\x1b\\")
+    write!(w, "\x1b_Ga=d,d=I,i={id},q=1\x1b\\")
+}
+
+/// Delete all placed images.
+pub fn delete_all(w: &mut impl Write) -> io::Result<()> {
+    write!(w, "\x1b_Ga=d,d=A,q=1\x1b\\")
 }
 
 /// Terminal cell size in pixels, falling back to `(10, 20)` when the ioctl
 /// yields no pixel geometry (e.g. a serial console or non-tty).
 pub fn cell_size() -> (u32, u32) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
-    if rc != 0 {
-        return (10, 20);
+    for fd in [libc::STDOUT_FILENO, 0] {
+        loop {
+            let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+            if rc == 0 {
+                return px_to_cells(&ws);
+            }
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
     }
-    px_to_cells(&ws)
+    (10, 20)
 }
 
 /// Pixel geometry of a `winsize`, normalized to per-cell pixels.
@@ -200,7 +229,14 @@ mod tests {
     fn delete_emits_exact_sequence() {
         let mut out = Vec::new();
         delete(&mut out, 7).unwrap();
-        assert_eq!(out, b"\x1b_Ga=d,d=I,i=7\x1b\\");
+        assert_eq!(out, b"\x1b_Ga=d,d=I,i=7,q=1\x1b\\");
+    }
+
+    #[test]
+    fn delete_all_emits_exact_sequence() {
+        let mut out = Vec::new();
+        delete_all(&mut out).unwrap();
+        assert_eq!(out, b"\x1b_Ga=d,d=A,q=1\x1b\\");
     }
 
     #[test]
@@ -211,7 +247,7 @@ mod tests {
         // scale = min(100/4, 200/3) = 25 -> c = 10, r = 3.
         assert_eq!(
             s,
-            "\x1b[1;1H\x1b_Ga=T,f=100,t=d,C=1,i=5,s=4,v=3,c=10,r=3,m=0;aGVsbG8=\x1b\\"
+            "\x1b[1;1H\x1b_Ga=T,f=100,t=d,C=1,i=5,s=4,v=3,c=10,r=3,m=0,q=1;aGVsbG8=\x1b\\"
         );
     }
 
@@ -223,7 +259,7 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("\x1b[1;1H\x1b_Ga=T,f=100,t=d,C=1,i=9"));
         // More than one chunk: first ends with m=1, last with m=0.
-        assert!(s.contains(",m=1;"));
+        assert!(s.contains(",m=1,q=1;"));
         assert!(s.ends_with("\x1b\\"));
         let parts: Vec<&str> = s.split("\x1b\\").filter(|p| !p.is_empty()).collect();
         assert!(parts.len() > 1);

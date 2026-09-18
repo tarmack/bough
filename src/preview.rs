@@ -49,8 +49,9 @@ pub struct Preview {
     pub requested: Option<String>,
     pub current: Option<PreviewImage>,
     pub area: Option<Rect>,
-    placed: Option<(u32, String, Rect)>,
+    placed: Option<(u32, String, Rect, u64)>,
     next_id: u32,
+    generation: u64,
 }
 
 impl Preview {
@@ -62,6 +63,7 @@ impl Preview {
             area: None,
             placed: None,
             next_id: 0,
+            generation: 0,
         }
     }
 
@@ -71,6 +73,17 @@ impl Preview {
 
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
+    }
+
+    /// Accept a decoded preview, but only if it matches the currently-requested
+    /// path (stale images from an earlier selection are dropped). A successful
+    /// accept bumps `generation` so [`sync`] re-places an image re-decoded after
+    /// an edit even when its path and rect are unchanged.
+    pub fn accept(&mut self, img: PreviewImage) {
+        if self.requested.as_deref() == Some(img.path.as_str()) {
+            self.generation = self.generation.wrapping_add(1);
+            self.current = Some(img);
+        }
     }
 }
 
@@ -103,39 +116,63 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         area.width,
         area.height.saturating_sub(1),
     );
-    if body.height > 0 && body.width > 0 {
-        let blank = " ".repeat(body.width as usize);
-        for y in body.y..body.y + body.height {
-            f.buffer_mut()
-                .set_string(body.x, y, blank.clone(), Style::reset());
-        }
+    if body.height == 0 || body.width == 0 {
+        // No room for an image below the header; leave `area` unset so `sync`
+        // deletes rather than painting over the header row.
+        app.preview.area = None;
+        return;
     }
-    app.preview.area = Some(if body.height > 0 {
-        body
-    } else {
-        Rect::new(area.x, area.y, area.width, 1)
-    });
+    let blank = " ".repeat(body.width as usize);
+    for y in body.y..body.y + body.height {
+        f.buffer_mut()
+            .set_string(body.x, y, blank.clone(), Style::reset());
+    }
+    app.preview.area = Some(body);
 }
 
 /// Reconcile the on-screen image with the current preview state. Call after
-/// every `terminal.draw`. Re-places when the image or its rect changed (a
-/// resize changes the rect) and deletes when the image goes away.
+/// every `terminal.draw`. Re-places when the image, its rect, or its generation
+/// changed (a resize changes the rect; a re-decode bumps the generation) and
+/// deletes when the image goes away.
 pub fn sync(w: &mut impl Write, preview: &mut Preview) -> io::Result<()> {
     if let (Some(img), Some(area)) = (preview.current.as_ref(), preview.area) {
-        if let Some((_, path, rect)) = preview.placed.as_ref() {
-            if path == &img.path && *rect == area {
+        if let Some((_, path, rect, gen)) = preview.placed.as_ref() {
+            if path == &img.path && *rect == area && *gen == preview.generation {
                 return Ok(());
             }
         }
-        if let Some((old_id, _, _)) = preview.placed.take() {
-            kitty::delete(w, old_id)?;
+        if let Some((old_id, _, _, _)) = preview.placed.take() {
+            if let Err(e) = kitty::delete(w, old_id) {
+                preview.placed = None;
+                let _ = w.flush();
+                return Err(e);
+            }
         }
-        let id = preview.next_id.wrapping_add(1);
+        let mut id = preview.next_id.wrapping_add(1);
+        if id == 0 {
+            id = 1;
+        }
         preview.next_id = id;
-        kitty::place(w, id, &img.png, img.width, img.height, area, kitty::cell_size())?;
-        preview.placed = Some((id, img.path.clone(), area));
-    } else if let Some((old_id, _, _)) = preview.placed.take() {
-        kitty::delete(w, old_id)?;
+        if let Err(e) = kitty::place(
+            w,
+            id,
+            &img.png,
+            img.width,
+            img.height,
+            area,
+            kitty::cell_size(),
+        ) {
+            preview.placed = None;
+            let _ = w.flush();
+            return Err(e);
+        }
+        preview.placed = Some((id, img.path.clone(), area, preview.generation));
+    } else if let Some((old_id, _, _, _)) = preview.placed.take() {
+        if let Err(e) = kitty::delete(w, old_id) {
+            preview.placed = None;
+            let _ = w.flush();
+            return Err(e);
+        }
     }
     w.flush()
 }
@@ -143,16 +180,13 @@ pub fn sync(w: &mut impl Write, preview: &mut Preview) -> io::Result<()> {
 /// Delete every image the terminal is holding. Call on exit so previews do not
 /// persist onto the primary screen.
 pub fn cleanup(w: &mut impl Write) -> io::Result<()> {
-    w.write_all(b"\x1b_Ga=d,d=A\x1b\\")?;
+    kitty::delete_all(w)?;
     w.flush()
 }
 
 /// Drain the preview channel, keeping only the newest image, and return it.
-/// The caller applies it via [`App::apply_preview`], which rejects stale images.
-pub fn drain_previews(
-    rx: &Receiver<PreviewImage>,
-    _preview: &mut Preview,
-) -> Option<PreviewImage> {
+/// The caller applies it via [`Preview::accept`], which rejects stale images.
+pub fn drain_previews(rx: &Receiver<PreviewImage>) -> Option<PreviewImage> {
     let mut latest = None;
     while let Ok(img) = rx.try_recv() {
         latest = Some(img);
@@ -209,10 +243,32 @@ mod tests {
         tx.send(mk(1)).unwrap();
         tx.send(mk(2)).unwrap();
         tx.send(mk(3)).unwrap();
-        let mut preview = Preview::new();
-        let got = drain_previews(&rx, &mut preview).unwrap();
+        let got = drain_previews(&rx).unwrap();
         assert_eq!(got.png, vec![3]);
-        assert!(drain_previews(&rx, &mut preview).is_none());
+        assert!(drain_previews(&rx).is_none());
+    }
+
+    #[test]
+    fn accept_only_matching_requested_and_bumps_generation() {
+        let mut p = Preview::new();
+        p.requested = Some("a.png".into());
+        let mk = |path: &str| PreviewImage {
+            path: path.into(),
+            png: vec![1],
+            width: 1,
+            height: 1,
+        };
+
+        p.accept(mk("other.png"));
+        assert!(p.current.is_none());
+        assert_eq!(p.generation, 0);
+
+        p.accept(mk("a.png"));
+        assert_eq!(p.generation, 1);
+        assert_eq!(p.current.as_ref().unwrap().path, "a.png");
+
+        p.accept(mk("a.png"));
+        assert_eq!(p.generation, 2);
     }
 
     #[test]
@@ -242,7 +298,62 @@ mod tests {
         p.current = None;
         let mut out3 = Vec::new();
         sync(&mut out3, &mut p).unwrap();
-        assert_eq!(out3, b"\x1b_Ga=d,d=I,i=1\x1b\\");
+        let s3 = String::from_utf8(out3).unwrap();
+        assert!(s3.contains("a=d,d=I,i=1"));
+        assert!(p.placed.is_none());
+    }
+
+    #[test]
+    fn sync_replaces_when_generation_changes() {
+        let mut p = Preview::new();
+        p.enabled = true;
+        p.requested = Some("x.png".into());
+        p.accept(PreviewImage {
+            path: "x.png".into(),
+            png: b"one".to_vec(),
+            width: 4,
+            height: 3,
+        });
+        p.area = Some(Rect::new(0, 0, 10, 10));
+
+        let mut out = Vec::new();
+        sync(&mut out, &mut p).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("i=1"));
+
+        // Same path/rect, but a re-decoded image bumps the generation.
+        p.accept(PreviewImage {
+            path: "x.png".into(),
+            png: b"two".to_vec(),
+            width: 4,
+            height: 3,
+        });
+        let mut out2 = Vec::new();
+        sync(&mut out2, &mut p).unwrap();
+        let s2 = String::from_utf8(out2).unwrap();
+        assert!(s2.contains("a=d,d=I,i=1"));
+        assert!(s2.contains("a=T"));
+        assert!(s2.contains("i=2"));
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("boom"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sync_clears_placed_on_write_error() {
+        let mut p = Preview::new();
+        p.placed = Some((1, "x.png".into(), Rect::new(0, 0, 10, 10), 0));
+        p.current = None;
+
+        let err = sync(&mut FailingWriter, &mut p).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(p.placed.is_none());
     }
 }

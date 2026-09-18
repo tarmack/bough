@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use notify::{recommended_watcher, RecursiveMode};
 
 /// Coarse classification of what moved. The worker treats both the same way
@@ -171,17 +171,28 @@ fn run_notify_loop(
     let mut last_head = stat_mtime(&head_path);
     let mut last_base = base_path.as_deref().and_then(stat_mtime);
     let mut last_poll = Instant::now();
+    // Set when a bounded send dropped an event under backpressure; retried as a
+    // coalesced `WorkdirChanged` so the worker can't miss the final change in a
+    // burst (only refs have a poll backstop, not the workdir).
+    let mut dirty = false;
 
     loop {
         if io.shutdown.load(Ordering::Relaxed) {
             break;
+        }
+        if dirty && io.out_tx.try_send(WorkerEvent::WorkdirChanged).is_ok() {
+            dirty = false;
         }
         match raw_rx.recv_timeout(SHUTDOWN_TICK) {
             Ok(Ok(event)) => {
                 for path in &event.paths {
                     let rel = path.strip_prefix(&io.repo_root).unwrap_or(path);
                     if let Some(ev) = classify(rel, io.base_ref.as_deref()) {
-                        let _ = io.out_tx.send(ev);
+                        match io.out_tx.try_send(ev) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => dirty = true,
+                            Err(TrySendError::Disconnected(_)) => return,
+                        }
                     }
                 }
             }

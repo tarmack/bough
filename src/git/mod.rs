@@ -41,7 +41,8 @@ pub(crate) fn open_repo() -> Result<gix::Repository, GitError> {
     open_repo_at(&cwd)
 }
 
-/// Open the repository containing `dir`, without searching above it.
+/// Open the repository containing `dir`, searching upward through parent
+/// directories.
 pub(crate) fn open_repo_at(dir: &Path) -> Result<gix::Repository, GitError> {
     gix::discover(dir).map_err(|e| GitError::message(format!("not a git repository: {e}")))
 }

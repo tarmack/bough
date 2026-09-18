@@ -213,7 +213,7 @@ fn tree_left(app: &App, node_idx: usize, bg: Color) -> Line<'static> {
 /// Unknown extensions fall back to a generic file icon. Shared with the diff
 /// header rows, which show the same icon for a file and its hunks.
 pub(crate) fn file_icon(name: &str) -> &'static str {
-    match name.rsplit('.').next().unwrap_or("") {
+    match name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("") {
         "rs" => "\u{e7a8}",                             // rust
         "toml" | "yaml" | "yml" | "json" => "\u{e615}", // config gear
         "py" => "\u{e795}",                             // python
@@ -308,5 +308,18 @@ mod tests {
         let buf = terminal.backend().buffer();
         assert_eq!(buf.cell((54, 23)).unwrap().symbol(), "\u{e0a5}");
         assert_eq!(buf.cell((57, 23)).unwrap().symbol(), "e");
+    }
+
+    #[test]
+    fn file_icon_extensionless_files_get_generic() {
+        let generic = file_icon("");
+        // An extension-less name must not be treated as its own extension.
+        assert_eq!(file_icon("rs"), generic);
+        assert_eq!(file_icon("go"), generic);
+        assert_eq!(file_icon("c"), generic);
+        assert_eq!(file_icon("README"), generic);
+        // A real extension still selects the specific icon.
+        assert_ne!(file_icon("a.rs"), generic);
+        assert_ne!(file_icon("a.go"), generic);
     }
 }

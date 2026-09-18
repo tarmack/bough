@@ -17,6 +17,11 @@ use crate::view::tree::file_icon;
 /// Render the diff pane: the locked header, optional rename line, and the
 /// scrollable body (sticky pinned hunk header + hunk rows).
 pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
+    // Click-row mapping must never point at a previous diff's headers; reset
+    // before any early return (loading/error/empty/preview).
+    app.sticky_file = None;
+    app.sticky_hunk = None;
+
     // No file selected: placeholder, no locked header.
     if app.current_file().is_none() {
         let style = Style::default().fg(Color::DarkGray);
@@ -41,12 +46,35 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let header_height = 1 + has_rename as u16;
     app.last_header_height = header_height;
 
-    let visible = app.visible_line_indices();
     let body_height = area.height.saturating_sub(header_height);
-    let max_scroll = max_scroll_for(visible.len(), body_height as usize);
+    // Degenerate pane (header fills it): nothing below the header to draw.
+    if body_height == 0 {
+        return;
+    }
+
+    let visible = app.visible_line_indices();
+    // Clamp in two passes: the sticky count depends on the scroll position,
+    // which the first clamp may have moved.
+    let sticky_rows = app.sticky_row_count();
+    let max_scroll = max_scroll_for(visible.len(), body_height as usize, sticky_rows);
     if app.diff_scroll > max_scroll {
         app.diff_scroll = max_scroll;
     }
+    let (file_sticky, hunk_sticky, flow_height) =
+        sticky_headers(&visible, &diff.lines, app.diff_scroll, body_height);
+    let actual_rows = usize::from(file_sticky.is_some()) + usize::from(hunk_sticky.is_some());
+    let (file_sticky, hunk_sticky, flow_height) = if actual_rows != sticky_rows {
+        let max_scroll = max_scroll_for(visible.len(), body_height as usize, actual_rows);
+        if app.diff_scroll > max_scroll {
+            app.diff_scroll = max_scroll;
+        }
+        sticky_headers(&visible, &diff.lines, app.diff_scroll, body_height)
+    } else {
+        (file_sticky, hunk_sticky, flow_height)
+    };
+    // Pinned sticky lines, for click-row mapping.
+    app.sticky_file = file_sticky;
+    app.sticky_hunk = hunk_sticky;
 
     let active = app.active_chunk;
     let current = active.map(|s| s + 1).unwrap_or(0);
@@ -96,59 +124,70 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Scrollable body. A sticky file header and a sticky hunk header are
-    // pinned independently: scrolling into the next file replaces the file
-    // sticky, while the hunk sticky tracks the last hunk within it.
-    let start = app.diff_scroll;
-    let (file_sticky, hunk_sticky, flow_height) =
-        sticky_headers(&visible, &diff.lines, start, body_height);
-    // Pinned sticky lines, for click-row mapping.
-    app.sticky_file = file_sticky;
-    app.sticky_hunk = hunk_sticky;
-
-    // Render pinned sticky rows, then the visible flow rows below them.
+    // Render pinned sticky rows, then the visible flow rows below them. Guard
+    // each sticky write against running past the pane bottom (ratatui's
+    // `set_line` panics otherwise).
+    let bottom = area.y.saturating_add(area.height);
     if let Some(idx) = file_sticky {
-        y = render_section_header(f, app, area, y, idx, diff);
+        if y < bottom {
+            y = render_section_header(f, app, area, y, idx, diff);
+        }
     }
     if let Some(idx) = hunk_sticky {
-        y = render_section_header(f, app, area, y, idx, diff);
+        if y < bottom {
+            y = render_section_header(f, app, area, y, idx, diff);
+        }
     }
+    let start = app.diff_scroll;
     let end = (start + flow_height as usize).min(visible.len());
     emit_visible_rows(f, app, area, y, diff, &visible[start..end]);
 }
 
-/// The last sticky header of `kind` that scrolls off above the body top. Only
-/// lines in `visible[..start]` can be sticky; `None` when the body top is at
-/// the very start (no row scrolled away yet).
-fn last_sticky(
+/// Position (within `visible`) of the last sticky header of `kind` that
+/// scrolls off above the body top, searching `visible[from..start]`. `None`
+/// when no such header scrolled away.
+fn last_sticky_pos(
     visible: &[usize],
     lines: &[DiffLine],
     kind: LineKind,
     start: usize,
+    from: usize,
 ) -> Option<usize> {
-    if start == 0 {
-        return None;
-    }
-    visible
-        .iter()
-        .take(start)
-        .rev()
-        .find(|&&li| lines[li].kind == kind)
-        .copied()
+    (from..start).rev().find(|&p| lines[visible[p]].kind == kind)
 }
 
 /// Compute the sticky file/hunk header layout for the body. Returns the two
 /// sticky indices plus the flow height left below them. The caller writes
 /// `app.sticky_file`/`app.sticky_hunk` (the pinned sticky lines, for click-row
 /// mapping).
+///
+/// The hunk sticky is confined to the pinned file's own lines, so scrolling
+/// into a new file replaces the previous file's hunk rather than pinning it
+/// under the new header. Rows are capped by `body_height`, preferring the file
+/// sticky over the hunk sticky.
 fn sticky_headers(
     visible: &[usize],
     lines: &[DiffLine],
     start: usize,
     body_height: u16,
 ) -> (Option<usize>, Option<usize>, u16) {
-    let file_sticky = last_sticky(visible, lines, LineKind::FileHeader, start);
-    let hunk_sticky = last_sticky(visible, lines, LineKind::HunkHeader, start);
+    let start = start.min(visible.len());
+    let file_pos = last_sticky_pos(visible, lines, LineKind::FileHeader, start, 0);
+    let file_sticky = file_pos.map(|p| visible[p]);
+    let hunk_from = file_pos.map_or(0, |p| p + 1);
+    let hunk_sticky = last_sticky_pos(visible, lines, LineKind::HunkHeader, start, hunk_from)
+        .map(|p| visible[p]);
+
+    // Cap pinned rows: at most one file sticky, and the hunk sticky only when
+    // a row remains for it.
+    let mut file_sticky = file_sticky;
+    let mut hunk_sticky = hunk_sticky;
+    if body_height == 0 {
+        file_sticky = None;
+        hunk_sticky = None;
+    } else if body_height < 2 && file_sticky.is_some() {
+        hunk_sticky = None;
+    }
     let sticky_rows =
         file_sticky.map(|_| 1u16).unwrap_or(0) + hunk_sticky.map(|_| 1u16).unwrap_or(0);
     (
@@ -308,7 +347,7 @@ fn stat_spans(added: usize, deleted: usize, binary: bool, bg: Option<Color>) -> 
 /// and let the caller's elide truncate the overflow.
 fn right_align(left: &mut Vec<Span<'static>>, right_w: usize, width: usize) {
     let left_w: usize = left.iter().map(|s| s.width()).sum();
-    if width > left_w + 1 + right_w {
+    if width >= left_w + 1 + right_w {
         left.push(Span::raw(" ".repeat(width - left_w - right_w)));
     }
 }
@@ -549,10 +588,11 @@ fn draw_section_header(
             .push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
     }
     f.buffer_mut().set_line(area.x, y, &name_line, name_w);
-    if name_w > 0 {
-        f.buffer_mut()
-            .set_line(area.x + name_w, y, &Line::from(stat), area.width - name_w);
-    }
+    // Draw the stat even when the name region collapsed to zero width so a
+    // too-narrow pane still shows the (truncated) diffstat instead of a blank
+    // row.
+    f.buffer_mut()
+        .set_line(area.x + name_w, y, &Line::from(stat), area.width - name_w);
     y + 1
 }
 
@@ -882,6 +922,16 @@ mod tests {
         // Word-diff off: the non-overlay path still renders.
         app.word_diff_on = false;
         terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
+        let cells = terminal.backend().buffer().content();
+        let row: String = cells.iter().map(|c| c.symbol().to_string()).collect();
+        assert!(
+            row.contains("newlonger"),
+            "non-word path must render the added line: {row}"
+        );
+        assert!(
+            row.contains("old"),
+            "non-word path must render the removed line: {row}"
+        );
 
         // Directly exercise the guard: tokens that don't tile `raw` exactly
         // must not panic and must still tile `raw` exactly (fallback spans).
@@ -1135,5 +1185,146 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect();
         assert!(text.contains("l19"), "last line was cut off: {text}");
+    }
+
+    #[test]
+    fn render_tiny_pane_does_not_panic() {
+        let mut app = sample_app();
+        app.selected_path = Some("x.rs".into());
+        let lines: Vec<DiffLine> = std::iter::once(hunk_header(0))
+            .chain((0..5).map(|i| ctx_line(i, 0)))
+            .collect();
+        app.snapshot = snapshot_with_diff(single_diff(header_full(None, None), lines));
+
+        // `body_height == 0`: the pane is only as tall as the locked header.
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
+        assert_eq!(app.sticky_file, None);
+        assert_eq!(app.sticky_hunk, None);
+    }
+
+    #[test]
+    fn sticky_rows_capped_to_body_height() {
+        let mk = |path: &str| FileHeader {
+            path: path.into(),
+            status: FileStatus::Modified,
+            added: 1,
+            deleted: 0,
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: false,
+            hunks: vec![HunkMeta {
+                added: 1,
+                deleted: 0,
+            }],
+        };
+        let mut app = sample_app();
+        app.selected_path = Some("src".into());
+        app.snapshot = snapshot_with_diff(Diff {
+            header: mk("src"),
+            files: vec![mk("src/a.rs"), mk("src/b.rs")],
+            sections: vec![
+                Section {
+                    kind: SectionKind::File,
+                    file: 0,
+                    hunk: None,
+                },
+                Section {
+                    kind: SectionKind::Hunk,
+                    file: 0,
+                    hunk: Some(0),
+                },
+                Section {
+                    kind: SectionKind::File,
+                    file: 1,
+                    hunk: None,
+                },
+                Section {
+                    kind: SectionKind::Hunk,
+                    file: 1,
+                    hunk: Some(0),
+                },
+            ],
+            lines: vec![
+                DiffLine {
+                    kind: LineKind::FileHeader,
+                    raw_text: "src/a.rs".into(),
+                    section: 0,
+                    word_runs: None,
+                },
+                DiffLine {
+                    kind: LineKind::HunkHeader,
+                    raw_text: "@@".into(),
+                    section: 1,
+                    word_runs: None,
+                },
+                DiffLine {
+                    kind: LineKind::Added,
+                    raw_text: "a".into(),
+                    section: 1,
+                    word_runs: None,
+                },
+                DiffLine {
+                    kind: LineKind::FileHeader,
+                    raw_text: "src/b.rs".into(),
+                    section: 2,
+                    word_runs: None,
+                },
+                DiffLine {
+                    kind: LineKind::HunkHeader,
+                    raw_text: "@@".into(),
+                    section: 3,
+                    word_runs: None,
+                },
+                DiffLine {
+                    kind: LineKind::Added,
+                    raw_text: "b".into(),
+                    section: 3,
+                    word_runs: None,
+                },
+            ],
+        });
+        // Both a file and a hunk sticky would pin, but only one body row
+        // exists; the file sticky wins.
+        app.diff_scroll = 5;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
+        assert!(app.sticky_file.is_some());
+        assert_eq!(app.sticky_hunk, None);
+    }
+
+    #[test]
+    fn hunk_sticky_stays_within_file() {
+        let lines = vec![
+            DiffLine {
+                kind: LineKind::FileHeader,
+                raw_text: "a.rs".into(),
+                section: 0,
+                word_runs: None,
+            },
+            hunk_header(1),
+            ctx_line(0, 1),
+            DiffLine {
+                kind: LineKind::FileHeader,
+                raw_text: "b.rs".into(),
+                section: 2,
+                word_runs: None,
+            },
+            hunk_header(3),
+            ctx_line(1, 3),
+        ];
+        let visible: Vec<usize> = (0..lines.len()).collect();
+        // Top scrolled just past b.rs's header: a.rs's hunk must not pin under
+        // b.rs's header.
+        let (file, hunk, _) = sticky_headers(&visible, &lines, 4, 5);
+        assert_eq!(file, Some(3));
+        assert_eq!(hunk, None);
+        // One line further, b.rs's own hunk becomes sticky.
+        let (file, hunk, _) = sticky_headers(&visible, &lines, 5, 5);
+        assert_eq!(file, Some(3));
+        assert_eq!(hunk, Some(4));
     }
 }
