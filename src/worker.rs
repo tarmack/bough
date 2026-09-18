@@ -16,6 +16,7 @@ use crossbeam_channel::{select, Receiver, Sender};
 use crate::diff::Diff;
 use crate::git;
 use crate::highlight::{Highlighter, ResumeState};
+use crate::preview::PreviewImage;
 use crate::snapshot::{ArcSnapshot, HighlightLines, Request, Seq, Snapshot};
 use crate::tree::Tree;
 use crate::watch::{Watcher, WorkerEvent};
@@ -62,6 +63,7 @@ impl std::error::Error for WorkerError {}
 pub struct Worker {
     pub request_tx: Sender<Request>,
     pub snapshot_rx: Receiver<ArcSnapshot>,
+    pub image_rx: Receiver<PreviewImage>,
     pub poll_mode: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -85,14 +87,15 @@ impl Worker {
                 // No watcher: surface via the first snapshot's error and run
                 // request-only. poll_mode stays false (watcher is off, not
                 // degraded to a workdir poll).
-                return spawn_no_watcher(rev, empty, initial_theme, e.to_string());
+                return spawn_no_watcher(rev, empty, repo_root, initial_theme, e.to_string());
             }
         };
         let poll_mode = watcher_poll_mode(&watcher);
         let event_rx = watcher.receiver().clone();
 
-        let (request_tx, request_rx) = crossbeam_channel::bounded::<Request>(64);
-        let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded::<ArcSnapshot>(16);
+        let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
+        let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
+        let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
 
         let theme = initial_theme;
         let handle = thread::Builder::new()
@@ -103,10 +106,14 @@ impl Worker {
                     rev,
                     empty,
                     highlighter,
+                    repo_root,
                     watcher,
-                    event_rx,
-                    request_rx,
-                    snapshot_tx,
+                    LoopChannels {
+                        event_rx,
+                        request_rx,
+                        snapshot_tx,
+                        image_tx,
+                    },
                 );
             })
             .map_err(|e| WorkerError {
@@ -116,6 +123,7 @@ impl Worker {
         Ok(Worker {
             request_tx,
             snapshot_rx,
+            image_rx,
             poll_mode,
             handle: Some(handle),
         })
@@ -143,11 +151,13 @@ fn watcher_poll_mode(w: &Watcher) -> Arc<AtomicBool> {
 fn spawn_no_watcher(
     rev: String,
     empty: bool,
+    repo_root: PathBuf,
     theme: String,
     watch_err: String,
 ) -> Result<Worker, WorkerError> {
-    let (request_tx, request_rx) = crossbeam_channel::bounded::<Request>(64);
-    let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded::<ArcSnapshot>(16);
+    let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
+    let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
+    let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
 
     let first_error = watch_err.clone();
     let handle = thread::Builder::new()
@@ -156,7 +166,7 @@ fn spawn_no_watcher(
             let highlighter = Highlighter::new(&theme).ok();
             // Emit one initial snapshot carrying the watcher error so the UI
             // status line surfaces it, then serve Diff requests only.
-            let mut state = WorkerState::new(rev.clone(), empty, highlighter);
+            let mut state = WorkerState::new(rev.clone(), empty, highlighter, repo_root);
             state.last_error = Some(first_error);
             state.send_initial(&snapshot_tx);
 
@@ -165,7 +175,7 @@ fn spawn_no_watcher(
                     recv(request_rx) -> msg => {
                         match msg {
                             Ok(req) => {
-                                if handle_request(req, &mut state, &snapshot_tx) {
+                                if handle_request(req, &mut state, &snapshot_tx, &image_tx) {
                                     break;
                                 }
                             }
@@ -183,6 +193,7 @@ fn spawn_no_watcher(
     Ok(Worker {
         request_tx,
         snapshot_rx,
+        image_rx,
         poll_mode: Arc::new(AtomicBool::new(false)),
         handle: Some(handle),
     })
@@ -262,6 +273,8 @@ struct WorkerState {
     rev: String,
     empty: bool,
     highlighter: Option<Highlighter>,
+    /// Repository root the worker resolves preview image paths against.
+    repo_root: PathBuf,
     selected_path: Option<String>,
     ctx: u32,
     latest_request_seq: Seq,
@@ -280,7 +293,12 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn new(rev: String, empty: bool, highlighter: Option<Highlighter>) -> Self {
+    fn new(
+        rev: String,
+        empty: bool,
+        highlighter: Option<Highlighter>,
+        repo_root: PathBuf,
+    ) -> Self {
         // Compute once up front so the first worker snapshot already shows
         // real branch state; later recomputes refresh it.
         let initial_branch = git::branch_state(&rev);
@@ -288,6 +306,7 @@ impl WorkerState {
             rev,
             empty,
             highlighter,
+            repo_root,
             selected_path: None,
             ctx: 3,
             latest_request_seq: 0,
@@ -327,18 +346,32 @@ impl WorkerState {
     }
 }
 
+/// The channels the worker loop reads from and writes to: watcher events,
+/// UI requests in, snapshots and preview images out.
+struct LoopChannels {
+    event_rx: Receiver<WorkerEvent>,
+    request_rx: Receiver<Request>,
+    snapshot_tx: Sender<ArcSnapshot>,
+    image_tx: Sender<PreviewImage>,
+}
+
 /// Main loop with watcher events + requests + debounce timer.
 fn run_loop(
     rev: String,
     empty: bool,
     highlighter: Option<Highlighter>,
+    repo_root: PathBuf,
     watcher: Watcher,
-    event_rx: Receiver<WorkerEvent>,
-    request_rx: Receiver<Request>,
-    snapshot_tx: Sender<ArcSnapshot>,
+    channels: LoopChannels,
 ) {
+    let LoopChannels {
+        event_rx,
+        request_rx,
+        snapshot_tx,
+        image_tx,
+    } = channels;
     let _watcher = watcher; // keep alive for the life of the loop
-    let mut state = WorkerState::new(rev, empty, highlighter);
+    let mut state = WorkerState::new(rev, empty, highlighter, repo_root);
     state.send_initial(&snapshot_tx);
     // First real snapshot comes from the initial recompute, so startup never
     // blocks the main thread on the git scan (whose cost scales with the total
@@ -367,7 +400,7 @@ fn run_loop(
             },
             recv(request_rx) -> req => match req {
                 Ok(r) => {
-                    if handle_request(r, &mut state, &snapshot_tx) {
+                    if handle_request(r, &mut state, &snapshot_tx, &image_tx) {
                         break;
                     }
                 }
@@ -438,7 +471,12 @@ fn is_stale(latest: Seq, incoming: Seq) -> bool {
 }
 
 /// Handle a UI request. Returns `true` if the loop should exit (`Shutdown`).
-fn handle_request(req: Request, state: &mut WorkerState, tx: &Sender<ArcSnapshot>) -> bool {
+fn handle_request(
+    req: Request,
+    state: &mut WorkerState,
+    tx: &Sender<ArcSnapshot>,
+    image_tx: &Sender<PreviewImage>,
+) -> bool {
     match req {
         Request::Shutdown => true,
         Request::SetRev { rev } => {
@@ -481,7 +519,62 @@ fn handle_request(req: Request, state: &mut WorkerState, tx: &Sender<ArcSnapshot
             fill_highlight_range(state, &path, ctx, from, to, tx);
             false
         }
+        Request::LoadImage { path, seq } => {
+            if is_stale(state.latest_request_seq, seq) {
+                return false;
+            }
+            state.latest_request_seq = seq;
+            load_preview(state, &path, image_tx);
+            false
+        }
     }
+}
+
+/// Read and decode the image at `path` (relative to the repo root) and send the
+/// finished preview on `tx`. Any read/decode failure is silent: the pane simply
+/// keeps showing whatever it had.
+fn load_preview(state: &WorkerState, path: &str, tx: &Sender<PreviewImage>) {
+    let Ok(bytes) = std::fs::read(state.repo_root.join(path)) else {
+        return;
+    };
+    if let Ok(img) = build_preview_bytes(&bytes, path.to_string()) {
+        let _ = tx.send(img);
+    }
+}
+
+/// Decode image bytes and re-encode them as a PNG preview, downscaling when the
+/// long edge exceeds 1024px to keep the escape payload small.
+pub fn build_preview_bytes(
+    bytes: &[u8],
+    path: String,
+) -> Result<PreviewImage, Box<dyn std::error::Error + Send + Sync>> {
+    let img = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .decode()?;
+    let rgba = if img.width().max(img.height()) > 1024 {
+        let long = img.width().max(img.height()) as f64;
+        let scale = 1024.0 / long;
+        let w = ((img.width() as f64 * scale).round() as u32).max(1);
+        let h = ((img.height() as f64 * scale).round() as u32).max(1);
+        image::imageops::resize(
+            &img.to_rgba8(),
+            w,
+            h,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img.to_rgba8()
+    };
+    let (width, height) = rgba.dimensions();
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(PreviewImage {
+        path,
+        png: out,
+        width,
+        height,
+    })
 }
 
 /// A `(status, path)` listing entry.
@@ -934,6 +1027,7 @@ mod tests {
             "main...HEAD".into(),
             false,
             Highlighter::new("Monokai Extended").ok(),
+            PathBuf::from("."),
         );
         let key = ("x.rs".to_string(), 3u32);
         state.cache.put(
@@ -955,7 +1049,27 @@ mod tests {
     fn worker_state_new_populates_branch() {
         // This repo is a git repo, so the first worker state must already
         // carry a branch name (the footer depends on it before any recompute).
-        let state = WorkerState::new("main...HEAD".into(), false, None);
+        let state = WorkerState::new("main...HEAD".into(), false, None, PathBuf::from("."));
         assert!(state.last_branch.name.is_some());
+    }
+
+    #[test]
+    fn build_preview_bytes_decodes_and_reencodes() {
+        let mut img = image::RgbaImage::new(4, 3);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([1, 2, 3, 255]);
+        }
+        let mut src = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut src),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let pv = build_preview_bytes(&src, "a/b.png".to_string()).unwrap();
+        assert_eq!(pv.path, "a/b.png");
+        assert_eq!((pv.width, pv.height), (4, 3));
+        assert_eq!(&pv.png[..4], b"\x89PNG");
     }
 }

@@ -14,6 +14,7 @@ use crossbeam_channel::Sender;
 
 use crate::diff::{Diff, LineKind};
 use crate::highlight::TokenOwned;
+use crate::preview::{self, PreviewImage};
 use crate::snapshot::{ArcSnapshot, Request, Seq};
 use crate::text::max_scroll_for;
 use crate::theme::Focus;
@@ -115,6 +116,8 @@ pub struct App {
     uncommitted_rev: String,
     /// Memoized `visible_line_indices` (see [`VisibleLine`]).
     visible_cache: RefCell<VisibleCache>,
+    /// Kitty-protocol image preview state for the selected file.
+    pub preview: crate::preview::Preview,
 }
 
 impl App {
@@ -182,6 +185,7 @@ impl App {
                 lines: Vec::new(),
                 max_width: 0,
             }),
+            preview: crate::preview::Preview::new(),
         };
         app.request_diff();
         app
@@ -289,6 +293,49 @@ impl App {
             ctx: self.context_lines,
             seq: self.seq,
         });
+        self.request_preview();
+    }
+
+    /// Ask the worker to decode the selected file as an image when the preview
+    /// is active and the selection is an image file; otherwise hide any preview.
+    fn request_preview(&mut self) {
+        let is_file = self
+            .selected_node()
+            .map(|idx| self.tree.nodes[idx].kind == tree::Kind::File)
+            .unwrap_or(false);
+        let path = self.selected_path.clone();
+        let wanted = self.preview.enabled
+            && is_file
+            && path.as_deref().map(preview::is_image_path).unwrap_or(false);
+        if !wanted {
+            self.preview.current = None;
+            self.preview.requested = None;
+            return;
+        }
+        let path = path.unwrap();
+        self.seq = self.seq.saturating_add(1);
+        let _ = self.request_tx.send(Request::LoadImage {
+            path: path.clone(),
+            seq: self.seq,
+        });
+        self.preview.requested = Some(path);
+        // Hide the old image while the new one is in flight.
+        self.preview.current = None;
+    }
+
+    /// Enable or disable image previews (called once at startup after the kitty
+    /// capability probe) and refresh the current selection accordingly.
+    pub fn set_preview_enabled(&mut self, on: bool) {
+        self.preview.set_enabled(on);
+        self.request_preview();
+    }
+
+    /// Accept a decoded preview, but only if it matches the currently-requested
+    /// path (stale images from an earlier selection are dropped).
+    pub fn apply_preview(&mut self, img: PreviewImage) {
+        if self.preview.requested.as_deref() == Some(img.path.as_str()) {
+            self.preview.current = Some(img);
+        }
     }
 
     /// Ask the worker to highlight the currently-visible diff region (viewport

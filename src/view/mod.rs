@@ -15,6 +15,7 @@ use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::preview;
 
 /// Compute the pane split and draw both panes plus an optional status line.
 /// Returns early on degenerate terminal sizes.
@@ -42,7 +43,12 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     let tree = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y, tree_w, tree_h);
     let tree_footer = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y + tree_h, tree_w, 1);
 
-    diff::render_diff(f, app, diff);
+    if app.preview.active() {
+        preview::render(f, app, diff);
+    } else {
+        app.preview.area = None;
+        diff::render_diff(f, app, diff);
+    }
     tree::render_tree(f, app, tree);
     tree::render_branch_footer(f, app, tree_footer);
 

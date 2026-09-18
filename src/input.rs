@@ -15,6 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{App, CONTEXT_STEP, HSCROLL_STEP};
+use crate::preview::{self, PreviewImage};
 use crate::snapshot::ArcSnapshot;
 use crate::theme::Focus;
 use crate::view;
@@ -36,10 +37,15 @@ pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     snapshot_rx: &Receiver<ArcSnapshot>,
+    image_rx: &Receiver<PreviewImage>,
 ) -> io::Result<()> {
     loop {
         terminal.draw(|f| view::ui(f, app))?;
+        let _ = preview::sync(&mut io::stdout(), &mut app.preview);
         drain_snapshots(snapshot_rx, app);
+        if let Some(img) = preview::drain_previews(image_rx, &mut app.preview) {
+            app.apply_preview(img);
+        }
         app.maybe_request_highlight();
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {

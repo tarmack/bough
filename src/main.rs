@@ -14,6 +14,8 @@ mod diff;
 mod git;
 mod highlight;
 mod input;
+mod kitty;
+mod preview;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
@@ -118,14 +120,17 @@ fn main() -> io::Result<()> {
     );
 
     enable_raw_mode()?;
+    let images = kitty::probe();
+    app.set_preview_enabled(images);
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = input::run(&mut terminal, &mut app, &worker.snapshot_rx);
+    let result = input::run(&mut terminal, &mut app, &worker.snapshot_rx, &worker.image_rx);
 
     disable_raw_mode()?;
+    let _ = preview::cleanup(&mut io::stdout());
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,

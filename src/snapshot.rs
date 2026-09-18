@@ -60,6 +60,9 @@ pub enum Request {
         to: usize,
         seq: Seq,
     },
+    /// Decode + downscale the image at `path` for the preview pane. `seq` lets
+    /// the worker drop stale asks.
+    LoadImage { path: String, seq: Seq },
     /// Switch the base the diffs are computed against (e.g. between `HEAD`
     /// and `main...HEAD`) and recompute the whole tree + diff.
     SetRev { rev: String },

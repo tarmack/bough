@@ -169,7 +169,7 @@ impl Highlighter {
     /// Highlight one line of `text` for a file at `path`, starting from a fresh
     /// [`ResumeState`]. Returns owned token spans, or an empty `Vec` when no
     /// grammar matches the file extension. Never panics.
-    #[allow(dead_code)] // convenience wrapper exercised by the in-file tests
+    #[cfg(test)]
     pub fn line(&self, path: &str, text: &str) -> Vec<TokenOwned> {
         let Some(mut resume) = self.fresh_state(path) else {
             return Vec::new();
