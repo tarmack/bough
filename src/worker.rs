@@ -313,15 +313,15 @@ struct WorkerState {
     /// True once the UI has sent a `LoadImage` request: recomputes then also
     /// refresh the selected image preview when it changed on disk.
     preview_active: bool,
+    /// Uncommitted-only `(added, deleted)` totals for branch comparisons —
+    /// how much of the view is mid-flight work. `None` in the uncommitted
+    /// view (its own totals already are uncommitted-only) or when the extra
+    /// scan failed.
+    uncommitted_stats: Option<(usize, usize)>,
 }
 
 impl WorkerState {
-    fn new(
-        rev: String,
-        empty: bool,
-        highlighter: Option<Highlighter>,
-        repo_root: PathBuf,
-    ) -> Self {
+    fn new(rev: String, empty: bool, highlighter: Option<Highlighter>, repo_root: PathBuf) -> Self {
         // Compute once up front so the first worker snapshot already shows
         // real branch state; later recomputes refresh it.
         let initial_branch = git::branch_state(&rev);
@@ -341,6 +341,7 @@ impl WorkerState {
             last_branch: initial_branch,
             last_changes: HashMap::new(),
             preview_active: false,
+            uncommitted_stats: None,
         }
     }
 
@@ -366,6 +367,7 @@ impl WorkerState {
             selected_highlight,
             error,
             branch_state: self.last_branch.clone(),
+            uncommitted_stats: self.uncommitted_stats,
         }
     }
 }
@@ -652,12 +654,7 @@ pub fn build_preview_bytes(
         let scale = 1024.0 / long;
         let w = ((img.width() as f64 * scale).round() as u32).max(1);
         let h = ((img.height() as f64 * scale).round() as u32).max(1);
-        image::imageops::resize(
-            &img.to_rgba8(),
-            w,
-            h,
-            image::imageops::FilterType::Triangle,
-        )
+        image::imageops::resize(&img.to_rgba8(), w, h, image::imageops::FilterType::Triangle)
     } else {
         img.to_rgba8()
     };
@@ -731,6 +728,20 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>, image_tx: &Sende
     state.last_git_wall = t0.elapsed();
     state.last_branch = git::branch_state(&state.rev);
 
+    // In branch comparisons, how much of the view is uncommitted mid-flight
+    // work: a second, uncommitted-only scan. The uncommitted view's own
+    // totals already are uncommitted-only, so skip it there. A failure just
+    // hides the split from the footer.
+    state.uncommitted_stats = if state.rev.contains("...") {
+        git::all_changes("HEAD").ok().map(|changes| {
+            changes
+                .iter()
+                .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted))
+        })
+    } else {
+        None
+    };
+
     // Adaptive floor: slow git or huge diff raises the floor for 10s.
     if state.last_git_wall > SLOW_GIT_THRESHOLD || entries.len() > LARGE_DIFF_THRESHOLD {
         state.floor_raised_at = Some(Instant::now());
@@ -775,8 +786,7 @@ fn evict_changed(state: &mut WorkerState) {
     }
     let changed = &state.last_changes;
     state.cache.retain(|(p, _)| {
-        !changed.contains_key(p)
-            && !changed.keys().any(|c| c.starts_with(&format!("{p}/")))
+        !changed.contains_key(p) && !changed.keys().any(|c| c.starts_with(&format!("{p}/")))
     });
 }
 
@@ -1289,10 +1299,7 @@ mod tests {
         }
         let mut src = Vec::new();
         image::DynamicImage::ImageRgba8(img)
-            .write_to(
-                &mut std::io::Cursor::new(&mut src),
-                image::ImageFormat::Png,
-            )
+            .write_to(&mut std::io::Cursor::new(&mut src), image::ImageFormat::Png)
             .unwrap();
 
         let pv = build_preview_bytes(&src, "a/b.png".to_string()).unwrap();

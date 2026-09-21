@@ -57,6 +57,7 @@ pub fn sample_snapshot(tree: Tree) -> ArcSnapshot {
         selected_highlight: Vec::new(),
         error: None,
         branch_state: crate::git::BranchState::default(),
+        uncommitted_stats: None,
         tree,
     })
 }
@@ -74,6 +75,7 @@ pub fn snapshot_with_diff(diff: Diff) -> ArcSnapshot {
         selected_highlight: hl,
         error: None,
         branch_state: crate::git::BranchState::default(),
+        uncommitted_stats: None,
         tree,
     })
 }

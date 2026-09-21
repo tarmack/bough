@@ -331,10 +331,7 @@ mod tests {
 
     #[test]
     fn duplicate_file_entry_keeps_latest_status() {
-        let tree = Tree::build(vec![
-            ('M', "a.rs".to_string()),
-            ('A', "a.rs".to_string()),
-        ]);
+        let tree = Tree::build(vec![('M', "a.rs".to_string()), ('A', "a.rs".to_string())]);
         let file_idx = tree.nodes[tree.root].children[0];
         assert_eq!(tree.nodes[file_idx].kind, Kind::File);
         assert_eq!(tree.nodes[file_idx].status, "A");

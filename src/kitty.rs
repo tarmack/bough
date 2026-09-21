@@ -84,8 +84,7 @@ fn probe_escape() -> bool {
             events: libc::POLLIN,
             revents: 0,
         };
-        let ready =
-            unsafe { libc::poll(&mut pfd, 1, wait.as_millis().max(1) as libc::c_int) };
+        let ready = unsafe { libc::poll(&mut pfd, 1, wait.as_millis().max(1) as libc::c_int) };
         if ready == -1 {
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
@@ -124,9 +123,7 @@ fn has_ok_response(buf: &[u8]) -> bool {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Transmit and display `png` as image `id` at `area`, preserving aspect ratio
@@ -156,9 +153,7 @@ pub fn place(
     let b64 = STANDARD.encode(png);
     let chunks: Vec<&[u8]> = b64.as_bytes().chunks(CHUNK_B64).collect();
     if chunks.is_empty() {
-        let control = format!(
-            "a=T,f=100,t=d,C=1,i={id},s={src_w},v={src_h},c={c},r={r},m=0,q=1"
-        );
+        let control = format!("a=T,f=100,t=d,C=1,i={id},s={src_w},v={src_h},c={c},r={r},m=0,q=1");
         write!(w, "\x1b_G{};\x1b\\", control)?;
         return Ok(());
     }
@@ -242,7 +237,16 @@ mod tests {
     #[test]
     fn place_single_chunk_header_and_payload() {
         let mut out = Vec::new();
-        place(&mut out, 5, b"hello", 4, 3, Rect::new(0, 0, 10, 10), (10, 20)).unwrap();
+        place(
+            &mut out,
+            5,
+            b"hello",
+            4,
+            3,
+            Rect::new(0, 0, 10, 10),
+            (10, 20),
+        )
+        .unwrap();
         let s = String::from_utf8(out).unwrap();
         // scale = min(100/4, 200/3) = 25 -> c = 10, r = 3.
         assert_eq!(
@@ -255,7 +259,16 @@ mod tests {
     fn place_multi_chunk_marks_middle_and_last() {
         let png = vec![0u8; 5000];
         let mut out = Vec::new();
-        place(&mut out, 9, &png, 100, 100, Rect::new(0, 0, 10, 10), (10, 20)).unwrap();
+        place(
+            &mut out,
+            9,
+            &png,
+            100,
+            100,
+            Rect::new(0, 0, 10, 10),
+            (10, 20),
+        )
+        .unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("\x1b[1;1H\x1b_Ga=T,f=100,t=d,C=1,i=9"));
         // More than one chunk: first ends with m=1, last with m=0.

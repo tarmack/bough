@@ -153,7 +153,9 @@ fn last_sticky_pos(
     start: usize,
     from: usize,
 ) -> Option<usize> {
-    (from..start).rev().find(|&p| lines[visible[p]].kind == kind)
+    (from..start)
+        .rev()
+        .find(|&p| lines[visible[p]].kind == kind)
 }
 
 /// Compute the sticky file/hunk header layout for the body. Returns the two
@@ -175,8 +177,8 @@ fn sticky_headers(
     let file_pos = last_sticky_pos(visible, lines, LineKind::FileHeader, start, 0);
     let file_sticky = file_pos.map(|p| visible[p]);
     let hunk_from = file_pos.map_or(0, |p| p + 1);
-    let hunk_sticky = last_sticky_pos(visible, lines, LineKind::HunkHeader, start, hunk_from)
-        .map(|p| visible[p]);
+    let hunk_sticky =
+        last_sticky_pos(visible, lines, LineKind::HunkHeader, start, hunk_from).map(|p| visible[p]);
 
     // Cap pinned rows: at most one file sticky, and the hunk sticky only when
     // a row remains for it.

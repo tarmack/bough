@@ -40,6 +40,11 @@ pub struct Snapshot {
     /// Current branch state (branch name, ahead/behind vs base, unpushed vs
     /// upstream), computed by the worker alongside the diff.
     pub branch_state: crate::git::BranchState,
+    /// Uncommitted-only totals `(added, deleted)`: how much of the view is
+    /// mid-flight work not yet committed. `None` when the view itself is the
+    /// uncommitted comparison, or when the extra scan failed (degrades to
+    /// hiding the split rather than blanking the bar).
+    pub uncommitted_stats: Option<(usize, usize)>,
 }
 
 /// Cheaply-clonable handle to a `Snapshot`.

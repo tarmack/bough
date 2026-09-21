@@ -1,7 +1,7 @@
 //! Reference/head state: repo classification, branch name, divergence vs a
 //! base ref, upstream tracking, and default-branch detection.
 
-use crate::git::{open_repo, resolve_id, GitError};
+use crate::git::{open_repo, resolve_id};
 
 /// All local branch names, sorted alphabetically (e.g. for the branch
 /// picker).
@@ -108,12 +108,6 @@ pub fn repo_state() -> RepoState {
     }
 }
 
-/// Current branch short name, or `None` when detached (or unresolved).
-pub fn current_branch() -> Result<Option<String>, GitError> {
-    let repo = open_repo()?;
-    Ok(current_branch_in(&repo))
-}
-
 /// Branch-state summary for the footer: current branch, its divergence from
 /// the base ref and from its upstream. Every field degrades to `None`/0 when
 /// it can't be determined (detached HEAD, no upstream, no base).
@@ -196,11 +190,7 @@ fn count_reachable(
     tip: &gix::ObjectId,
     hidden: &gix::ObjectId,
 ) -> Option<u32> {
-    let walker = repo
-        .rev_walk([*tip])
-        .with_hidden([*hidden])
-        .all()
-        .ok()?;
+    let walker = repo.rev_walk([*tip]).with_hidden([*hidden]).all().ok()?;
     // Count in `u64` and convert checked so an enormous walk is reported as
     // not-computable rather than silently truncated to `u32`.
     let count = u64::try_from(walker.count()).ok()?;

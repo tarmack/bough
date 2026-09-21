@@ -35,15 +35,23 @@ pub const HSCROLL_STEP: usize = 2;
 /// changes (e.g. made by AI coding agents).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// The branch's work: everything the current branch changed since it left
-    /// the default branch (usually `main`), plus any uncommitted edits.
-    Branch,
-    /// The branch's work measured from a different origin the user picked
-    /// (a branch, tag, or commit): everything since that point, plus
+    /// The branch's work: everything since an origin — the branch point on
+    /// the trunk by default, or any ref the user picked — plus any
     /// uncommitted edits.
-    BranchFrom(String),
+    Branch(Origin),
     /// Only uncommitted working-tree edits.
     Uncommitted,
+}
+
+/// Where a [`Mode::Branch`] comparison is measured from. The default is the
+/// startup comparison (usually the trunk's branch point, e.g. `main`); a
+/// picked origin is any ref chosen from the base picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The default comparison the app started with.
+    Default,
+    /// A ref the user picked: a branch, tag, or commit.
+    Picked(String),
 }
 
 /// One row in the base-picker popup: `rev` is the revision spec the diff is
@@ -131,12 +139,13 @@ pub struct App {
     pub poll_mode: bool,
     /// Current diff base: the default branch, a picked origin, or `HEAD`.
     pub mode: Mode,
-    /// Revision for `Mode::Branch` (the startup revision).
+    /// Revision for `Mode::Branch(Origin::Default)` (the startup revision).
     main_rev: String,
     /// Revision for `Mode::Uncommitted` (`HEAD`).
     uncommitted_rev: String,
-    /// Last picked origin, remembered across an `Uncommitted` toggle.
-    last_base: Option<String>,
+    /// Origin of the last `Mode::Branch` view, remembered across an
+    /// `Uncommitted` toggle.
+    last_origin: Option<Origin>,
     /// Open base-picker popup, or `None` when closed.
     pub base_picker: Option<BasePicker>,
     /// Memoized `visible_line_indices` (see [`VisibleCache`]).
@@ -197,10 +206,10 @@ impl App {
             seq: 0,
             last_highlight_range: None,
             poll_mode,
-            mode: Mode::Branch,
+            mode: Mode::Branch(Origin::Default),
             main_rev,
             uncommitted_rev,
-            last_base: None,
+            last_origin: None,
             base_picker: None,
             visible_cache: RefCell::new(VisibleCache {
                 snap: init_snap,
@@ -404,10 +413,32 @@ impl App {
     /// The active diff base revision.
     fn current_rev(&self) -> String {
         match &self.mode {
-            Mode::Branch => self.main_rev.clone(),
-            Mode::BranchFrom(base) => format!("{base}...HEAD"),
+            Mode::Branch(Origin::Default) => self.main_rev.clone(),
+            Mode::Branch(Origin::Picked(rev)) => format!("{rev}...HEAD"),
             Mode::Uncommitted => self.uncommitted_rev.clone(),
         }
+    }
+
+    /// Short name of the default origin (the left side of the startup
+    /// revision, e.g. `main` in `main...HEAD`), or `None` when the startup
+    /// revision compares against `HEAD` itself.
+    fn default_origin(&self) -> Option<String> {
+        self.main_rev
+            .split_once("...")
+            .map(|(base, _)| base.trim().to_string())
+    }
+
+    /// Switch between the branch view and uncommitted-only. The branch view's
+    /// origin is remembered so the round trip returns to it.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode.clone() {
+            Mode::Branch(origin) => {
+                self.last_origin = Some(origin);
+                Mode::Uncommitted
+            }
+            Mode::Uncommitted => Mode::Branch(self.last_origin.clone().unwrap_or(Origin::Default)),
+        };
+        self.apply_base_switch();
     }
 
     /// Reset the diff view and ask the worker to recompute at the current rev.
@@ -422,21 +453,6 @@ impl App {
         let _ = self.request_tx.send(Request::SetRev {
             rev: self.current_rev(),
         });
-    }
-
-    /// Switch between the default-branch and uncommitted bases, or toggle a
-    /// picked origin against `Uncommitted`. A picked origin is remembered so
-    /// the round trip returns to it rather than the default branch.
-    pub fn toggle_mode(&mut self) {
-        self.mode = match &self.mode {
-            Mode::Branch => Mode::Uncommitted,
-            Mode::BranchFrom(_) => Mode::Uncommitted,
-            Mode::Uncommitted => match &self.last_base {
-                Some(base) => Mode::BranchFrom(base.clone()),
-                None => Mode::Branch,
-            },
-        };
-        self.apply_base_switch();
     }
 
     /// Open the base picker populated from the repository's local branches.
@@ -514,23 +530,36 @@ impl App {
         self.set_base(rev);
     }
 
-    /// Switch the diff base to `base...HEAD`, remembering it for a later
-    /// `Uncommitted` round trip.
+    /// Switch the comparison origin to `base...HEAD`. Picking the default
+    /// origin (e.g. `main`) canonicalizes back to [`Origin::Default`], so it
+    /// is presented exactly like the app's startup view rather than as a
+    /// custom pick. Picking the branch you are on compares against `HEAD`
+    /// itself — that is the uncommitted view, so switch to it.
     pub fn set_base(&mut self, base: String) {
-        self.mode = Mode::BranchFrom(base.clone());
-        self.last_base = Some(base);
+        if self.snapshot.branch_state.name.as_deref() == Some(base.as_str()) {
+            self.mode = Mode::Uncommitted;
+            self.apply_base_switch();
+            return;
+        }
+        let origin = if self.default_origin().as_deref() == Some(base.as_str()) {
+            Origin::Default
+        } else {
+            Origin::Picked(base)
+        };
+        self.mode = Mode::Branch(origin.clone());
+        self.last_origin = Some(origin);
         self.apply_base_switch();
     }
 
-    /// Short name of the current mode's base, when one applies.
+    /// Short name of the current view's origin, when one applies.
     fn base_name(&self) -> Option<String> {
         match &self.mode {
-            Mode::BranchFrom(b) => Some(b.clone()),
-            Mode::Uncommitted => self.last_base.clone(),
-            Mode::Branch => self
-                .main_rev
-                .split_once("...")
-                .map(|(base, _)| base.trim().to_string()),
+            Mode::Branch(Origin::Default) => self.default_origin(),
+            Mode::Branch(Origin::Picked(rev)) => Some(rev.clone()),
+            Mode::Uncommitted => self.last_origin.as_ref().map(|o| match o {
+                Origin::Default => self.default_origin(),
+                Origin::Picked(rev) => Some(rev.clone()),
+            })?,
         }
     }
 
@@ -540,15 +569,15 @@ impl App {
     pub fn mode_label(&self) -> String {
         match &self.mode {
             Mode::Uncommitted => "uncommitted".to_string(),
-            Mode::Branch => {
-                let base = self
-                    .main_rev
-                    .split_once("...")
-                    .map(|(base, _)| base)
-                    .unwrap_or(&self.main_rev);
-                format!("vs {}", short_origin(base.trim()))
+            Mode::Branch(origin) => {
+                let base = match origin {
+                    Origin::Default => self
+                        .default_origin()
+                        .unwrap_or_else(|| self.main_rev.trim().to_string()),
+                    Origin::Picked(rev) => short_origin(rev),
+                };
+                format!("vs {base}")
             }
-            Mode::BranchFrom(rev) => format!("vs {}", short_origin(rev)),
         }
     }
 
@@ -1197,11 +1226,7 @@ impl App {
 /// Shortens a full 40-hex commit oid to 7 characters for the footer; branch
 /// and tag names pass through unchanged.
 fn short_origin(rev: &str) -> String {
-    if rev.len() == 40
-        && rev
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
+    if rev.len() == 40 && rev.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         rev[..7].to_string()
     } else {
         rev.to_string()
@@ -1291,7 +1316,7 @@ mod tests {
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );
-        assert_eq!(app.mode, Mode::Branch);
+        assert_eq!(app.mode, Mode::Branch(Origin::Default));
 
         app.toggle_mode();
         assert_eq!(app.mode, Mode::Uncommitted);
@@ -1301,7 +1326,7 @@ mod tests {
         }
 
         app.toggle_mode();
-        assert_eq!(app.mode, Mode::Branch);
+        assert_eq!(app.mode, Mode::Branch(Origin::Default));
         match rx.try_recv().unwrap() {
             crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "main...HEAD"),
             other => panic!("expected SetRev, got {other:?}"),
@@ -1328,13 +1353,72 @@ mod tests {
 
         app.set_base("feature".to_string());
 
-        assert_eq!(app.mode, Mode::BranchFrom("feature".to_string()));
+        assert_eq!(
+            app.mode,
+            Mode::Branch(Origin::Picked("feature".to_string()))
+        );
         assert_eq!(app.diff_scroll, 0);
         assert_eq!(app.diff_col, 0);
         assert_eq!(app.active_chunk, None);
         assert!(app.collapsed_hunks.is_empty());
         match rx.try_recv().unwrap() {
             crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_base_default_branch_canonicalizes_to_default_origin() {
+        // Picking `main` from the base picker must present exactly like the
+        // app's startup view (default origin, blue), not as a custom pick
+        // (magenta): the two are the same comparison.
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(4);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+
+        app.set_base("main".to_string());
+
+        assert_eq!(app.mode, Mode::Branch(Origin::Default));
+        assert_eq!(app.mode_label(), "vs main");
+        // The startup revision is sent verbatim, not `main...HEAD` rebuilt
+        // from the picked name.
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "main...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_base_own_branch_is_the_uncommitted_view() {
+        // Picking the branch you are on compares against `HEAD` itself:
+        // present that as the uncommitted view, not a branch view.
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(4);
+        let mut snap = sample_snapshot(Tree::build(Vec::new()));
+        std::sync::Arc::get_mut(&mut snap).unwrap().branch_state = crate::git::BranchState {
+            name: Some("feature".into()),
+            ..Default::default()
+        };
+        let mut app = App::new(
+            snap,
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+
+        app.set_base("feature".to_string());
+
+        assert_eq!(app.mode, Mode::Uncommitted);
+        assert_eq!(app.mode_label(), "uncommitted");
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "HEAD"),
             other => panic!("expected SetRev, got {other:?}"),
         }
     }
@@ -1354,7 +1438,7 @@ mod tests {
         app.toggle_mode();
         assert_eq!(app.mode, Mode::Uncommitted);
         app.toggle_mode();
-        assert_eq!(app.mode, Mode::Branch);
+        assert_eq!(app.mode, Mode::Branch(Origin::Default));
     }
 
     #[test]
@@ -1374,7 +1458,10 @@ mod tests {
         app.toggle_mode();
         assert_eq!(app.mode, Mode::Uncommitted);
         app.toggle_mode();
-        assert_eq!(app.mode, Mode::BranchFrom("feature".to_string()));
+        assert_eq!(
+            app.mode,
+            Mode::Branch(Origin::Picked("feature".to_string()))
+        );
     }
 
     #[test]
@@ -1428,7 +1515,7 @@ mod tests {
         let mut app = sample_app();
         app.set_base("feature".to_string());
         app.open_picker_with(
-" compare against a branch ",
+            " compare against a branch ",
             vec![
                 PickerEntry {
                     rev: "develop".to_string(),

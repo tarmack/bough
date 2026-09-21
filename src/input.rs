@@ -40,6 +40,7 @@ fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App, worker_dead: &mut 
             selected_highlight: Vec::new(),
             error: Some("worker stopped: live updates disabled".into()),
             branch_state: app.snapshot.branch_state.clone(),
+            uncommitted_stats: app.snapshot.uncommitted_stats,
         });
     }
 }
@@ -993,7 +994,10 @@ mod tests {
             "HEAD".to_string(),
         );
         let _ = rx.try_recv();
-        app.open_picker_with(" compare against a branch ", vec![entry("develop"), entry("feature")]);
+        app.open_picker_with(
+            " compare against a branch ",
+            vec![entry("develop"), entry("feature")],
+        );
         (app, rx)
     }
 
@@ -1072,7 +1076,10 @@ mod tests {
             &mut app
         ));
         assert!(app.base_picker.is_none());
-        assert_eq!(app.mode, crate::app::Mode::BranchFrom("feature".to_string()));
+        assert_eq!(
+            app.mode,
+            crate::app::Mode::Branch(crate::app::Origin::Picked("feature".to_string()))
+        );
         match rx.try_recv().unwrap() {
             crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
             other => panic!("expected SetRev, got {other:?}"),
@@ -1101,7 +1108,10 @@ mod tests {
             &mut app
         ));
         assert!(app.base_picker.is_none());
-        assert_eq!(app.mode, crate::app::Mode::BranchFrom("abcdef1234567890".to_string()));
+        assert_eq!(
+            app.mode,
+            crate::app::Mode::Branch(crate::app::Origin::Picked("abcdef1234567890".to_string()))
+        );
         match rx.try_recv().unwrap() {
             crate::snapshot::Request::SetRev { rev } => {
                 assert_eq!(rev, "abcdef1234567890...HEAD")

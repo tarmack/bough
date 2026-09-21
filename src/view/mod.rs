@@ -37,7 +37,16 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     app.height = body_height as usize;
 
     let diff = ratatui::layout::Rect::new(area.x, area.y, diff_w, body_height);
-    let tree = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y, tree_w, body_height);
+    // The tree pane carries a one-row header summarizing what it lists
+    // (file count, per-status breakdown, diff totals); the list follows
+    // beneath it.
+    let tree_header = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y, tree_w, 1);
+    let tree = ratatui::layout::Rect::new(
+        area.x + diff_w + 1,
+        area.y + 1,
+        tree_w,
+        body_height.saturating_sub(1),
+    );
     let footer = ratatui::layout::Rect::new(area.x, area.y + body_height, area.width, 1);
 
     if app.preview.active() {
@@ -50,6 +59,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         app.preview.area = None;
         diff::render_diff(f, app, diff);
     }
+    tree::render_tree_header(f, app, tree_header);
     tree::render_tree(f, app, tree);
     tree::render_footer(f, app, footer, status_line(app).as_deref());
 
@@ -107,7 +117,8 @@ fn render_branch_picker(f: &mut Frame, app: &App) {
             Style::default()
         };
         let line = Line::styled(text, style);
-        f.buffer_mut().set_line(inner.x, inner.y + (i - start) as u16, &line, inner.width);
+        f.buffer_mut()
+            .set_line(inner.x, inner.y + (i - start) as u16, &line, inner.width);
     }
 }
 

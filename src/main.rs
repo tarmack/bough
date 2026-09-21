@@ -131,15 +131,15 @@ fn main() -> io::Result<()> {
         selected_highlight: Vec::new(),
         error: None,
         branch_state: crate::git::BranchState::default(),
+        uncommitted_stats: None,
         tree: Tree::build(Vec::new()),
     });
 
     let repo_root = std::env::current_dir()?;
-    let worker = Worker::spawn(revision.clone(), empty, repo_root, cli.theme)
-        .unwrap_or_else(|e| {
-            eprintln!("bough: worker spawn failed: {e}");
-            std::process::exit(1);
-        });
+    let worker = Worker::spawn(revision.clone(), empty, repo_root, cli.theme).unwrap_or_else(|e| {
+        eprintln!("bough: worker spawn failed: {e}");
+        std::process::exit(1);
+    });
 
     let mut app = App::new(
         initial_snapshot,
@@ -148,6 +148,14 @@ fn main() -> io::Result<()> {
         revision.clone(),
         "HEAD".to_string(),
     );
+    // A degenerate comparison (no committed work since the origin: standing
+    // on the trunk, or a branch still at the trunk's tip) is the uncommitted
+    // view — start there instead of showing a branch view with no branch
+    // work in it. The worker keeps the named revision: its content is the
+    // same, and the label stays honest.
+    if starts_uncommitted(&revision, git::branch_state(&revision).ahead) {
+        app.mode = crate::app::Mode::Uncommitted;
+    }
 
     enable_raw_mode()?;
     let previous_hook = std::panic::take_hook();
@@ -163,7 +171,12 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = input::run(&mut terminal, &mut app, &worker.snapshot_rx, &worker.image_rx);
+    let result = input::run(
+        &mut terminal,
+        &mut app,
+        &worker.snapshot_rx,
+        &worker.image_rx,
+    );
 
     let restore = TerminalGuard::restore();
     drop(worker);
@@ -176,12 +189,51 @@ fn main() -> io::Result<()> {
 fn resolve_revision(arg: Option<String>, default: Option<String>) -> String {
     match arg.filter(|s| !s.is_empty()) {
         Some(s) => s,
-        None => {
-            let trunk = default.unwrap_or_else(|| "main".to_string());
-            match git::current_branch() {
-                Ok(Some(b)) if b == trunk => "HEAD".to_string(),
-                _ => format!("{trunk}...HEAD"),
-            }
-        }
+        // Always name the trunk as the origin — even when standing on it.
+        // `main...HEAD` degenerates gracefully there (the merge-base is
+        // `HEAD` itself, so the view reduces to uncommitted edits), while a
+        // bare `HEAD` would leave the origin unnamed: the footer would read
+        // `vs HEAD` and picking `main` could not canonicalize back to the
+        // default view.
+        None => format!("{}...HEAD", default.unwrap_or_else(|| "main".to_string())),
+    }
+}
+
+/// True when the startup revision contains no committed work (nothing ahead
+/// of the origin, or an explicit comparison against `HEAD` itself), making
+/// the branch view identical to the uncommitted view.
+fn starts_uncommitted(revision: &str, ahead: Option<u32>) -> bool {
+    ahead == Some(0) || revision == "HEAD"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_revision_always_names_the_trunk() {
+        assert_eq!(
+            resolve_revision(None, Some("main".to_string())),
+            "main...HEAD"
+        );
+        // Even standing on the trunk, and when no default can be detected.
+        assert_eq!(resolve_revision(None, None), "main...HEAD");
+        // An explicit revision passes through verbatim.
+        assert_eq!(
+            resolve_revision(Some("v1.2...HEAD".to_string()), Some("main".to_string())),
+            "v1.2...HEAD"
+        );
+    }
+
+    #[test]
+    fn starts_uncommitted_when_nothing_ahead_of_origin() {
+        // Standing on the trunk (or a branch still at its tip): the branch
+        // view has no committed work.
+        assert!(starts_uncommitted("main...HEAD", Some(0)));
+        // An explicit comparison against HEAD is the uncommitted view.
+        assert!(starts_uncommitted("HEAD", None));
+        // Real branch work, or an unknown ahead count, stays a branch view.
+        assert!(!starts_uncommitted("main...HEAD", Some(3)));
+        assert!(!starts_uncommitted("v1.2...HEAD", None));
     }
 }

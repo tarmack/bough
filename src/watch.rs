@@ -193,12 +193,7 @@ fn run_notify_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        poll_refs(
-            &head_path,
-            &mut last_head,
-            &io.out_tx,
-            &mut last_poll,
-        );
+        poll_refs(&head_path, &mut last_head, &io.out_tx, &mut last_poll);
     }
 }
 
@@ -220,12 +215,7 @@ fn run_poll_loop(io: &WatchIo) {
             last_workdir = Instant::now();
             let _ = io.out_tx.send(WorkerEvent::WorkdirChanged);
         }
-        poll_refs(
-            &head_path,
-            &mut last_head,
-            &io.out_tx,
-            &mut last_refs,
-        );
+        poll_refs(&head_path, &mut last_head, &io.out_tx, &mut last_refs);
     }
 }
 

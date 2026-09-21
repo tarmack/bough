@@ -236,22 +236,12 @@ pub(crate) fn collect_changes(
             // An untracked or intent-to-add file is a pure addition. Count it
             // against the empty tree like the other statuses so binary files are
             // detected rather than counted by scanning for newline bytes.
-            (IWItem::DirectoryContents { .. }, Summary::Added) if !is_directory_item(&item) => (
-                FileStatus::Added,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            (IWItem::Modification { .. }, Summary::IntentToAdd) => (
-                FileStatus::Added,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
+            (IWItem::DirectoryContents { .. }, Summary::Added) if !is_directory_item(&item) => {
+                (FileStatus::Added, None, None, None, None, None)
+            }
+            (IWItem::Modification { .. }, Summary::IntentToAdd) => {
+                (FileStatus::Added, None, None, None, None, None)
+            }
             // Untracked directories and nested repositories are not files; skip
             // them rather than emit a bogus tree node.
             (IWItem::DirectoryContents { .. }, Summary::Added) => continue,
