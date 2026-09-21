@@ -15,7 +15,9 @@ use crate::tree::{self, TreeNode};
 /// of the bottom status bar) summarizing the *shape* of what the list
 /// beneath it shows — changed-file count with per-status breakdown. The
 /// magnitude (diff totals) lives on the full-width status bar, which has the
-/// room this third-width pane lacks.
+/// room this third-width pane lacks. The strip opens with a rounded cap on
+/// its left edge and runs flush to the screen edge on the right — a closing
+/// cap against the terminal edge would float.
 pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
     if area.width < 8 || area.height < 1 {
         return;
@@ -26,7 +28,9 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
     let root = &app.snapshot.tree.nodes[app.snapshot.tree.root];
 
     // Left: the file count and per-status breakdown — the shape of the
-    // change, in the tree's own status colors.
+    // change, in the tree's own status colors. Each status becomes a
+    // compact rounded pill (status-color fill, bold black text) in the diff
+    // pane's language; the count keeps its plain White-on-DarkGray span.
     let mut left: Vec<Span<'static>> = Vec::new();
     if root.file_count > 0 {
         left.push(Span::styled(
@@ -50,26 +54,30 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
             .iter()
             .filter_map(|l| counts.get(l).map(|n| format!("{n}{l}")))
             .collect();
-        if !parts.is_empty() {
-            left.push(Span::styled(
-                "· ".to_string(),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ));
-            for (i, part) in parts.iter().enumerate() {
-                if i > 0 {
-                    left.push(Span::styled(
-                        " ".to_string(),
-                        Style::default().fg(Color::White).bg(Color::DarkGray),
-                    ));
-                }
-                let color = crate::diff::FileStatus::from_char(part.chars().last().unwrap())
-                    .map(theme::status_color)
-                    .unwrap_or(Color::White);
-                left.push(Span::styled(
-                    part.clone(),
-                    Style::default().fg(color).bg(Color::DarkGray),
-                ));
+        // One bar-colored cell between pills; the pills separate
+        // themselves, so no `· ` marker.
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                left.push(Span::styled(" ", bar_style()));
             }
+            let color = FileStatus::from_char(part.chars().last().unwrap())
+                .map(theme::status_color)
+                .unwrap_or(Color::White);
+            left.push(Span::styled(
+                CAP_LEFT,
+                Style::default().fg(color).bg(Color::DarkGray),
+            ));
+            left.push(Span::styled(
+                part.clone(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            left.push(Span::styled(
+                CAP_RIGHT,
+                Style::default().fg(color).bg(Color::DarkGray),
+            ));
         }
     } else {
         left.push(Span::styled(
@@ -79,13 +87,16 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
     }
     let left = Line::from(left);
 
-    // Right: nothing — the pane is only a third of the terminal wide; the
-    // diff totals live on the full-width status bar, which has the room,
-    // while the shape of the change (this header's left side) belongs next
-    // to the list it summarizes.
-    let right = Line::from(Vec::<Span<'static>>::new());
-
-    draw_aligned(f, area.x, area.y, area.width, &left, Some(&right));
+    // The strip starts one column in, leaving room for a rounded opening
+    // cap, and runs flush to the screen's right edge with no trailing cap.
+    // Let `set_line` clip when the pane is narrow.
+    let opening = Line::from(vec![Span::styled(
+        CAP_LEFT,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    )]);
+    f.buffer_mut().set_line(area.x, area.y, &opening, 1);
+    let strip_w = area.width.saturating_sub(1);
+    draw_aligned(f, area.x + 1, area.y, strip_w, &left, None);
 }
 
 /// Render the file tree with the selection highlighted.
@@ -231,7 +242,7 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>
     let left = Line::from(left);
 
     // The far right: one two-part pill, `source  origin`, on colored
-    // backgrounds with bold white text — the fills are the recognition
+    // backgrounds with bold black text — the fills are the recognition
     // signal. The source is always purple; the origin part carries the
     // mode's color (blue default origin, magenta picked, green
     // `Uncommitted`), mirroring vim's mode colors.
@@ -246,10 +257,10 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>
             (bg, app.mode_label())
         }
     };
-    // Bold white reads on every one of the pill's colored fills.
+    // Bold black reads on every one of the pill's colored fills.
     let on_pill = |bg: Color| {
         Style::default()
-            .fg(Color::White)
+            .fg(Color::Black)
             .bg(bg)
             .add_modifier(Modifier::BOLD)
     };
@@ -315,12 +326,9 @@ fn bar_style() -> Style {
     Style::default().fg(Color::DarkGray).bg(Color::DarkGray)
 }
 
-/// Powerline rounded chip caps (nerd font): thick half-circles — the left
-/// cap's rounded edge faces left (U+E0B6), the right cap's faces right
-/// (U+E0B4). Not U+E0B7/E0B5: those are the thin arc variants, decorative
-/// crescents rather than filled caps.
-const CAP_LEFT: &str = "\u{e0b6}";
-const CAP_RIGHT: &str = "\u{e0b4}";
+/// Powerline rounded chip caps, shared with the diff pane's header tabs.
+const CAP_LEFT: &str = crate::theme::CAP_LEFT;
+const CAP_RIGHT: &str = crate::theme::CAP_RIGHT;
 
 /// Draw `left` left-aligned at the pane origin and `right` right-aligned at
 /// the pane's right edge, leaving one separating cell, over `width` columns.
@@ -512,13 +520,13 @@ mod tests {
         // source-side count, switch glyph, origin-side count.
         assert!(text.contains("feature/x"), "row: {text}");
         assert!(text.contains("3 \u{f0bcd} 1"), "row: {text}");
-        // The divergence is bold white on purple, like the rest of the
+        // The divergence is bold black on purple, like the rest of the
         // source part.
         let switch = (0..80)
             .map(|x| buf.cell((x, 23)).unwrap())
             .find(|c| c.symbol() == "\u{f0bcd}")
             .expect("double arrow in the pill");
-        assert_eq!(switch.fg, Color::White);
+        assert_eq!(switch.fg, Color::Black);
         assert_eq!(switch.bg, Color::Magenta);
         assert!(text.contains("vs main"), "row: {text}");
         assert!(
@@ -562,7 +570,20 @@ mod tests {
             .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
             .collect();
         assert!(header.contains("4 files"), "header: {header}");
-        assert!(header.contains("2M 1A 1D"), "header: {header}");
+        // Each status is a compact pill, so the parts are no longer a
+        // contiguous plain-text run.
+        assert!(header.contains("2M"), "header: {header}");
+        assert!(header.contains("1A"), "header: {header}");
+        assert!(header.contains("1D"), "header: {header}");
+        // A pill's closing cap carries its status color on the strip.
+        let modified_color = theme::status_color(FileStatus::Modified);
+        assert!(
+            (67..100).any(|x| {
+                let c = buf.cell((x, 0)).unwrap();
+                c.symbol() == theme::CAP_RIGHT && c.fg == modified_color
+            }),
+            "no modified-colored cap in header: {header}"
+        );
         // The magnitude lives on the full-width status bar.
         let bar: String = (0..100)
             .map(|x| buf.cell((x, 23)).unwrap().symbol().to_string())

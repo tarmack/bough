@@ -1,7 +1,7 @@
 //! Diff-pane rendering.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -80,27 +80,24 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let current = active.map(|s| s + 1).unwrap_or(0);
 
     // Locked header: the single file's header, or a folder summary carrying
-    // the path and total file count. Line 1 always, line 2 rename.
-    let header_spans = if multi {
-        build_summary_header(diff, area.width as usize)
-    } else {
-        build_header_line(&diff.header, current, area.width as usize)
-    };
-    f.buffer_mut().set_line(
-        area.x,
-        area.y,
-        &elide(header_spans, app.diff_col, area.width, None),
-        area.width,
+    // the path and total file count. Line 1 always, line 2 rename. The rows
+    // form a DarkGray rail (matching the tree pane's header strip), with the
+    // last column of each reserved for a rounded cap.
+    f.buffer_mut().set_style(
+        Rect::new(area.x, area.y, area.width, header_height),
+        Style::default().bg(Color::DarkGray),
     );
+    let header_w = area.width.saturating_sub(1) as usize;
+    let header_spans = if multi {
+        build_summary_header(diff, header_w)
+    } else {
+        build_header_line(&diff.header, current, header_w)
+    };
+    draw_locked_header_row(f, app, area, area.y, header_spans);
     let mut y = area.y + 1;
     if has_rename {
         let rename = build_rename_line(&diff.header);
-        f.buffer_mut().set_line(
-            area.x,
-            y,
-            &elide(rename, app.diff_col, area.width, None),
-            area.width,
-        );
+        draw_locked_header_row(f, app, area, y, rename);
         y += 1;
     }
 
@@ -141,6 +138,23 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let start = app.diff_scroll;
     let end = (start + flow_height as usize).min(visible.len());
     emit_visible_rows(f, app, area, y, diff, &visible[start..end]);
+}
+
+/// Draw one locked-header row: elide the spans into every column but the
+/// last, then close the DarkGray rail with a rounded cap whose fingers flow
+/// out into the terminal background.
+fn draw_locked_header_row(f: &mut Frame, app: &App, area: Rect, y: u16, spans: Vec<Span<'static>>) {
+    let w = area.width.saturating_sub(1);
+    f.buffer_mut()
+        .set_line(area.x, y, &elide(spans, app.diff_col, w, None), w);
+    if area.width > 0 {
+        let cap = Span::styled(
+            theme::CAP_RIGHT,
+            Style::default().fg(Color::DarkGray).bg(Color::Reset),
+        );
+        f.buffer_mut()
+            .set_line(area.x + area.width - 1, y, &Line::from(cap), 1);
+    }
 }
 
 /// Position (within `visible`) of the last sticky header of `kind` that
@@ -233,17 +247,24 @@ fn emit_visible_rows(
 /// Locked header for a multi-file (folder) diff: `<path>  N files` with the
 /// aggregate diffstat right-aligned.
 fn build_summary_header(diff: &Diff, width: usize) -> Vec<Span<'static>> {
-    let mut left = vec![
-        Span::styled(
-            diff.header.path.clone(),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("{} files", diff.files.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
+    // The folder's icon tab in the tree's dark directory tint, then the path
+    // and file count.
+    let mut left = icon_chip(
+        file_icon(&diff.header.path),
+        theme::DIR_FG,
+        Color::DarkGray,
+        0,
+    );
+    left.push(Span::styled(" ", Style::default()));
+    left.push(Span::styled(
+        diff.header.path.clone(),
+        Style::default().fg(Color::White),
+    ));
+    left.push(Span::raw("  "));
+    left.push(Span::styled(
+        format!("{} files", diff.files.len()),
+        Style::default().fg(Color::Gray),
+    ));
     let right = stat_spans(diff.header.added, diff.header.deleted, false, None);
     let right_w: usize = right.iter().map(|s| s.width()).sum();
     right_align(&mut left, right_w, width);
@@ -254,16 +275,24 @@ fn build_summary_header(diff: &Diff, width: usize) -> Vec<Span<'static>> {
 /// Locked header line 1: `<path>  +A -D  <status>  [cur/total]`, plus a
 /// right-aligned mode change (`old → new`, octal) when the modes differ.
 fn build_header_line(header: &FileHeader, current_hunk: usize, width: usize) -> Vec<Span<'static>> {
-    // Left content: path and hunk position.
-    let mut left = vec![Span::styled(
+    // Left content: the file's icon tab in its status tint, then the path
+    // and hunk position.
+    let mut left = icon_chip(
+        file_icon(&header.path),
+        theme::status_color(header.status),
+        Color::DarkGray,
+        0,
+    );
+    left.push(Span::styled(" ", Style::default()));
+    left.push(Span::styled(
         header.path.clone(),
-        Style::default().fg(Color::DarkGray),
-    )];
+        Style::default().fg(Color::White),
+    ));
     if !header.hunks.is_empty() {
         left.push(Span::raw("  "));
         left.push(Span::styled(
             format!("[{current_hunk}/{}]", header.hunks.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ));
     }
 
@@ -296,9 +325,9 @@ fn build_header_line(header: &FileHeader, current_hunk: usize, width: usize) -> 
 fn build_rename_line(header: &FileHeader) -> Vec<Span<'static>> {
     let old = header.old_path.clone().unwrap_or_default();
     let mut spans = vec![
-        Span::styled(old, Style::default().fg(Color::DarkGray)),
-        Span::styled(" → ", Style::default().fg(Color::DarkGray)),
-        Span::styled(header.path.clone(), Style::default().fg(Color::DarkGray)),
+        Span::styled(old, Style::default().fg(Color::Gray)),
+        Span::styled(" → ", Style::default().fg(Color::Gray)),
+        Span::styled(header.path.clone(), Style::default().fg(Color::Gray)),
     ];
     if let Some(p) = header.rename_percent {
         spans.push(Span::styled(
@@ -309,12 +338,13 @@ fn build_rename_line(header: &FileHeader) -> Vec<Span<'static>> {
     spans
 }
 
-/// The `old → new` mode change (octal) span, coloured `DarkGray` over an
-/// optional background. Caller handles surrounding spacing.
+/// The `old → new` mode change (octal) span. On the locked header's DarkGray
+/// rail (`bg = None`) it reads `Gray`; over a section strip (`Some(bg)`) it
+/// stays `DarkGray`. Caller handles surrounding spacing.
 fn mode_change_span(old: u32, new: u32, bg: Option<Color>) -> Span<'static> {
     let style = match bg {
         Some(c) => Style::default().fg(Color::DarkGray).bg(c),
-        None => Style::default().fg(Color::DarkGray),
+        None => Style::default().fg(Color::Gray),
     };
     Span::styled(format!("{old:o} → {new:o}"), style)
 }
@@ -472,13 +502,12 @@ fn overlay_word_runs(
 /// Nerd Font glyph for a hunk (`@@`) header row — a block of changed lines.
 const HUNK_ICON: &str = "\u{f0c9}";
 
-/// The hunk icon glyph; scrolls horizontally.
+/// The hunk icon glyph; scrolls horizontally. The tab anchors at column 0,
+/// flush with the file and main headers, while the one-cell indent lives
+/// inside the dark-blue fill — so hunk icons sit one cell further in than
+/// file-header icons without the tab itself being offset.
 fn hunk_name_spans(bg: Color) -> Vec<Span<'static>> {
-    vec![Span::styled(
-        // One leading space indents hunks beneath their file header.
-        format!(" {} ", HUNK_ICON),
-        Style::default().fg(Color::Blue).bg(bg),
-    )]
+    icon_chip(HUNK_ICON, Color::Blue, bg, 1)
 }
 
 /// The `+A -D` diffstat, a spacer, and the fold arrow. Pinned to the pane's
@@ -559,9 +588,11 @@ fn header_content<'a>(diff: &'a Diff, line: &DiffLine) -> Option<HeaderContent<'
     }
 }
 
-/// Shared layout for any section header: elide the name, pin the diffstat +
-/// fold arrow to the right edge, and pad the name's background to the full
-/// region so the whole row is one highlighted strip.
+/// Shared layout for any section header: elide the name, pad its background
+/// to the name region, pin the diffstat + fold arrow flush against the cap
+/// column, and close the strip's right edge with a rounded cap — leaving the
+/// last column for it so the whole row reads as a rounded strip over the
+/// terminal background.
 fn draw_section_header(
     f: &mut Frame,
     app: &App,
@@ -573,7 +604,9 @@ fn draw_section_header(
 ) -> u16 {
     let stat = content.stat_spans(bg, collapsed);
     let stat_w: u16 = stat.iter().map(|s| s.width()).sum::<usize>() as u16;
-    let name_w = area.width.saturating_sub(stat_w);
+    // The strip (name region + diffstat + fold arrow) spans every column but
+    // the last, which is reserved for the cap.
+    let name_w = area.width.saturating_sub(stat_w).saturating_sub(1);
     let mut name_line = elide(
         content.name_spans(bg),
         app.diff_col,
@@ -592,9 +625,17 @@ fn draw_section_header(
     f.buffer_mut().set_line(area.x, y, &name_line, name_w);
     // Draw the stat even when the name region collapsed to zero width so a
     // too-narrow pane still shows the (truncated) diffstat instead of a blank
-    // row.
+    // row. It ends flush against the cap column.
+    let stat_w_avail = area.width.saturating_sub(name_w).saturating_sub(1);
     f.buffer_mut()
-        .set_line(area.x + name_w, y, &Line::from(stat), area.width - name_w);
+        .set_line(area.x + name_w, y, &Line::from(stat), stat_w_avail);
+    // Close the strip's right edge: the cap's fg is the strip color, so the
+    // strip flows out into the terminal background.
+    if area.width > 0 {
+        let cap = Span::styled(theme::CAP_RIGHT, Style::default().fg(bg).bg(Color::Reset));
+        f.buffer_mut()
+            .set_line(area.x + area.width - 1, y, &Line::from(cap), 1);
+    }
     y + 1
 }
 
@@ -615,13 +656,32 @@ fn file_header_name_spans(file: &FileHeader, bg: Color) -> Vec<Span<'static>> {
     spans
 }
 
-/// The `[icon] ` prefix of a header row: the owning file's type glyph colored
-/// `color`, on the header background `bg`.
+/// A leading icon tab: the glyph on a colored fill, closed by a rounded
+/// right cap over the row's background — a tab, not a full pill (no left
+/// cap), matching the footer's chip language. `chip_bg` carries the meaning
+/// (file status color, structure blue, folder cyan); the glyph is bold
+/// black, like the footer pill's text.
+///
+/// The tab always anchors at column 0. `indent` prepends spaces *inside* the
+/// colored fill, so indented rows (hunk headers) read as padding within the
+/// anchored tab rather than an offset before it.
+fn icon_chip(icon: &str, chip_bg: Color, row_bg: Color, indent: usize) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!("{} {icon} ", " ".repeat(indent)),
+            Style::default()
+                .fg(Color::Black)
+                .bg(chip_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(theme::CAP_RIGHT, Style::default().fg(chip_bg).bg(row_bg)),
+    ]
+}
+
+/// The `[icon] ` prefix of a header row: the file-type glyph as an icon tab
+/// in the file's status color.
 fn header_icon(file: &FileHeader, color: Color, bg: Color) -> Vec<Span<'static>> {
-    vec![Span::styled(
-        format!("{} ", file_icon(&file.path)),
-        Style::default().fg(color).bg(bg),
-    )]
+    icon_chip(file_icon(&file.path), color, bg, 0)
 }
 
 /// Right-pinned stat + fold arrow for a file-header row.
@@ -1116,9 +1176,10 @@ mod tests {
         let buf = terminal.backend().buffer();
         // Top visible chunk (hunk 0's header, ACTIVE = brighter selection
         // #464741) at buffer row 1; hunk 1 is INACTIVE (inactive-tab #34352f)
-        // at row 4.
-        assert_eq!(buf.cell((0, 1)).unwrap().bg, Color::Rgb(0x46, 0x47, 0x41));
-        assert_eq!(buf.cell((0, 4)).unwrap().bg, Color::Rgb(0x34, 0x35, 0x2f));
+        // at row 4. Sample past the hunk tab (one indent space, icon, padding,
+        // and cap — five cells) to read the row's highlight background.
+        assert_eq!(buf.cell((5, 1)).unwrap().bg, Color::Rgb(0x46, 0x47, 0x41));
+        assert_eq!(buf.cell((5, 4)).unwrap().bg, Color::Rgb(0x34, 0x35, 0x2f));
     }
 
     #[test]
@@ -1144,8 +1205,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
-        assert_eq!(buf.cell((0, 1)).unwrap().bg, Color::Rgb(0x3d, 0x3e, 0x38));
-        assert_eq!(buf.cell((0, 4)).unwrap().bg, Color::Rgb(0x34, 0x35, 0x2f));
+        assert_eq!(buf.cell((5, 1)).unwrap().bg, Color::Rgb(0x3d, 0x3e, 0x38));
+        assert_eq!(buf.cell((5, 4)).unwrap().bg, Color::Rgb(0x34, 0x35, 0x2f));
     }
 
     #[test]

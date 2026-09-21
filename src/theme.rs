@@ -28,6 +28,13 @@ pub const BG_RUN_REMOVED: Color = Color::Rgb(0x5a, 0x2f, 0x2f);
 /// Monokai blue (#66d9ef) for directory nodes in the tree.
 pub const DIR_FG: Color = Color::Rgb(0x66, 0xd9, 0xef);
 
+/// Powerline rounded chip caps (nerd font): thick half-circles — the left
+/// cap's rounded edge faces left (U+E0B6), the right cap's faces right
+/// (U+E0B4). Not U+E0B7/E0B5: those are the thin arc variants, decorative
+/// crescents rather than filled caps.
+pub const CAP_LEFT: &str = "\u{e0b6}";
+pub const CAP_RIGHT: &str = "\u{e0b4}";
+
 /// Foreground color for a diff/file status letter.
 pub fn status_color(status: FileStatus) -> Color {
     match status {
