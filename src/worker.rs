@@ -82,17 +82,14 @@ pub struct Worker {
 impl Worker {
     /// Spawn the worker thread. `initial_theme` selects the syntect theme;
     /// an unknown theme degrades to no-color (the worker still builds structured
-    /// diffs). `repo_root` is where `notify` watches; `base_ref` is the local
-    /// branch name whose ref file is watched for movement (e.g. `main`), or
-    /// `None`.
+    /// diffs). `repo_root` is where `notify` watches.
     pub fn spawn(
         rev: String,
         empty: bool,
         repo_root: PathBuf,
-        base_ref: Option<String>,
         initial_theme: String,
     ) -> Result<Worker, WorkerError> {
-        let watcher = match Watcher::start(repo_root.clone(), base_ref.clone()) {
+        let watcher = match Watcher::start(repo_root.clone()) {
             Ok(w) => w,
             Err(e) => {
                 // No watcher: surface via the first snapshot's error and run

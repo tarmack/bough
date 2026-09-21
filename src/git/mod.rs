@@ -65,17 +65,19 @@ pub(crate) mod test_util {
 
     /// `git init -b main`, then commit each `content` item as `file{i}.txt`.
     pub fn repo_with_commits(dir: &Path, contents: &[&str]) {
-        run(dir, &["init", "-b", "main"]);
-        run(dir, &["config", "user.email", "test@example.com"]);
-        run(dir, &["config", "user.name", "Test"]);
+        run_git(dir, &["init", "-b", "main"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
         for (i, content) in contents.iter().enumerate() {
             std::fs::write(dir.join(format!("file{i}.txt")), content).unwrap();
-            run(dir, &["add", "."]);
-            run(dir, &["commit", "-m", &format!("commit {i}")]);
+            run_git(dir, &["add", "."]);
+            run_git(dir, &["commit", "-m", &format!("commit {i}")]);
         }
     }
 
-    fn run(dir: &Path, args: &[&str]) {
+    /// Run `git` in `dir` and assert success. Exposed for other test modules
+    /// that need to create branches or refs.
+    pub(crate) fn run_git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
             .current_dir(dir)
             .args(args)

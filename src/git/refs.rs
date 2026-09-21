@@ -3,14 +3,87 @@
 
 use crate::git::{open_repo, resolve_id, GitError};
 
-/// True when `name` names a local branch. Only local branches can be watched
-/// for live updates (the watcher polls `.git/refs/heads/<name>`).
-pub fn local_branch_exists(name: &str) -> bool {
-    let full = format!("refs/heads/{name}");
+/// All local branch names, sorted alphabetically (e.g. for the branch
+/// picker).
+pub fn local_branches() -> Vec<String> {
     match open_repo() {
-        Ok(repo) => repo.find_reference(full.as_str()).is_ok(),
-        Err(_) => false,
+        Ok(repo) => local_branches_in(&repo),
+        Err(_) => Vec::new(),
     }
+}
+
+/// [`local_branches`] against an already-open repository.
+pub(crate) fn local_branches_in(repo: &gix::Repository) -> Vec<String> {
+    let Ok(platform) = repo.references() else {
+        return Vec::new();
+    };
+    let Ok(iter) = platform.local_branches() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = iter
+        .filter_map(Result::ok)
+        .map(|r| r.name().shorten().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The `n` most recent commits from `HEAD`, newest first: full oid hex plus
+/// the commit subject (first message line).
+pub fn recent_commits(n: usize) -> Vec<(String, String)> {
+    match open_repo() {
+        Ok(repo) => recent_commits_in(&repo, n),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`recent_commits`] against an already-open repository.
+pub(crate) fn recent_commits_in(repo: &gix::Repository, n: usize) -> Vec<(String, String)> {
+    let Ok(head_id) = repo.head_id() else {
+        return Vec::new();
+    };
+    let Ok(walker) = repo.rev_walk([head_id.detach()]).all() else {
+        return Vec::new();
+    };
+    walker
+        .take(n)
+        .filter_map(|info| {
+            let info = info.ok()?;
+            let id = info.id;
+            // A commit that fails to resolve/parse still contributes its oid
+            // with an empty subject.
+            let subject = repo
+                .find_commit(id)
+                .ok()
+                .and_then(|c| c.message().ok().map(|m| m.summary().to_string()))
+                .unwrap_or_default();
+            Some((id.to_string(), subject))
+        })
+        .collect()
+}
+
+/// All tag names, sorted alphabetically.
+pub fn tags() -> Vec<String> {
+    match open_repo() {
+        Ok(repo) => tags_in(&repo),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`tags`] against an already-open repository.
+pub(crate) fn tags_in(repo: &gix::Repository) -> Vec<String> {
+    let Ok(platform) = repo.references() else {
+        return Vec::new();
+    };
+    let Ok(iter) = platform.tags() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = iter
+        .filter_map(Result::ok)
+        .map(|r| r.name().shorten().to_string())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Coarse state of the current working directory with respect to git.
@@ -160,7 +233,7 @@ pub fn default_branch() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::git::test_util::repo_with_commits;
+    use crate::git::test_util::{repo_with_commits, run_git};
 
     use super::*;
 
@@ -183,5 +256,53 @@ mod tests {
         assert_eq!(st.base.as_deref(), Some("HEAD~1"));
         assert_eq!(st.ahead, Some(1));
         assert_eq!(st.behind, Some(0));
+    }
+
+    #[test]
+    fn local_branches_lists_only_local_heads_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["a", "b"]);
+        run_git(dir.path(), &["branch", "feature"]);
+        let repo = gix::discover(dir.path()).unwrap();
+
+        assert_eq!(
+            local_branches_in(&repo),
+            vec!["feature".to_string(), "main".to_string()]
+        );
+    }
+
+    #[test]
+    fn recent_commits_newest_first_with_subjects() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["a", "b", "c"]);
+        let repo = gix::discover(dir.path()).unwrap();
+
+        let commits = recent_commits_in(&repo, 10);
+        assert_eq!(commits.len(), 3);
+        // Newest (highest index) first; subjects are non-empty.
+        assert_eq!(commits[0].1, "commit 2");
+        assert_eq!(commits[1].1, "commit 1");
+        assert_eq!(commits[2].1, "commit 0");
+        assert_eq!(commits[0].0.len(), 40, "full oid hex");
+    }
+
+    #[test]
+    fn recent_commits_honours_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["a", "b", "c"]);
+        let repo = gix::discover(dir.path()).unwrap();
+
+        assert_eq!(recent_commits_in(&repo, 2).len(), 2);
+    }
+
+    #[test]
+    fn tags_lists_all_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["a", "b"]);
+        run_git(dir.path(), &["tag", "v1"]);
+        run_git(dir.path(), &["tag", "v0"]);
+        let repo = gix::discover(dir.path()).unwrap();
+
+        assert_eq!(tags_in(&repo), vec!["v0".to_string(), "v1".to_string()]);
     }
 }

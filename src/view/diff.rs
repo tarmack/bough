@@ -1287,10 +1287,11 @@ mod tests {
             ],
         });
         // Both a file and a hunk sticky would pin, but only one body row
-        // exists; the file sticky wins.
+        // exists; the file sticky wins. (Three terminal rows: two body rows
+        // plus the full-width footer.)
         app.diff_scroll = 5;
 
-        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 3)).unwrap();
         terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
         assert!(app.sticky_file.is_some());
         assert_eq!(app.sticky_hunk, None);

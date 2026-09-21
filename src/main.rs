@@ -135,8 +135,7 @@ fn main() -> io::Result<()> {
     });
 
     let repo_root = std::env::current_dir()?;
-    let base_ref = base_ref_from_revision(&revision, default);
-    let worker = Worker::spawn(revision.clone(), empty, repo_root, base_ref, cli.theme)
+    let worker = Worker::spawn(revision.clone(), empty, repo_root, cli.theme)
         .unwrap_or_else(|e| {
             eprintln!("bough: worker spawn failed: {e}");
             std::process::exit(1);
@@ -174,20 +173,6 @@ fn main() -> io::Result<()> {
     }
 }
 
-/// The ref the worker watches for live updates. For a `<base>...HEAD` revision
-/// that is `<base>`, but only when it names a local branch (the watcher polls
-/// `.git/refs/heads/<base>`); otherwise (e.g. a bare `HEAD`, or a base like
-/// `origin/main`) the default branch.
-fn base_ref_from_revision(revision: &str, default: Option<String>) -> Option<String> {
-    if let Some((left, _)) = revision.split_once("...") {
-        let left = left.trim();
-        if !left.is_empty() && git::local_branch_exists(left) {
-            return Some(left.to_string());
-        }
-    }
-    default
-}
-
 fn resolve_revision(arg: Option<String>, default: Option<String>) -> String {
     match arg.filter(|s| !s.is_empty()) {
         Some(s) => s,
@@ -198,28 +183,5 @@ fn resolve_revision(arg: Option<String>, default: Option<String>) -> String {
                 _ => format!("{trunk}...HEAD"),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base_ref_prefers_local_branches_only() {
-        // `origin/main` is a remote ref, not a local branch the watcher can
-        // poll, so the default branch is used instead.
-        assert_eq!(
-            base_ref_from_revision("origin/main...HEAD", Some("main".into())),
-            Some("main".into())
-        );
-        assert_eq!(
-            base_ref_from_revision("main...HEAD", Some("develop".into())),
-            Some("main".into())
-        );
-        assert_eq!(
-            base_ref_from_revision("HEAD", Some("main".into())),
-            Some("main".into())
-        );
     }
 }

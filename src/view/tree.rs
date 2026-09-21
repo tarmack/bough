@@ -62,18 +62,15 @@ pub fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Render the branch-state footer row at the bottom of the tree pane. Shows
-/// the current branch, its divergence from the base ref, and unpushed commits
-/// vs the upstream. Renders nothing when the area is too narrow or the branch
-/// state is empty (initial frame before the first worker snapshot).
-pub fn render_branch_footer(f: &mut Frame, app: &App, area: Rect) {
+/// Render the vim-style footer row spanning the full terminal width. The left
+/// side shows the current branch, its divergence from the base ref, unpushed
+/// commits vs the upstream, and any transient status message (git error, poll
+/// mode). The right side shows the diff mode.
+pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>) {
     if area.width < 8 || area.height < 1 {
         return;
     }
     let state = app.branch_state();
-    if state.name.is_none() && state.unpushed.is_none() && state.base.is_none() {
-        return;
-    }
 
     let mut left: Vec<Span<'static>> = Vec::new();
 
@@ -114,22 +111,26 @@ pub fn render_branch_footer(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    let left = Line::from(left);
-    let mut right: Vec<Span<'static>> = Vec::new();
-    match app.mode {
-        Mode::DiffToMain => {
-            if let Some(base) = state.base.as_deref() {
-                right.push(Span::styled(
-                    base.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        }
-        Mode::Uncommitted => {
-            right.push(Span::styled("wc", Style::default().fg(Color::DarkGray)));
-        }
+    // Transient status (git error, poll mode) rides along the branch state.
+    if let Some(msg) = message {
+        left.push(Span::styled(
+            format!("— {msg} "),
+            Style::default().fg(Color::Yellow),
+        ));
     }
-    let right = Line::from(right);
+
+    let left = Line::from(left);
+    // The mode is always shown: the diff base in yellow, or `uncommitted` in
+    // cyan.
+    let fg = if matches!(app.mode, Mode::Uncommitted) {
+        Color::Cyan
+    } else {
+        Color::Yellow
+    };
+    let right = Line::from(Span::styled(
+        app.mode_label(),
+        Style::default().fg(fg).bold(),
+    ));
 
     draw_aligned(f, area.x, area.y, area.width, &left, Some(&right));
 }
@@ -306,8 +307,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| super::super::ui(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
-        assert_eq!(buf.cell((54, 23)).unwrap().symbol(), "\u{e0a5}");
-        assert_eq!(buf.cell((57, 23)).unwrap().symbol(), "e");
+        // The footer spans the full width; the branch icon leads the row.
+        assert_eq!(buf.cell((0, 23)).unwrap().symbol(), "\u{e0a5}");
+        assert_eq!(buf.cell((3, 23)).unwrap().symbol(), "e");
     }
 
     #[test]

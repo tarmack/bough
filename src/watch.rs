@@ -1,14 +1,15 @@
 //! Filesystem watching for live updates.
 //!
 //! Produces a stream of coarse `WorkerEvent`s: either the workdir changed (a
-//! tracked/untracked file moved) or the git refs moved (`HEAD` or the base
-//! branch). The worker thread consumes these and recomputes. Two layers:
+//! tracked/untracked file moved) or the git refs moved (`HEAD`, `packed-refs`,
+//! or any ref under `.git/refs/`). The worker thread consumes these and
+//! recomputes. Two layers:
 //!
 //! - **`notify` (recommended watcher)** watches the repo root recursively.
-//!   Paths under `.git/` are ignored except `.git/HEAD` and
-//!   `.git/refs/heads/<base>`, which become `RefsChanged`.
-//! - **Backstop poll**: every 2s, stat `.git/HEAD` and the base ref. If `notify`
-//!   missed a ref change (some filesystems are flaky), the poll catches it.
+//!   Paths under `.git/` are ignored except `.git/HEAD`, `.git/packed-refs`,
+//!   and anything under `.git/refs/`, which become `RefsChanged`.
+//! - **Backstop poll**: every 2s, stat `.git/HEAD`. If `notify` missed a ref
+//!   change (some filesystems are flaky), the poll catches it.
 //!
 //! When `notify` init fails (unsupported filesystem), the watcher degrades to
 //! a 1s workdir poll and surfaces `is_poll_mode()` so the UI can show a hint.
@@ -29,7 +30,7 @@ use notify::{recommended_watcher, RecursiveMode};
 pub enum WorkerEvent {
     /// Any non-`.git` path changed (tracked or untracked file).
     WorkdirChanged,
-    /// `HEAD` or the base branch ref moved.
+    /// Any git ref moved (`HEAD`, `packed-refs`, or a local/remote/tag ref).
     RefsChanged,
 }
 
@@ -63,10 +64,8 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Start watching `repo_root`. `base_ref` is the local branch name whose
-    /// ref file should be watched for movement (e.g. `main`); pass `None` when
-    /// no base ref applies.
-    pub fn start(repo_root: PathBuf, base_ref: Option<String>) -> Result<Watcher, WatchError> {
+    /// Start watching `repo_root`.
+    pub fn start(repo_root: PathBuf) -> Result<Watcher, WatchError> {
         let poll_mode = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded::<WorkerEvent>(128);
@@ -78,7 +77,6 @@ impl Watcher {
             .spawn(move || {
                 let io = WatchIo {
                     repo_root,
-                    base_ref,
                     out_tx: tx,
                     shutdown: shutdown_t,
                 };
@@ -117,10 +115,9 @@ impl Drop for Watcher {
 }
 
 /// Shared thread inputs threaded through the orchestration: where to watch,
-/// the base ref to watch, where to emit events, and the shutdown flag.
+/// where to emit events, and the shutdown flag.
 struct WatchIo {
     repo_root: PathBuf,
-    base_ref: Option<String>,
     out_tx: Sender<WorkerEvent>,
     shutdown: Arc<AtomicBool>,
 }
@@ -164,12 +161,7 @@ fn run_notify_loop(
     let _watcher = watcher;
 
     let head_path = io.repo_root.join(".git/HEAD");
-    let base_path = io
-        .base_ref
-        .as_ref()
-        .map(|n| io.repo_root.join(format!(".git/refs/heads/{n}")));
     let mut last_head = stat_mtime(&head_path);
-    let mut last_base = base_path.as_deref().and_then(stat_mtime);
     let mut last_poll = Instant::now();
     // Set when a bounded send dropped an event under backpressure; retried as a
     // coalesced `WorkdirChanged` so the worker can't miss the final change in a
@@ -187,7 +179,7 @@ fn run_notify_loop(
             Ok(Ok(event)) => {
                 for path in &event.paths {
                     let rel = path.strip_prefix(&io.repo_root).unwrap_or(path);
-                    if let Some(ev) = classify(rel, io.base_ref.as_deref()) {
+                    if let Some(ev) = classify(rel) {
                         match io.out_tx.try_send(ev) {
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => dirty = true,
@@ -203,9 +195,7 @@ fn run_notify_loop(
 
         poll_refs(
             &head_path,
-            base_path.as_deref(),
             &mut last_head,
-            &mut last_base,
             &io.out_tx,
             &mut last_poll,
         );
@@ -216,12 +206,7 @@ fn run_notify_loop(
 /// second and run the same 2s backstop ref poll.
 fn run_poll_loop(io: &WatchIo) {
     let head_path = io.repo_root.join(".git/HEAD");
-    let base_path = io
-        .base_ref
-        .as_ref()
-        .map(|n| io.repo_root.join(format!(".git/refs/heads/{n}")));
     let mut last_head = stat_mtime(&head_path);
-    let mut last_base = base_path.as_deref().and_then(stat_mtime);
     let mut last_workdir = Instant::now();
     let mut last_refs = Instant::now();
 
@@ -237,9 +222,7 @@ fn run_poll_loop(io: &WatchIo) {
         }
         poll_refs(
             &head_path,
-            base_path.as_deref(),
             &mut last_head,
-            &mut last_base,
             &io.out_tx,
             &mut last_refs,
         );
@@ -247,13 +230,10 @@ fn run_poll_loop(io: &WatchIo) {
 }
 
 /// Backstop ref poll shared by both loops: on the cadence gated by
-/// `last_poll`, stat `HEAD` and the base ref and emit `RefsChanged` when
-/// either moved.
+/// `last_poll`, stat `HEAD` and emit `RefsChanged` when it moved.
 fn poll_refs(
     head_path: &Path,
-    base_path: Option<&Path>,
     last_head: &mut Option<SystemTime>,
-    last_base: &mut Option<SystemTime>,
     out_tx: &Sender<WorkerEvent>,
     last_poll: &mut Instant,
 ) {
@@ -263,13 +243,6 @@ fn poll_refs(
         if mtime_changed(*last_head, h) {
             *last_head = h;
             let _ = out_tx.send(WorkerEvent::RefsChanged);
-        }
-        if let Some(bp) = base_path {
-            let b = stat_mtime(bp);
-            if mtime_changed(*last_base, b) {
-                *last_base = b;
-                let _ = out_tx.send(WorkerEvent::RefsChanged);
-            }
         }
     }
 }
@@ -286,19 +259,15 @@ fn mtime_changed(prev: Option<SystemTime>, cur: Option<SystemTime>) -> bool {
 }
 
 /// Classify a path (relative to the repo root) into a `WorkerEvent`, or
-/// `None` to ignore. `.git/` is ignored except exact `.git/HEAD` and
-/// `.git/refs/heads/<base>` (both → `RefsChanged`). Everything else →
-/// `WorkdirChanged`.
-fn classify(rel: &Path, base_ref: Option<&str>) -> Option<WorkerEvent> {
+/// `None` to ignore. `.git/HEAD`, `.git/packed-refs`, and anything under
+/// `.git/refs/` are `RefsChanged` (any ref movement triggers a rescan, so a
+/// freshly picked base stays live). Other `.git/` internals are ignored;
+/// everything else is `WorkdirChanged`.
+fn classify(rel: &Path) -> Option<WorkerEvent> {
     // Normalise separators so the string comparisons work on Windows too.
     let s = rel.to_string_lossy().replace('\\', "/");
-    if s == ".git/HEAD" {
+    if s == ".git/HEAD" || s == ".git/packed-refs" || s.starts_with(".git/refs/") {
         return Some(WorkerEvent::RefsChanged);
-    }
-    if let Some(name) = base_ref {
-        if s == format!(".git/refs/heads/{name}") {
-            return Some(WorkerEvent::RefsChanged);
-        }
     }
     if s.starts_with(".git/") {
         return None;
@@ -313,59 +282,56 @@ mod tests {
     #[test]
     fn classify_head_is_refs_changed() {
         assert_eq!(
-            classify(Path::new(".git/HEAD"), Some("main")),
+            classify(Path::new(".git/HEAD")),
             Some(WorkerEvent::RefsChanged)
         );
     }
 
     #[test]
-    fn classify_base_ref_is_refs_changed() {
+    fn classify_packed_refs_is_refs_changed() {
         assert_eq!(
-            classify(Path::new(".git/refs/heads/main"), Some("main")),
+            classify(Path::new(".git/packed-refs")),
+            Some(WorkerEvent::RefsChanged)
+        );
+    }
+
+    #[test]
+    fn classify_any_head_ref_is_refs_changed() {
+        // Any ref movement (not just the configured base) rescans, so a picked
+        // branch stays live.
+        assert_eq!(
+            classify(Path::new(".git/refs/heads/main")),
+            Some(WorkerEvent::RefsChanged)
+        );
+        assert_eq!(
+            classify(Path::new(".git/refs/heads/feature/x")),
+            Some(WorkerEvent::RefsChanged)
+        );
+        assert_eq!(
+            classify(Path::new(".git/refs/tags/v1")),
             Some(WorkerEvent::RefsChanged)
         );
     }
 
     #[test]
     fn classify_other_git_internals_ignored() {
-        assert_eq!(classify(Path::new(".git/index"), Some("main")), None);
-        assert_eq!(
-            classify(Path::new(".git/objects/xx/yyyy"), Some("main")),
-            None
-        );
-        assert_eq!(
-            classify(Path::new(".git/refs/heads/feature"), Some("main")),
-            None
-        );
+        assert_eq!(classify(Path::new(".git/index")), None);
+        assert_eq!(classify(Path::new(".git/objects/xx/yyyy")), None);
     }
 
     #[test]
     fn classify_workdir_paths_are_workdir_changed() {
         assert_eq!(
-            classify(Path::new("src/foo.rs"), Some("main")),
+            classify(Path::new("src/foo.rs")),
             Some(WorkerEvent::WorkdirChanged)
         );
         assert_eq!(
-            classify(Path::new("Cargo.toml"), Some("main")),
+            classify(Path::new("Cargo.toml")),
             Some(WorkerEvent::WorkdirChanged)
         );
         assert_eq!(
-            classify(Path::new("a/b/c/d.txt"), Some("main")),
+            classify(Path::new("a/b/c/d.txt")),
             Some(WorkerEvent::WorkdirChanged)
-        );
-    }
-
-    #[test]
-    fn classify_base_ref_without_base_config_is_ignored() {
-        // No base ref configured: .git/refs/heads/main is just git internals.
-        assert_eq!(classify(Path::new(".git/refs/heads/main"), None), None);
-    }
-
-    #[test]
-    fn classify_head_without_base_config_is_still_refs() {
-        assert_eq!(
-            classify(Path::new(".git/HEAD"), None),
-            Some(WorkerEvent::RefsChanged)
         );
     }
 

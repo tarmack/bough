@@ -123,6 +123,11 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
         return true;
     }
 
+    // An open base picker captures every key (including `q`) until closed.
+    if app.base_picker.is_some() {
+        return handle_picker_key(key.code, app);
+    }
+
     // Modifier-prefix state: a second `z` (fold) or `g` (goto) chord consumes
     // this very key before normal dispatch.
     if app.fold_key {
@@ -145,6 +150,14 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
         }
         KeyCode::Char('m') => {
             app.toggle_mode();
+            false
+        }
+        KeyCode::Char('b') => {
+            app.open_branch_picker();
+            false
+        }
+        KeyCode::Char('t') => {
+            app.open_commit_picker();
             false
         }
         KeyCode::Char('z') => {
@@ -197,6 +210,32 @@ fn handle_fold_key(code: KeyCode, app: &mut App) -> bool {
         KeyCode::Char('c') => app.close_hunk_at_cursor(),
         KeyCode::Char('R') | KeyCode::Char('r') => app.expand_all_hunks(),
         KeyCode::Char('M') | KeyCode::Char('m') => app.collapse_all_hunks(),
+        _ => {}
+    }
+    false
+}
+
+/// Handle a key while the base picker is open. Every key is consumed so the
+/// popup owns focus until it closes (`b`, `t`, `q`, or Esc) — `q` must close
+/// the popup rather than quit the app.
+fn handle_picker_key(code: KeyCode, app: &mut App) -> bool {
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(p) = app.base_picker.as_mut() {
+                if !p.entries.is_empty() {
+                    p.selection = (p.selection + 1).min(p.entries.len() - 1);
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(p) = app.base_picker.as_mut() {
+                p.selection = p.selection.saturating_sub(1);
+            }
+        }
+        KeyCode::Enter => app.select_picked_base(),
+        KeyCode::Char('b') | KeyCode::Char('t') | KeyCode::Char('q') | KeyCode::Esc => {
+            app.close_picker()
+        }
         _ => {}
     }
     false
@@ -930,5 +969,165 @@ mod tests {
         ));
         assert!(app.diff_scroll > 0);
         assert_eq!(app.active_chunk, Some(0));
+    }
+
+    /// A picker entry with `rev` used as both revision spec and label.
+    fn entry(rev: &str) -> crate::app::PickerEntry {
+        crate::app::PickerEntry {
+            rev: rev.to_string(),
+            label: rev.to_string(),
+        }
+    }
+
+    /// An `App` with the base picker open on a fixed branch list. The initial
+    /// `Diff` request from `App::new` is drained so later requests are
+    /// unambiguous.
+    fn picker_app() -> (App, Receiver<crate::snapshot::Request>) {
+        let tree = crate::tree::Tree::build(vec![('M', "a.rs".to_string())]);
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(8);
+        let mut app = App::new(
+            crate::test_support::sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_picker_with(" compare against a branch ", vec![entry("develop"), entry("feature")]);
+        (app, rx)
+    }
+
+    #[test]
+    fn picker_b_closes_popup() {
+        let (mut app, _rx) = picker_app();
+        assert!(app.base_picker.is_some());
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
+    }
+
+    #[test]
+    fn picker_t_closes_popup() {
+        let (mut app, _rx) = picker_app();
+        assert!(app.base_picker.is_some());
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
+    }
+
+    #[test]
+    fn t_opens_commit_picker() {
+        let mut app = sample_app();
+        assert!(app.base_picker.is_none());
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_some());
+    }
+
+    #[test]
+    fn picker_j_k_move_selection() {
+        let (mut app, _rx) = picker_app();
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0);
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1);
+        // Clamped at the end.
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1);
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0);
+        // Clamped at the start.
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0);
+    }
+
+    #[test]
+    fn picker_enter_picks_and_sends_setrev() {
+        let (mut app, rx) = picker_app();
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
+        assert_eq!(app.mode, crate::app::Mode::BranchFrom("feature".to_string()));
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picker_enter_on_commit_entry_sends_oid_setrev() {
+        let tree = crate::tree::Tree::build(vec![('M', "a.rs".to_string())]);
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(8);
+        let mut app = App::new(
+            crate::test_support::sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_commit_picker_with(vec![crate::app::PickerEntry {
+            rev: "abcdef1234567890".to_string(),
+            label: "abcdef1 subject".to_string(),
+        }]);
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
+        assert_eq!(app.mode, crate::app::Mode::BranchFrom("abcdef1234567890".to_string()));
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => {
+                assert_eq!(rev, "abcdef1234567890...HEAD")
+            }
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picker_esc_closes() {
+        let (mut app, _rx) = picker_app();
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
+    }
+
+    #[test]
+    fn picker_q_closes_popup_not_app() {
+        let (mut app, _rx) = picker_app();
+        // `q` while the popup is open closes it and must not quit.
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
     }
 }

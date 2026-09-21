@@ -30,14 +30,38 @@ pub const CONTEXT_STEP: i32 = 3;
 /// Cells scrolled horizontally per `h`/`l` press.
 pub const HSCROLL_STEP: usize = 2;
 
-/// Which base the working tree is diffed against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which changes the app shows. Named for the user's mental model, not git
+/// plumbing: "what work am I looking at?" for users keeping oversight of
+/// changes (e.g. made by AI coding agents).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// Diff against the merge-base of the trunk (`main...HEAD`): shows the
-    /// branch's committed work plus any uncommitted changes.
-    DiffToMain,
-    /// Diff against `HEAD`: only uncommitted working-tree changes.
+    /// The branch's work: everything the current branch changed since it left
+    /// the default branch (usually `main`), plus any uncommitted edits.
+    Branch,
+    /// The branch's work measured from a different origin the user picked
+    /// (a branch, tag, or commit): everything since that point, plus
+    /// uncommitted edits.
+    BranchFrom(String),
+    /// Only uncommitted working-tree edits.
     Uncommitted,
+}
+
+/// One row in the base-picker popup: `rev` is the revision spec the diff is
+/// computed against (`<rev>...HEAD`), `label` is what the row displays.
+pub struct PickerEntry {
+    pub rev: String,
+    pub label: String,
+}
+
+/// Base-picker popup state (opened with `b` for branches, `t` for
+/// commits/tags).
+pub struct BasePicker {
+    /// Popup title, e.g. ` compare against a branch `.
+    pub title: String,
+    /// Selectable rows.
+    pub entries: Vec<PickerEntry>,
+    /// Selected row index.
+    pub selection: usize,
 }
 
 /// Cache for [`App::visible_line_indices`]. The visibility set depends only on
@@ -105,12 +129,16 @@ pub struct App {
     last_highlight_range: Option<(usize, usize)>,
     /// True when the file watcher degraded to poll mode (for the status line).
     pub poll_mode: bool,
-    /// Current diff base: `DiffToMain` (against the trunk) or `Uncommitted`.
+    /// Current diff base: the default branch, a picked origin, or `HEAD`.
     pub mode: Mode,
-    /// Revision for `Mode::DiffToMain` (the startup revision).
+    /// Revision for `Mode::Branch` (the startup revision).
     main_rev: String,
     /// Revision for `Mode::Uncommitted` (`HEAD`).
     uncommitted_rev: String,
+    /// Last picked origin, remembered across an `Uncommitted` toggle.
+    last_base: Option<String>,
+    /// Open base-picker popup, or `None` when closed.
+    pub base_picker: Option<BasePicker>,
     /// Memoized `visible_line_indices` (see [`VisibleCache`]).
     visible_cache: RefCell<VisibleCache>,
     /// Kitty-protocol image preview state for the selected file.
@@ -169,9 +197,11 @@ impl App {
             seq: 0,
             last_highlight_range: None,
             poll_mode,
-            mode: Mode::DiffToMain,
+            mode: Mode::Branch,
             main_rev,
             uncommitted_rev,
+            last_base: None,
+            base_picker: None,
             visible_cache: RefCell::new(VisibleCache {
                 snap: init_snap,
                 collapsed: HashSet::new(),
@@ -373,19 +403,16 @@ impl App {
 
     /// The active diff base revision.
     fn current_rev(&self) -> String {
-        match self.mode {
-            Mode::DiffToMain => self.main_rev.clone(),
+        match &self.mode {
+            Mode::Branch => self.main_rev.clone(),
+            Mode::BranchFrom(base) => format!("{base}...HEAD"),
             Mode::Uncommitted => self.uncommitted_rev.clone(),
         }
     }
 
-    /// Switch between the two diff bases (`DiffToMain` <-> `Uncommitted`).
-    /// Resets the diff view and asks the worker to recompute at the new rev.
-    pub fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            Mode::DiffToMain => Mode::Uncommitted,
-            Mode::Uncommitted => Mode::DiffToMain,
-        };
+    /// Reset the diff view and ask the worker to recompute at the current rev.
+    /// Shared by every base switch (`toggle_mode`, `set_base`).
+    fn apply_base_switch(&mut self) {
         self.diff_scroll = 0;
         self.diff_col = 0;
         self.active_chunk = None;
@@ -395,6 +422,134 @@ impl App {
         let _ = self.request_tx.send(Request::SetRev {
             rev: self.current_rev(),
         });
+    }
+
+    /// Switch between the default-branch and uncommitted bases, or toggle a
+    /// picked origin against `Uncommitted`. A picked origin is remembered so
+    /// the round trip returns to it rather than the default branch.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match &self.mode {
+            Mode::Branch => Mode::Uncommitted,
+            Mode::BranchFrom(_) => Mode::Uncommitted,
+            Mode::Uncommitted => match &self.last_base {
+                Some(base) => Mode::BranchFrom(base.clone()),
+                None => Mode::Branch,
+            },
+        };
+        self.apply_base_switch();
+    }
+
+    /// Open the base picker populated from the repository's local branches.
+    pub fn open_branch_picker(&mut self) {
+        let entries = crate::git::local_branches()
+            .into_iter()
+            .map(|name| PickerEntry {
+                rev: name.clone(),
+                label: name,
+            })
+            .collect();
+        self.open_picker_with(" compare against a branch ", entries);
+    }
+
+    /// Open the base picker populated with recent commits followed by tags.
+    /// Commits diff against the full oid, tags against the tag name.
+    pub fn open_commit_picker(&mut self) {
+        let commits = crate::git::recent_commits(50)
+            .into_iter()
+            .map(|(oid, subject)| {
+                let short = oid.get(..7).unwrap_or(&oid).to_string();
+                PickerEntry {
+                    rev: oid,
+                    label: format!("{short} {subject}"),
+                }
+            });
+        let tags = crate::git::tags().into_iter().map(|name| PickerEntry {
+            rev: name.clone(),
+            label: name,
+        });
+        self.open_commit_picker_with(commits.chain(tags).collect());
+    }
+
+    /// Testable core of [`App::open_commit_picker`]: open the commit/tag picker
+    /// with an explicit entry list.
+    pub fn open_commit_picker_with(&mut self, entries: Vec<PickerEntry>) {
+        self.open_picker_with(" compare against a commit or tag ", entries);
+    }
+
+    /// Testable core of the picker openers: open the popup with an explicit
+    /// title and entry list. No-op when the list is empty; the selection starts
+    /// on the current mode's base when it is present.
+    pub fn open_picker_with(&mut self, title: &str, entries: Vec<PickerEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let current = self.base_name();
+        let selection = current
+            .as_deref()
+            .and_then(|b| entries.iter().position(|e| e.rev == b))
+            .unwrap_or(0);
+        self.base_picker = Some(BasePicker {
+            title: title.to_string(),
+            entries,
+            selection,
+        });
+    }
+
+    /// Close the base picker (Esc/q, or after a pick).
+    pub fn close_picker(&mut self) {
+        self.base_picker = None;
+    }
+
+    /// Enter in the picker: switch the diff base to the selected entry's rev.
+    pub fn select_picked_base(&mut self) {
+        let Some(rev) = self
+            .base_picker
+            .as_ref()
+            .and_then(|p| p.entries.get(p.selection).map(|e| e.rev.clone()))
+        else {
+            self.base_picker = None;
+            return;
+        };
+        self.base_picker = None;
+        self.set_base(rev);
+    }
+
+    /// Switch the diff base to `base...HEAD`, remembering it for a later
+    /// `Uncommitted` round trip.
+    pub fn set_base(&mut self, base: String) {
+        self.mode = Mode::BranchFrom(base.clone());
+        self.last_base = Some(base);
+        self.apply_base_switch();
+    }
+
+    /// Short name of the current mode's base, when one applies.
+    fn base_name(&self) -> Option<String> {
+        match &self.mode {
+            Mode::BranchFrom(b) => Some(b.clone()),
+            Mode::Uncommitted => self.last_base.clone(),
+            Mode::Branch => self
+                .main_rev
+                .split_once("...")
+                .map(|(base, _)| base.trim().to_string()),
+        }
+    }
+
+    /// The footer's always-present mode label: `vs <origin>` for a branch
+    /// comparison, or `uncommitted`. Never empty, so the footer shows the
+    /// active mode even before the first worker snapshot arrives.
+    pub fn mode_label(&self) -> String {
+        match &self.mode {
+            Mode::Uncommitted => "uncommitted".to_string(),
+            Mode::Branch => {
+                let base = self
+                    .main_rev
+                    .split_once("...")
+                    .map(|(base, _)| base)
+                    .unwrap_or(&self.main_rev);
+                format!("vs {}", short_origin(base.trim()))
+            }
+            Mode::BranchFrom(rev) => format!("vs {}", short_origin(rev)),
+        }
     }
 
     // ── Convenience accessors for snapshot data ─────────────────────────
@@ -1039,6 +1194,20 @@ impl App {
     }
 }
 
+/// Shortens a full 40-hex commit oid to 7 characters for the footer; branch
+/// and tag names pass through unchanged.
+fn short_origin(rev: &str) -> String {
+    if rev.len() == 40
+        && rev
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        rev[..7].to_string()
+    } else {
+        rev.to_string()
+    }
+}
+
 /// Collect the set of expanded dir paths from a freshly-built `Tree` (its
 /// default expansion state).
 fn collect_expanded(tree: &Tree) -> HashSet<String> {
@@ -1122,7 +1291,7 @@ mod tests {
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );
-        assert_eq!(app.mode, Mode::DiffToMain);
+        assert_eq!(app.mode, Mode::Branch);
 
         app.toggle_mode();
         assert_eq!(app.mode, Mode::Uncommitted);
@@ -1132,11 +1301,158 @@ mod tests {
         }
 
         app.toggle_mode();
-        assert_eq!(app.mode, Mode::DiffToMain);
+        assert_eq!(app.mode, Mode::Branch);
         match rx.try_recv().unwrap() {
             crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "main...HEAD"),
             other => panic!("expected SetRev, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_base_sends_setrev_and_resets_view() {
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(vec![('M', "a.rs".to_string())])),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        // Drain the initial Diff request sent by `App::new`.
+        let _ = rx.try_recv();
+
+        app.diff_scroll = 5;
+        app.diff_col = 3;
+        app.active_chunk = Some(2);
+        app.collapsed_hunks = [1].into_iter().collect();
+
+        app.set_base("feature".to_string());
+
+        assert_eq!(app.mode, Mode::BranchFrom("feature".to_string()));
+        assert_eq!(app.diff_scroll, 0);
+        assert_eq!(app.diff_col, 0);
+        assert_eq!(app.active_chunk, None);
+        assert!(app.collapsed_hunks.is_empty());
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_round_trip_returns_to_branch() {
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(vec![('M', "a.rs".to_string())])),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+
+        app.toggle_mode();
+        assert_eq!(app.mode, Mode::Uncommitted);
+        app.toggle_mode();
+        assert_eq!(app.mode, Mode::Branch);
+    }
+
+    #[test]
+    fn toggle_round_trip_returns_to_picked_branch() {
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(vec![('M', "a.rs".to_string())])),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+
+        app.set_base("feature".to_string());
+        let _ = rx.try_recv();
+        app.toggle_mode();
+        assert_eq!(app.mode, Mode::Uncommitted);
+        app.toggle_mode();
+        assert_eq!(app.mode, Mode::BranchFrom("feature".to_string()));
+    }
+
+    #[test]
+    fn mode_label_covers_all_modes() {
+        let (tx, _rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(4);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        assert_eq!(app.mode_label(), "vs main");
+
+        app.set_base("feature/x".to_string());
+        assert_eq!(app.mode_label(), "vs feature/x");
+
+        app.toggle_mode();
+        assert_eq!(app.mode_label(), "uncommitted");
+    }
+
+    #[test]
+    fn mode_label_shortens_full_commit_oid() {
+        let (tx, _rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(4);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.set_base("abcdef1234567890abcdef1234567890abcdef12".to_string());
+        assert_eq!(app.mode_label(), "vs abcdef1");
+    }
+
+    #[test]
+    fn mode_label_branch_without_origin_rev() {
+        let (tx, _rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(4);
+        let app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        assert_eq!(app.mode_label(), "vs HEAD");
+    }
+
+    #[test]
+    fn open_picker_prefills_current_base() {
+        let mut app = sample_app();
+        app.set_base("feature".to_string());
+        app.open_picker_with(
+" compare against a branch ",
+            vec![
+                PickerEntry {
+                    rev: "develop".to_string(),
+                    label: "develop".to_string(),
+                },
+                PickerEntry {
+                    rev: "feature".to_string(),
+                    label: "feature".to_string(),
+                },
+                PickerEntry {
+                    rev: "main".to_string(),
+                    label: "main".to_string(),
+                },
+            ],
+        );
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.selection, 1);
+
+        app.close_picker();
+        assert!(app.base_picker.is_none());
+
+        // An empty list is a no-op: no popup opens.
+        app.open_picker_with(" compare against a branch ", Vec::new());
+        assert!(app.base_picker.is_none());
     }
 
     fn app_with_diff(diff: Diff) -> App {
