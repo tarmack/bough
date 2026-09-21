@@ -122,7 +122,10 @@ fn untracked_paths(repo: &gix::Repository) -> Result<Vec<String>, GitError> {
     };
     let mut out = Vec::new();
     for item in iter {
-        let item = item.map_err(|e| GitError::message(format!("untracked scan: {e}")))?;
+        // A single unreadable path skips; the scan must not abort.
+        let Ok(item) = item else {
+            continue;
+        };
         if matches!(item.summary(), Some(Summary::Added)) && !is_directory_item(&item) {
             out.push(item.rela_path().to_string());
         }
@@ -160,7 +163,12 @@ pub(crate) fn collect_changes(
 
     let mut changes = Vec::new();
     for res in iter {
-        let item = res.map_err(|e| GitError::message(e.to_string()))?;
+        // One failed scan item (e.g. a file that cannot be read) must not
+        // blank the whole tree: skip it and keep scanning.
+        let item = match res {
+            Ok(item) => item,
+            Err(_) => continue,
+        };
         let summary = match item.summary() {
             Some(s) => s,
             None => continue,
@@ -255,7 +263,12 @@ pub(crate) fn collect_changes(
             }
         };
 
-        let (added, deleted, binary) = count_changes(&mut cache, repo, old_id, &path)?;
+        // When a single file's content cannot be read (permissions, broken
+        // state, ...), keep the entry with unknown stats — like a conflict —
+        // so the tree still loads; the per-file diff surfaces the error when
+        // the file is selected.
+        let (added, deleted, binary) =
+            count_changes(&mut cache, repo, old_id, &path).unwrap_or((0, 0, false));
         cache.clear_resource_cache_keep_allocation();
         changes.push(ChangeInfo {
             status,
@@ -521,6 +534,46 @@ mod tests {
         assert!(index
             .entry_by_path(gix::bstr::BStr::new("file0.txt"))
             .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_worktree_file_does_not_abort_scan() {
+        // One file whose content cannot be read must not blank the tree. The
+        // untracked one degrades to a zero-stat entry; the modified one is
+        // rejected by the scanner itself (no path info on the item error) and
+        // is skipped — either way the scan must succeed for the rest.
+        // (Runs as root both stay readable and the assertions still hold.)
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["one"]);
+        let repo = gix::discover(dir.path()).unwrap();
+
+        // A modified tracked file and an untracked file, both unreadable.
+        std::fs::write(dir.path().join("file0.txt"), "changed\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.path().join("file0.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            dir.path().join("new.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let changes = collect_changes(&repo, "HEAD").unwrap();
+        let by_path: HashMap<_, _> = changes.into_iter().map(|c| (c.path.clone(), c)).collect();
+        assert!(
+            by_path.contains_key("new.txt"),
+            "unreadable untracked file must still appear: {by_path:?}"
+        );
+        // When the modified file is listed at all, its stats degrade to zero
+        // rather than aborting.
+        if let Some(c) = by_path.get("file0.txt") {
+            assert_eq!((c.added, c.deleted), (0, 0));
+        }
     }
 
     #[test]
