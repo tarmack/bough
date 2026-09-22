@@ -54,25 +54,14 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
 
     let visible = app.visible_line_indices();
     let headers = app.header_positions();
-    // Clamp in two passes: the sticky count depends on the scroll position,
-    // which the first clamp may have moved.
-    let sticky_rows = app.sticky_row_count();
-    let max_scroll = max_scroll_for(visible.len(), body_height as usize, sticky_rows);
+    // The app-side sticky count and this renderer share `sticky_pair_capped`,
+    // so a single clamp against it is exact (no render-time reconciliation).
+    let max_scroll = max_scroll_for(visible.len(), body_height as usize, app.sticky_row_count());
     if app.diff_scroll > max_scroll {
         app.diff_scroll = max_scroll;
     }
     let (file_sticky, hunk_sticky, flow_height) =
         sticky_headers(&visible, &headers, app.diff_scroll, body_height);
-    let actual_rows = usize::from(file_sticky.is_some()) + usize::from(hunk_sticky.is_some());
-    let (file_sticky, hunk_sticky, flow_height) = if actual_rows != sticky_rows {
-        let max_scroll = max_scroll_for(visible.len(), body_height as usize, actual_rows);
-        if app.diff_scroll > max_scroll {
-            app.diff_scroll = max_scroll;
-        }
-        sticky_headers(&visible, &headers, app.diff_scroll, body_height)
-    } else {
-        (file_sticky, hunk_sticky, flow_height)
-    };
     // Pinned sticky lines, for click-row mapping.
     app.sticky_file = file_sticky;
     app.sticky_hunk = hunk_sticky;
@@ -178,20 +167,10 @@ fn sticky_headers(
     body_height: u16,
 ) -> (Option<usize>, Option<usize>, u16) {
     let start = start.min(visible.len());
-    let (file_pos, hunk_pos) = headers.sticky_pair(start);
+    let (file_pos, hunk_pos) = headers.sticky_pair_capped(start, body_height);
     let file_sticky = file_pos.map(|p| visible[p]);
     let hunk_sticky = hunk_pos.map(|p| visible[p]);
 
-    // Cap pinned rows: at most one file sticky, and the hunk sticky only when
-    // a row remains for it.
-    let mut file_sticky = file_sticky;
-    let mut hunk_sticky = hunk_sticky;
-    if body_height == 0 {
-        file_sticky = None;
-        hunk_sticky = None;
-    } else if body_height < 2 && file_sticky.is_some() {
-        hunk_sticky = None;
-    }
     let sticky_rows =
         file_sticky.map(|_| 1u16).unwrap_or(0) + hunk_sticky.map(|_| 1u16).unwrap_or(0);
     (
@@ -384,10 +363,16 @@ fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
+        return format!("{bytes} B");
     }
+    // Choosing the unit by the unrounded value can leave a value that rounds up
+    // to `1024.0` at one decimal (e.g. 1_048_575 bytes -> 1023.999 KB); bump it
+    // into the next unit so the printed number never crosses its own boundary.
+    while unit < UNITS.len() - 1 && (value * 10.0).round() >= 10240.0 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// Right-align a `right` block against a `left` block over `width` columns:
@@ -476,7 +461,8 @@ fn overlay_word_runs(
     let mut tok_start = 0usize;
     let mut ti = 0usize;
     for &(rs, re, bg) in &kept {
-        let mut seg = rs;
+        let re = re.min(raw.len());
+        let mut seg = rs.min(re);
         while seg < re {
             while ti + 1 < tokens.len() && tok_start + tokens[ti].text.len() <= seg {
                 tok_start += tokens[ti].text.len();
@@ -529,8 +515,18 @@ fn hunk_name_spans(bg: Color) -> Vec<Span<'static>> {
 /// The `+A -D` diffstat, a spacer, and the fold arrow. Pinned to the pane's
 /// right edge (does not scroll).
 fn hunk_stat_spans(meta: &HunkMeta, bg: Color, collapsed: bool) -> Vec<Span<'static>> {
+    stat_fold_spans(
+        stat_spans(meta.added, meta.deleted, false, Some(bg)),
+        bg,
+        collapsed,
+    )
+}
+
+/// Append a spacer and the fold glyph to a right-pinned `stat` block. Shared by
+/// the hunk and file-header stat rows so their layout stays identical.
+fn stat_fold_spans(stat: Vec<Span<'static>>, bg: Color, collapsed: bool) -> Vec<Span<'static>> {
     let glyph = if collapsed { "▶" } else { "▼" };
-    let mut spans = stat_spans(meta.added, meta.deleted, false, Some(bg));
+    let mut spans = stat;
     spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
     spans.push(Span::styled(
         glyph.to_string(),
@@ -702,14 +698,11 @@ fn header_icon(file: &FileHeader, color: Color, bg: Color) -> Vec<Span<'static>>
 
 /// Right-pinned stat + fold arrow for a file-header row.
 fn file_header_stat_spans(file: &FileHeader, bg: Color, collapsed: bool) -> Vec<Span<'static>> {
-    let glyph = if collapsed { "▶" } else { "▼" };
-    let mut spans = stat_spans(file.added, file.deleted, file.binary, Some(bg));
-    spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
-    spans.push(Span::styled(
-        glyph.to_string(),
-        Style::default().fg(Color::Blue).bg(bg),
-    ));
-    spans
+    stat_fold_spans(
+        stat_spans(file.added, file.deleted, file.binary, Some(bg)),
+        bg,
+        collapsed,
+    )
 }
 
 #[cfg(test)]
@@ -890,6 +883,12 @@ mod tests {
         let cells = terminal.backend().buffer().content();
         let row: String = cells.iter().map(|c| c.symbol().to_string()).collect();
         assert!(row.contains("x.rs"));
+        // The body lines and the header's stat chips are actually drawn, not
+        // just the locked header text.
+        assert!(row.contains("new"), "added body line missing: {row}");
+        assert!(row.contains("old"), "removed body line missing: {row}");
+        assert!(row.contains("+1"), "add stat chip missing: {row}");
+        assert!(row.contains("-1"), "delete stat chip missing: {row}");
     }
 
     #[test]
@@ -1280,10 +1279,29 @@ mod tests {
         app.snapshot = snapshot_with_diff(single_diff(header_full(None, None), lines));
 
         // `body_height == 0`: the pane is only as tall as the locked header.
+        // `ui` early-returns for terminals under two rows, so reach the
+        // renderer directly with an explicit zero-height rect.
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
-        terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| render_diff(f, &mut app, Rect::new(0, 0, 80, 0)))
+            .unwrap();
         assert_eq!(app.sticky_file, None);
         assert_eq!(app.sticky_hunk, None);
+
+        // The regular tiny-terminal path must also stay panic-free.
+        terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn human_size_does_not_cross_its_own_unit_boundary() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        // 1_048_575 B is 1023.999 KB, which must round up into MB rather than
+        // print "1024.0 KB".
+        assert_eq!(human_size(1_048_575), "1.0 MB");
+        assert_eq!(human_size(1_048_576), "1.0 MB");
+        assert_eq!(human_size(u64::MAX), "16777216.0 TB");
     }
 
     #[test]

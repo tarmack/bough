@@ -275,14 +275,8 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>
     // `Uncommitted`), mirroring vim's mode colors.
     let (mode_bg, label) = match &app.mode {
         Mode::Uncommitted => (Color::Green, "\u{f040} uncommitted".to_string()),
-        branch => {
-            let bg = match branch {
-                Mode::Branch(Origin::Default) => Color::Blue,
-                Mode::Branch(Origin::Picked(_)) => Color::Magenta,
-                Mode::Uncommitted => unreachable!(),
-            };
-            (bg, app.mode_label())
-        }
+        Mode::Branch(Origin::Default) => (Color::Blue, app.mode_label()),
+        Mode::Branch(Origin::Picked(_)) => (Color::Magenta, app.mode_label()),
     };
     // Bold black reads on every one of the pill's colored fills.
     let on_pill = |bg: Color| {

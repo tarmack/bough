@@ -9,7 +9,9 @@ use gix::diff::blob::platform::prepare_diff::Operation;
 use gix::diff::blob::unified_diff::{ConsumeHunk, DiffLineKind, HunkHeader};
 use gix::object::tree::EntryKind;
 
-use crate::diff::{Diff, DiffLine, FileHeader, HunkMeta, LfsInfo, LineKind, Section, SectionKind};
+use crate::diff::{
+    Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LfsInfo, LineKind, Section, SectionKind,
+};
 use crate::git::lfs::{self, LfsMatcher};
 use crate::git::{base_tree_id, open_repo, FileMeta, GitError};
 
@@ -53,7 +55,13 @@ impl<'repo> DiffContext<'repo> {
         meta: &FileMeta,
         ctx: u32,
     ) -> Result<Diff, GitError> {
-        let old_id = blob_id_in_tree(self.repo, self.base_tree, path)?;
+        // A rename/copy's new path does not exist in the base tree, so the old
+        // side must be resolved at the source path instead.
+        let old_path = match meta.status {
+            FileStatus::Renamed | FileStatus::Copied => meta.old_path.as_deref().unwrap_or(path),
+            _ => path,
+        };
+        let old_id = blob_id_in_tree(self.repo, self.base_tree, old_path)?;
         // The HEAD blob is the new side's content in the object database. It is
         // passed to LFS detection so a file committed as a pointer is stubbed
         // even though the diff's new side is read from the worktree (where an
@@ -122,11 +130,13 @@ fn resolve_base_tree(
 }
 
 /// HEAD's tree, or `None` for an unborn HEAD. Used to give LFS detection the
-/// new-side blob without reading the worktree.
+/// new-side blob without reading the worktree. An unborn HEAD is expected to
+/// have no tree; any other failure is a real error and is propagated.
 fn resolve_head_tree(repo: &gix::Repository) -> Result<Option<gix::ObjectId>, GitError> {
     match repo.head_tree_id() {
         Ok(id) => Ok(Some(id.detach())),
-        Err(_) => Ok(None),
+        Err(_) if repo.head().is_ok_and(|h| h.is_unborn()) => Ok(None),
+        Err(e) => Err(GitError::message(format!("cannot resolve HEAD tree: {e}"))),
     }
 }
 
@@ -209,6 +219,62 @@ impl ConsumeHunk for HunkCollector {
     }
 }
 
+/// The gix entry kind for a git file mode, or [`EntryKind::Blob`] when the
+/// mode is absent. Lets callers pass the real kind (link, submodule) instead of
+/// assuming a content-read is safe.
+pub(crate) fn entry_kind_for(mode: Option<u32>) -> EntryKind {
+    match mode.map(|m| m & 0o170000) {
+        Some(0o120000) => EntryKind::Link,
+        Some(0o160000) => EntryKind::Commit,
+        Some(0o100000) => {
+            if mode.is_some_and(|m| m & 0o111 != 0) {
+                EntryKind::BlobExecutable
+            } else {
+                EntryKind::Blob
+            }
+        }
+        _ => EntryKind::Blob,
+    }
+}
+
+/// The entry kind of a worktree path, or `None` when it must not be opened as
+/// content: symlinks are read via the link itself (never followed), regular
+/// files are content-read, a missing path degrades to the empty file, and every
+/// other kind (FIFO, device, directory, socket) is refused so a hung or
+/// unbounded read is impossible.
+pub(crate) fn worktree_entry_kind(repo: &gix::Repository, path: &str) -> Option<EntryKind> {
+    let full = repo
+        .workdir()
+        .map(|root| root.join(path))
+        .unwrap_or_else(|| std::path::PathBuf::from(path));
+    let meta = match std::fs::symlink_metadata(&full) {
+        Ok(meta) => meta,
+        // Missing as identified by the failed stat: gix handles the missing
+        // destination as the empty side, so a deletion still counts.
+        Err(_) => return Some(EntryKind::Blob),
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Some(EntryKind::Link);
+    }
+    if file_type.is_file() {
+        return Some(worktree_blob_kind(&meta));
+    }
+    None
+}
+
+/// Blob vs executable from a regular file's metadata.
+fn worktree_blob_kind(meta: &std::fs::Metadata) -> EntryKind {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 != 0 {
+            return EntryKind::BlobExecutable;
+        }
+    }
+    EntryKind::Blob
+}
+
 /// Load the blob at `old_id` (or the empty blob when `None`) and the worktree
 /// content at `path` into `cache` as the source/destination resources for a
 /// blob diff. Shared by the per-file diff construction and the added/removed
@@ -217,7 +283,9 @@ pub(crate) fn set_blob_resources(
     cache: &mut gix::diff::blob::Platform,
     repo: &gix::Repository,
     old_id: Option<gix::ObjectId>,
+    old_kind: EntryKind,
     path: &str,
+    new_kind: EntryKind,
 ) -> Result<(), GitError> {
     let rela: &gix::bstr::BStr = path.into();
     let null = gix::ObjectId::null(repo.object_hash());
@@ -225,7 +293,7 @@ pub(crate) fn set_blob_resources(
     cache
         .set_resource(
             old_id.unwrap_or(null),
-            EntryKind::Blob,
+            old_kind,
             rela,
             gix::diff::blob::ResourceKind::OldOrSource,
             &repo.objects,
@@ -234,7 +302,7 @@ pub(crate) fn set_blob_resources(
     cache
         .set_resource(
             null,
-            EntryKind::Blob,
+            new_kind,
             rela,
             gix::diff::blob::ResourceKind::NewOrDestination,
             &repo.objects,
@@ -250,23 +318,23 @@ pub(crate) fn set_odb_resources(
     cache: &mut gix::diff::blob::Platform,
     repo: &gix::Repository,
     old_id: Option<gix::ObjectId>,
+    old_kind: EntryKind,
     new_id: Option<gix::ObjectId>,
+    new_kind: EntryKind,
     path: &str,
 ) -> Result<(), GitError> {
     let rela: &gix::bstr::BStr = path.into();
     let null = gix::ObjectId::null(repo.object_hash());
-    for (id, kind) in [
-        (old_id, gix::diff::blob::ResourceKind::OldOrSource),
-        (new_id, gix::diff::blob::ResourceKind::NewOrDestination),
+    for (id, kind, res_kind) in [
+        (old_id, old_kind, gix::diff::blob::ResourceKind::OldOrSource),
+        (
+            new_id,
+            new_kind,
+            gix::diff::blob::ResourceKind::NewOrDestination,
+        ),
     ] {
         cache
-            .set_resource(
-                id.unwrap_or(null),
-                EntryKind::Blob,
-                rela,
-                kind,
-                &repo.objects,
-            )
+            .set_resource(id.unwrap_or(null), kind, rela, res_kind, &repo.objects)
             .map_err(|e| GitError::message(format!("diff {path}: {e}")))?;
     }
     Ok(())
@@ -287,6 +355,31 @@ fn build_file_diff(
     let mut lfs = LfsMatcher::new(repo);
     let info = lfs::detect(repo, &mut lfs, old_id, None, path);
     build_file_diff_with(&mut cache, repo, old_id, path, meta, ctx, info)
+}
+
+/// A zero-line binary stub for a path whose content must not be read (a
+/// submodule, symlink-only target, FIFO, device, ...). Mirrors the LFS stub:
+/// correct header, no hunks, no body.
+fn stub_diff(path: &str, meta: &FileMeta) -> Diff {
+    let file_header = FileHeader {
+        path: path.to_string(),
+        old_path: meta.old_path.clone(),
+        status: meta.status,
+        added: 0,
+        deleted: 0,
+        rename_percent: meta.rename_percent,
+        mode_old: meta.mode_old,
+        mode_new: meta.mode_new,
+        binary: true,
+        lfs: None,
+        hunks: Vec::new(),
+    };
+    Diff {
+        header: file_header.clone(),
+        files: vec![file_header],
+        sections: Vec::new(),
+        lines: Vec::new(),
+    }
 }
 
 /// Build a single-file [`Diff`] using the caller's diff platform. An LFS object
@@ -322,7 +415,17 @@ fn build_file_diff_with(
         });
     }
 
-    set_blob_resources(cache, repo, old_id, path)?;
+    let old_kind = entry_kind_for(meta.mode_old);
+    // A submodule's object is a commit, not a blob, and a symlink/FIFO/device
+    // worktree entry must never be content-read: stub those as binary instead.
+    let Some(new_kind) = worktree_entry_kind(repo, path) else {
+        return Ok(stub_diff(path, meta));
+    };
+    if old_kind == EntryKind::Commit {
+        return Ok(stub_diff(path, meta));
+    }
+
+    set_blob_resources(cache, repo, old_id, old_kind, path, new_kind)?;
 
     let (sections, mut lines, hunks) = match cache.prepare_diff() {
         Ok(outcome) => match outcome.operation {
@@ -603,5 +706,151 @@ mod tests {
         let info = diff.header.lfs.as_ref().expect("lfs metadata");
         assert_eq!(info.size, 555);
         assert_eq!(info.oid, OID);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_symlink_is_not_followed() {
+        // The worktree side must read the link itself, never its target: a
+        // symlink to /dev/zero or /etc/shadow must not be read in full.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["one\n"]);
+        let repo = gix::discover(dir.path()).unwrap();
+        std::os::unix::fs::symlink("file0.txt", dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join("evil")).unwrap();
+
+        let meta = FileMeta {
+            status: FileStatus::Added,
+            added: 1,
+            deleted: 0,
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: false,
+        };
+        let diff = build_file_diff(&repo, None, "link.txt", &meta, 3).unwrap();
+        assert!(
+            diff.lines
+                .iter()
+                .any(|l| l.raw_text == "file0.txt" && l.kind == LineKind::Added),
+            "link target, not linked content: {:?}",
+            diff.lines
+        );
+        assert!(!diff.lines.iter().any(|l| l.raw_text.contains("one")));
+
+        // A link to a device is likewise just its target string.
+        let evil = build_file_diff(&repo, None, "evil", &meta, 3).unwrap();
+        assert!(evil
+            .lines
+            .iter()
+            .any(|l| l.raw_text == "/dev/zero" && l.kind == LineKind::Added));
+    }
+
+    #[test]
+    fn worktree_non_regular_entry_is_stubbed() {
+        // A directory entry (standing in for a FIFO/device, which must never be
+        // opened) yields an empty binary stub rather than a hang.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["one\n"]);
+        let repo = gix::discover(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+        let meta = FileMeta {
+            status: FileStatus::Added,
+            added: 0,
+            deleted: 0,
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: false,
+        };
+        let diff = build_file_diff(&repo, None, "sub", &meta, 3).unwrap();
+        assert!(diff.header.binary);
+        assert!(diff.lines.is_empty());
+        assert!(diff.sections.is_empty());
+    }
+
+    /// Create `main` with a 10-line `old.txt`, then a `feature` branch that
+    /// renames it to `new.txt` with `extra` appended. Returns on `feature`.
+    #[cfg(test)]
+    fn repo_with_renamed_file(dir: &std::path::Path, append_extra: bool) {
+        let run = |args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(s.success());
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "t@e"]);
+        run(&["config", "user.name", "T"]);
+        let body: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("old.txt"), body).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "base"]);
+        run(&["checkout", "-b", "feature"]);
+        run(&["mv", "old.txt", "new.txt"]);
+        if append_extra {
+            let mut body: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+            body.push_str("extra\n");
+            std::fs::write(dir.join("new.txt"), body).unwrap();
+        }
+        run(&["add", "."]);
+        run(&["commit", "-m", "rename"]);
+    }
+
+    fn renamed_meta(added: usize) -> FileMeta {
+        FileMeta {
+            status: FileStatus::Renamed,
+            added,
+            deleted: 0,
+            old_path: Some("old.txt".to_string()),
+            rename_percent: Some(90),
+            mode_old: Some(0o100644),
+            mode_new: Some(0o100644),
+            binary: false,
+        }
+    }
+
+    #[test]
+    fn rename_with_modification_diffs_old_path() {
+        // The old side lives at the *source* path in the base tree; resolving
+        // it at the new path would make the body a pure addition.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_renamed_file(dir.path(), true);
+        let repo = gix::discover(dir.path()).unwrap();
+
+        let diff = diff_file_in(&repo, "main...HEAD", "new.txt", &renamed_meta(1), 3).unwrap();
+        assert_eq!(diff.header.old_path.as_deref(), Some("old.txt"));
+        assert!(
+            diff.lines
+                .iter()
+                .any(|l| l.raw_text == "extra" && l.kind == LineKind::Added),
+            "modified line must show as an addition: {:?}",
+            diff.lines
+        );
+        assert!(
+            !diff.lines.is_empty(),
+            "a rename of modified content must not be an empty diff"
+        );
+    }
+
+    #[test]
+    fn pure_rename_has_empty_body_and_zero_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_renamed_file(dir.path(), false);
+        let repo = gix::discover(dir.path()).unwrap();
+
+        let diff = diff_file_in(&repo, "main...HEAD", "new.txt", &renamed_meta(0), 3).unwrap();
+        assert_eq!(diff.header.added, 0);
+        assert_eq!(diff.header.deleted, 0);
+        assert!(
+            diff.lines.is_empty(),
+            "a pure rename has no bogus additions: {:?}",
+            diff.lines
+        );
     }
 }

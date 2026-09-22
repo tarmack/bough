@@ -34,7 +34,13 @@ pub(crate) fn recent_commits_in(repo: &gix::Repository, n: usize) -> Vec<(String
     let Ok(head_id) = repo.head_id() else {
         return Vec::new();
     };
-    let Ok(walker) = repo.rev_walk([head_id.detach()]).all() else {
+    let Ok(walker) = repo
+        .rev_walk([head_id.detach()])
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
+        .all()
+    else {
         return Vec::new();
     };
     walker
@@ -278,5 +284,70 @@ mod tests {
         let repo = gix::discover(dir.path()).unwrap();
 
         assert_eq!(tags_in(&repo), vec!["v0".to_string(), "v1".to_string()]);
+    }
+
+    #[test]
+    fn recent_commits_newest_first_on_merge_history() {
+        // On a merge history the walk must order by commit time, not
+        // breadth-first: the newest side-branch commit has to follow HEAD
+        // rather than the older first-parent commit. Dates are pinned so the
+        // order is independent of how fast the commits are authored.
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        run_git(dir.path(), &["config", "user.email", "t@e"]);
+        run_git(dir.path(), &["config", "user.name", "T"]);
+
+        let commit_at = |date: &str, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        commit_at("2000-01-01T00:00:00", &["commit", "-m", "A"]);
+
+        // Older first-parent commit on main.
+        std::fs::write(dir.path().join("c.txt"), "c\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        commit_at("2000-01-02T00:00:00", &["commit", "-m", "C"]);
+
+        // Newer side-branch commit.
+        run_git(dir.path(), &["checkout", "-b", "feature", "HEAD~1"]);
+        std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        commit_at("2000-01-03T00:00:00", &["commit", "-m", "B"]);
+        let b_id = rev_parse(dir.path(), "HEAD");
+
+        run_git(dir.path(), &["checkout", "main"]);
+        commit_at(
+            "2000-01-04T00:00:00",
+            &["merge", "--no-ff", "feature", "-m", "merge"],
+        );
+        let merge_id = rev_parse(dir.path(), "HEAD");
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let commits = recent_commits_in(&repo, 10);
+        assert_eq!(commits.len(), 4);
+        assert_eq!(commits[0].0, merge_id);
+        assert_eq!(
+            commits[1].0, b_id,
+            "newest side-branch commit must be listed right after HEAD"
+        );
+    }
+
+    fn rev_parse(dir: &std::path::Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 }

@@ -29,6 +29,18 @@ const BUSY_POLL: Duration = Duration::from_millis(100);
 /// Poll timeout while idle: long enough to keep the loop quiet, short enough to
 /// pick up worker snapshots that arrive without a terminal event.
 const IDLE_POLL: Duration = Duration::from_millis(50);
+/// Backoff steps (milliseconds) for consecutive transient reader errors: a
+/// persistent non-fatal error must not spin the reader thread at 100% CPU.
+const READ_BACKOFF_MS: [u64; 3] = [1, 10, 100];
+/// Consecutive transient reader errors before the reader treats the terminal
+/// as effectively gone and ends the loop.
+const READ_GIVE_UP_AFTER: u32 = 1000;
+/// Message on the synthetic error sent when the reader gives up; recognized by
+/// [`classify_wake`] as fatal.
+const READER_GAVE_UP: &str = "input reader gave up after repeated transient errors";
+/// Maximum terminal events handled per loop iteration. A mouse-motion storm
+/// otherwise forces one redraw per queued event.
+const MAX_EVENTS_PER_FRAME: usize = 64;
 
 /// Redraw gating for the event loop: the frame is drawn only when something
 /// marked it dirty, plus a periodic tick while the worker is busy so the UI
@@ -118,9 +130,12 @@ enum Wake {
 fn classify_wake(result: Result<io::Result<Event>, RecvTimeoutError>) -> Wake {
     match result {
         Ok(Ok(event)) => Wake::Event(event),
-        // Only terminal-fatal read errors end the loop; a transient one is
-        // retried on the next iteration.
-        Ok(Err(e)) if is_fatal_read_error(&e) => Wake::Closed,
+        // Terminal-fatal read errors — and the reader's synthetic "gave up
+        // after N transient errors" — end the loop.
+        Ok(Err(e)) if is_fatal_read_error(&e) || is_reader_gave_up(&e) => Wake::Closed,
+        // Defense-in-depth: the reader retries transient errors itself and only
+        // sends fatal ones, but any other queued error is treated as transient
+        // so a stray one can't spuriously quit.
         Ok(Err(_)) => Wake::Idle,
         Err(RecvTimeoutError::Timeout) => Wake::Idle,
         // The reader thread is gone; nothing can arrive again.
@@ -142,6 +157,23 @@ fn is_fatal_read_error(e: &io::Error) -> bool {
     )
 }
 
+/// The synthetic error the reader sends after giving up on repeated transient
+/// errors; [`classify_wake`] treats it as fatal.
+fn gave_up_error() -> io::Error {
+    io::Error::other(READER_GAVE_UP)
+}
+
+/// True when `e` is the sentinel from [`gave_up_error`].
+fn is_reader_gave_up(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Other && e.to_string() == READER_GAVE_UP
+}
+
+/// Backoff after `consecutive` transient read errors: 1ms, 10ms, then 100ms.
+fn read_backoff(consecutive: u32) -> Duration {
+    let step = (consecutive.saturating_sub(1) as usize).min(READ_BACKOFF_MS.len() - 1);
+    Duration::from_millis(READ_BACKOFF_MS[step])
+}
+
 /// Spawn the terminal-input reader. Crossterm's event source owns a single
 /// global handle and, once the pty is closed, spins inside `event::read`
 /// without ever returning an error; a dedicated thread keeps that spin off the
@@ -150,22 +182,36 @@ fn spawn_reader() -> io::Result<Receiver<io::Result<Event>>> {
     let (tx, rx) = crossbeam_channel::unbounded::<io::Result<Event>>();
     thread::Builder::new()
         .name("bough-input".into())
-        .spawn(move || loop {
-            match event::read() {
-                Ok(event) => {
-                    if tx.send(Ok(event)).is_err() {
-                        break;
+        .spawn(move || {
+            let mut consecutive = 0u32;
+            loop {
+                match event::read() {
+                    Ok(event) => {
+                        consecutive = 0;
+                        if tx.send(Ok(event)).is_err() {
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    // Transient errors are retried; only fatal ones end the
-                    // reader, so the channel never disconnects spuriously.
-                    if is_fatal_read_error(&e) {
-                        crate::perf_evt!("input read fatal error kind={:?}", e.kind());
-                        let _ = tx.send(Err(e));
-                        break;
+                    Err(e) => {
+                        // Transient errors are retried with escalating backoff
+                        // (a persistent unknown errno must not spin this
+                        // thread); only fatal ones end the reader.
+                        if is_fatal_read_error(&e) {
+                            crate::perf_evt!("input read fatal error kind={:?}", e.kind());
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                        consecutive += 1;
+                        if consecutive >= READ_GIVE_UP_AFTER {
+                            crate::perf_evt!(
+                                "input read gave up after {consecutive} transient errors"
+                            );
+                            let _ = tx.send(Err(gave_up_error()));
+                            break;
+                        }
+                        perf::tally(Counter::ReadRetries);
+                        thread::sleep(read_backoff(consecutive));
                     }
-                    perf::tally(Counter::ReadRetries);
                 }
             }
         })?;
@@ -251,7 +297,32 @@ pub fn run(
         perf::tally(Counter::PollWakes);
         match wake {
             Wake::Event(event) => {
-                if handle_event(event, app, &mut redraw) {
+                let mut quit = false;
+                let mut drained = 0usize;
+                let mut next = Some(event);
+                // Bulk-drain a burst so a mouse-motion storm cannot force one
+                // redraw per event: pure motion is dropped, everything else is
+                // handled (scrolling applies per event), and the frame is
+                // marked dirty by the handlers (a single boolean).
+                while let Some(e) = next.take() {
+                    drained += 1;
+                    if !matches!(&e, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved)) {
+                        quit = handle_event(e, app, &mut redraw);
+                    }
+                    if quit || drained >= MAX_EVENTS_PER_FRAME {
+                        break;
+                    }
+                    match events.try_recv() {
+                        Ok(Ok(e)) => next = Some(e),
+                        // The reader only sends fatal errors.
+                        Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                            crate::perf_evt!("input closed");
+                            return Ok(());
+                        }
+                        Err(TryRecvError::Empty) => break,
+                    }
+                }
+                if quit {
                     crate::perf_evt!("quit key");
                     break;
                 }
@@ -273,6 +344,12 @@ pub fn run(
 }
 
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+    // A preview covers the diff pane: hunk hit-testing and diff scrolling
+    // would target invisible content, so ignore events over that pane. Tree
+    // scrolls (the right pane) still work.
+    if app.preview.active() && mouse.column < app.diff_width {
+        return;
+    }
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
         // Left-click inside the diff pane on a hunk header toggles it.
         if mouse.column < app.diff_width {
@@ -314,6 +391,14 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
         return handle_picker_key(key.code, app);
     }
 
+    // Esc always quits, even with a pending `z`/`g` chord: clear the chord
+    // first so it cannot swallow the key.
+    if key.code == KeyCode::Esc {
+        app.fold_key = false;
+        app.g_key = false;
+        return true;
+    }
+
     // Modifier-prefix state: a second `z` (fold) or `g` (goto) chord consumes
     // this very key before normal dispatch.
     if app.fold_key {
@@ -329,7 +414,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Char('q') => true,
         KeyCode::Char('w') => {
             app.word_diff_on = !app.word_diff_on;
             false
@@ -561,6 +646,23 @@ mod tests {
             classify_wake(Ok(Ok(Event::FocusGained))),
             Wake::Event(_)
         ));
+    }
+
+    #[test]
+    fn classify_wake_reader_gave_up_is_fatal() {
+        // The reader's synthetic error after repeated transient failures must
+        // end the loop rather than being treated as transient.
+        let err: io::Result<Event> = Err(gave_up_error());
+        assert!(matches!(classify_wake(Ok(err)), Wake::Closed));
+    }
+
+    #[test]
+    fn read_backoff_escalates_then_caps() {
+        assert_eq!(read_backoff(1), Duration::from_millis(1));
+        assert_eq!(read_backoff(2), Duration::from_millis(10));
+        assert_eq!(read_backoff(3), Duration::from_millis(100));
+        // Stays capped however long the failure persists.
+        assert_eq!(read_backoff(1_000), Duration::from_millis(100));
     }
 
     #[test]
@@ -1031,6 +1133,26 @@ mod tests {
     }
 
     #[test]
+    fn esc_quits_even_with_pending_chord() {
+        // A pending `z`/`g` chord must not swallow Esc: Esc clears the chord
+        // and quits.
+        let mut app = sample_app();
+        app.fold_key = true;
+        assert!(handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(!app.fold_key);
+
+        app.g_key = true;
+        assert!(handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(!app.g_key);
+    }
+
+    #[test]
     fn mouse_click_toggles_hunk() {
         let mut app = sample_app();
         app.focus = Focus::Diff;
@@ -1067,6 +1189,57 @@ mod tests {
         // Clicking a body line (row 2, a ctx line) does not toggle.
         handle_mouse(click(2), &mut app);
         assert!(!app.collapsed_hunks.contains(&0));
+    }
+
+    #[test]
+    fn mouse_ignores_diff_pane_when_preview_active() {
+        let mut app = sample_app();
+        app.focus = Focus::Diff;
+        app.selected_path = Some("x.rs".into());
+        app.snapshot = snapshot_with_diff(single_diff(
+            header_full(None, None),
+            vec![hunk_header(0), ctx_line(0, 0), ctx_line(1, 0)],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| view::ui(f, &mut app)).unwrap();
+        assert!(app.collapsed_hunks.is_empty());
+
+        // A preview covering the diff pane suppresses hunk hit-testing.
+        app.preview.set_enabled(true);
+        app.preview.current = Some(PreviewImage {
+            path: "x.rs".into(),
+            png: Vec::new(),
+            width: 1,
+            height: 1,
+        });
+        assert!(app.preview.active());
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(
+            app.collapsed_hunks.is_empty(),
+            "a preview must suppress hunk toggling"
+        );
+
+        // Once the preview is gone the header toggles again.
+        app.preview.set_enabled(false);
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(app.collapsed_hunks.contains(&0));
     }
 
     #[test]

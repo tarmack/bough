@@ -34,7 +34,12 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     let tree_w = (area.width / 3).clamp(1, area.width.saturating_sub(2));
     let diff_w = area.width.saturating_sub(tree_w).saturating_sub(1);
 
-    app.diff_width = diff_w;
+    if app.diff_width != diff_w {
+        app.diff_width = diff_w;
+        // A resize can move the pane's right edge left; re-clamp the
+        // horizontal scroll so it is never past the new maximum.
+        app.clamp_diff_col();
+    }
     app.height = body_height as usize;
 
     let diff = ratatui::layout::Rect::new(area.x, area.y, diff_w, body_height);
@@ -88,9 +93,13 @@ fn render_branch_picker(f: &mut Frame, app: &App) {
         .max()
         .unwrap_or(0);
     let max_w = (area.width.saturating_mul(3) / 5).max(1);
-    let width = (longest as u16 + 6).clamp(28.min(max_w), max_w);
+    let width =
+        (u16::try_from(longest).unwrap_or(u16::MAX).saturating_add(6)).clamp(28.min(max_w), max_w);
     let max_h = (area.height.saturating_mul(4) / 5).max(1);
-    let height = ((picker.entries.len() as u16) + 2).clamp(5.min(max_h), max_h);
+    let height = (u16::try_from(picker.entries.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2))
+    .clamp(5.min(max_h), max_h);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -126,6 +135,9 @@ fn render_branch_picker(f: &mut Frame, app: &App) {
 fn status_line(app: &App) -> Option<String> {
     if let Some(err) = app.diff_error() {
         return Some(format!("git: {err}"));
+    }
+    if let Some(msg) = app.picker_error() {
+        return Some(msg.to_string());
     }
     if app.poll_mode.load(Ordering::Relaxed) {
         return Some("live update: poll mode".into());

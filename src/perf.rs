@@ -3,7 +3,9 @@
 //! Disabled by default: set `BOUGH_PERF_LOG` to a file path and bough truncates
 //! (creating) that file at startup and appends one line per event. When the
 //! variable is unset every entry point is a single relaxed atomic load plus a
-//! branch — no file, no allocation, no logging.
+//! branch — no file, no allocation, no logging. The `perf_evt!` argument
+//! expressions still evaluate before that early return, so keep them cheap
+//! (a path format, an integer — never a scan).
 //!
 //! Usage:
 //!
@@ -137,13 +139,17 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 /// True when `BOUGH_PERF_LOG` was set and a log is being written.
-pub fn enabled() -> bool {
+fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
 /// Open the log named by `BOUGH_PERF_LOG`, if set. Truncates any existing file.
-/// Safe to call once at startup; a later call is a no-op.
+/// Safe to call once at startup; a later call is a no-op (it must not truncate
+/// a log that is already live).
 pub fn init() {
+    if enabled() {
+        return;
+    }
     let Ok(path) = std::env::var("BOUGH_PERF_LOG") else {
         return;
     };
@@ -258,6 +264,10 @@ struct Logger {
     out: Mutex<Box<dyn Write + Send>>,
     start: Instant,
     counters: [AtomicU64; Counter::ALL.len()],
+    /// Latched on the first write error. Once set, no further writes are
+    /// attempted (a broken sink must not spam stderr), and `beat` stops
+    /// resetting counters so the accumulated counts are retained.
+    failed: AtomicBool,
 }
 
 impl Logger {
@@ -266,6 +276,7 @@ impl Logger {
             out: Mutex::new(out),
             start,
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -282,12 +293,32 @@ impl Logger {
         );
     }
 
-    fn write(&self, kind: &str, payload: &str) {
+    /// Write one line. Returns `false` when nothing was written: the sink
+    /// already failed, or this write failed (which latches `failed` and emits a
+    /// one-time stderr note). A poisoned `out` mutex is recovered rather than
+    /// silently disabling logging.
+    fn write(&self, kind: &str, payload: &str) -> bool {
+        if self.failed.load(Ordering::Relaxed) {
+            return false;
+        }
         let elapsed = self.start.elapsed().as_millis();
         let thread = std::thread::current();
         let name = thread.name().unwrap_or("unnamed");
-        if let Ok(mut out) = self.out.lock() {
-            let _ = writeln!(out, "{elapsed} {name} {kind} {payload}");
+        let result = {
+            let mut out = self
+                .out
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            writeln!(out, "{elapsed} {name} {kind} {payload}")
+        };
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                if !self.failed.swap(true, Ordering::Relaxed) {
+                    eprintln!("bough: perf log write failed ({e}); instrumentation disabled");
+                }
+                false
+            }
         }
     }
 
@@ -300,9 +331,13 @@ impl Logger {
     }
 
     fn beat(&self) {
+        if self.failed.load(Ordering::Relaxed) {
+            return;
+        }
         let mut payload = String::new();
+        let mut written = Vec::new();
         for counter in Counter::ALL {
-            let n = self.counters[counter.index()].swap(0, Ordering::Relaxed);
+            let n = self.counters[counter.index()].load(Ordering::Relaxed);
             if n == 0 {
                 continue;
             }
@@ -310,9 +345,17 @@ impl Logger {
                 payload.push(' ');
             }
             let _ = write!(payload, "{}={n}", counter.name());
+            written.push(counter);
         }
-        if !payload.is_empty() {
-            self.write("tally", &payload);
+        if payload.is_empty() {
+            return;
+        }
+        // Reset a counter only after its payload reached the sink. A failed
+        // write leaves counts intact rather than silently dropping them.
+        if self.write("tally", &payload) {
+            for counter in written {
+                self.counters[counter.index()].store(0, Ordering::Relaxed);
+            }
         }
     }
 
@@ -328,6 +371,8 @@ impl Logger {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     fn string_logger() -> (Logger, tempfile::NamedTempFile) {
@@ -411,5 +456,53 @@ mod tests {
         let payload = text.lines().next().unwrap().splitn(4, ' ').nth(3).unwrap();
         assert!(payload.starts_with("git_scan="), "{payload}");
         assert!(payload.ends_with("ms"), "{payload}");
+    }
+
+    #[test]
+    fn counter_all_matches_variants_and_names_are_unique() {
+        let mut names: Vec<&str> = Vec::new();
+        for (i, counter) in Counter::ALL.iter().enumerate() {
+            assert_eq!(
+                counter.index(),
+                i,
+                "ALL must list every variant once, in declaration order"
+            );
+            names.push(counter.name());
+        }
+        assert_eq!(Counter::ALL.len(), names.len());
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "counter names must be unique");
+    }
+
+    /// A sink that always fails, to exercise the write-error path.
+    struct FailWriter;
+
+    impl Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("sink is broken"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_failure_disables_sink_and_keeps_counts() {
+        let logger = Logger::new(Box::new(FailWriter), Instant::now());
+        assert!(!logger.write("evt", "boom"));
+        assert!(logger.failed.load(Ordering::Relaxed));
+
+        logger.tally(Counter::Draws);
+        logger.beat();
+        // The failed tally write must not have reset the counter.
+        assert_eq!(
+            logger.counters[Counter::Draws.index()].load(Ordering::Relaxed),
+            1
+        );
+        // Once failed, further writes are skipped without touching the sink.
+        assert!(!logger.write("evt", "again"));
     }
 }

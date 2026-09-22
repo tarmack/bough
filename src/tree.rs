@@ -67,6 +67,11 @@ impl Tree {
 
         sort_recursive(&mut nodes, root);
         aggregate(&mut nodes, root);
+        // Populate `file_count`/`status_counts` in `build` so a caller that
+        // never calls `annotate_stats` still sees the shape of the change
+        // instead of a zeroed header. `annotate_stats` recomputes these cheap
+        // aggregates after applying per-file line stats.
+        sum_stats(&mut nodes, root);
 
         Tree { nodes, root }
     }
@@ -206,16 +211,7 @@ fn find_child(nodes: &[TreeNode], parent: usize, name: &str) -> Option<usize> {
 /// (case-insensitive).
 fn sort_recursive(nodes: &mut Vec<TreeNode>, idx: usize) {
     let mut children = nodes[idx].children.clone();
-    children.sort_by(|&a, &b| {
-        let ra = kind_rank(nodes[a].kind);
-        let rb = kind_rank(nodes[b].kind);
-        ra.cmp(&rb).then_with(|| {
-            nodes[a]
-                .name
-                .to_lowercase()
-                .cmp(&nodes[b].name.to_lowercase())
-        })
-    });
+    children.sort_by_cached_key(|&i| (kind_rank(nodes[i].kind), nodes[i].name.to_lowercase()));
     nodes[idx].children = children;
 
     let children = nodes[idx].children.clone();

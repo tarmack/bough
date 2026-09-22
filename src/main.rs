@@ -28,7 +28,7 @@ mod watch;
 mod worker;
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::Parser;
 use crossterm::cursor::Show;
@@ -64,8 +64,23 @@ struct Cli {
 /// sequence, which is harmless because each step is idempotent.
 struct TerminalGuard;
 
+/// Serializes the two restore paths — the panic hook and `Drop` — so their
+/// escape sequences can't interleave mid-sequence. The render path does not
+/// take this lock: a panic during `terminal.draw` can still interleave with a
+/// frame, but the hook restores immediately after, and keeping each whole
+/// restore sequence atomic is what prevents a torn terminal.
+fn restore_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 impl TerminalGuard {
     fn restore() -> io::Result<()> {
+        // Hold the process-global lock for the whole sequence; a poisoned lock
+        // is recovered (a prior restore panicking must not wedge later ones).
+        let _serialized = restore_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut first_err = None;
         if let Err(e) = disable_raw_mode() {
             first_err = Some(e);
@@ -307,5 +322,12 @@ mod tests {
         assert_eq!(snap.branch_state.name.as_deref(), Some("feature/x"));
         assert_eq!(snap.branch_state.base.as_deref(), Some("main"));
         assert_eq!(snap.branch_state.ahead, Some(2));
+    }
+
+    #[test]
+    fn restore_lock_is_process_global() {
+        // Two calls must hand out the same mutex, so the hook and `Drop`
+        // serialize their restore sequences.
+        assert!(std::ptr::eq(restore_lock(), restore_lock()));
     }
 }

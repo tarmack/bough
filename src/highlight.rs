@@ -25,6 +25,15 @@ pub struct TokenOwned {
 ///
 /// Cloning and restarting from a checkpoint is cheap, so the worker can jump
 /// to an arbitrary raw-line range of a diff without re-parsing from line 0.
+///
+/// # Contiguity assumption
+///
+/// A `ResumeState` is only valid for the exact line sequence that produced it.
+/// The consumer must feed lines *contiguously* from the checkpoint onward:
+/// syntect's parser state carries multi-line constructs (block comments,
+/// template strings, heredocs), so skipping lines — as feeding hunk bodies
+/// with gaps between them does — drops the intervening text and drifts the
+/// scope stack, coloring later lines under the wrong grammar context.
 #[derive(Clone)]
 pub struct ResumeState {
     /// The live syntect parser state.
@@ -131,16 +140,24 @@ impl Highlighter {
     ///
     /// This is the cheap path used to bridge a checkpoint to an arbitrary body
     /// line: it mutates only the parse state and scope stack, never allocating
-    /// styles. On a parse error the remaining lines are skipped.
-    pub fn parse_only(&self, resume: &mut ResumeState, texts: &[&str]) {
+    /// styles.
+    ///
+    /// Returns `true` once every line parsed, or `false` when a parse error
+    /// aborted the advance (the remaining lines were skipped, leaving `resume`
+    /// only partially advanced). Callers that cache the mutated state as a
+    /// complete checkpoint must treat `false` as "do not resume from this":
+    /// continuing from a partial state highlights later lines from the wrong
+    /// scope.
+    pub fn parse_only(&self, resume: &mut ResumeState, texts: &[&str]) -> bool {
         for text in texts {
             let Ok(ops) = resume.parse.parse_line(text, self.syntaxes) else {
-                return;
+                return false;
             };
             for (_, op) in ops {
                 let _ = resume.scope.apply(&op);
             }
         }
+        true
     }
 
     /// Highlight one line, advancing `resume` to the end of that line's scope.
@@ -149,6 +166,12 @@ impl Highlighter {
     /// build a [`HighlightState`] from the previous scope stack, run a
     /// [`HighlightIterator`], then capture its end-of-line `path` back into
     /// `resume`. Returns owned token spans, or an empty `Vec` on a parse error.
+    ///
+    /// An empty `Vec` is the same failed-parse signal as [`parse_only`]'s
+    /// `false`: the line renders uncolored, and callers must not treat the
+    /// mutated `resume` as a trustworthy checkpoint afterward.
+    ///
+    /// [`parse_only`]: Self::parse_only
     pub fn highlight(&self, resume: &mut ResumeState, text: &str) -> Vec<TokenOwned> {
         let ops = match resume.parse.parse_line(text, self.syntaxes) {
             Ok(ops) => ops,

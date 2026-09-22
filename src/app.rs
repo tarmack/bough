@@ -141,6 +141,26 @@ impl HeaderPositions {
         let hunk_from = file_pos.map_or(0, |p| p + 1);
         (file_pos, self.hunk_before(start, hunk_from))
     }
+
+    /// [`sticky_pair`](Self::sticky_pair) with the renderer's row cap applied:
+    /// no pinned rows when `body_height == 0`, and the hunk sticky dropped when
+    /// only one body row exists and a file sticky already occupies it. Shared
+    /// by the render path and [`App::sticky_row_count`] so scroll math and
+    /// drawing can never disagree on how many rows are pinned.
+    pub(crate) fn sticky_pair_capped(
+        &self,
+        start: usize,
+        body_height: u16,
+    ) -> (Option<usize>, Option<usize>) {
+        let (file, hunk) = self.sticky_pair(start);
+        if body_height == 0 {
+            return (None, None);
+        }
+        if body_height < 2 && file.is_some() {
+            return (file, None);
+        }
+        (file, hunk)
+    }
 }
 
 pub struct App {
@@ -202,6 +222,9 @@ pub struct App {
     last_origin: Option<Origin>,
     /// Open base-picker popup, or `None` when closed.
     pub base_picker: Option<BasePicker>,
+    /// Transient picker-open failure (e.g. the repository could not be
+    /// opened), surfaced on the status line. Cleared on the next attempt.
+    picker_error: Option<String>,
     /// Memoized `visible_line_indices` (see [`VisibleCache`]).
     visible_cache: RefCell<VisibleCache>,
     /// Kitty-protocol image preview state for the selected file.
@@ -264,6 +287,7 @@ impl App {
             uncommitted_rev,
             last_origin: None,
             base_picker: None,
+            picker_error: None,
             visible_cache: RefCell::new(VisibleCache {
                 diff: None,
                 collapsed: HashSet::new(),
@@ -298,6 +322,7 @@ impl App {
             .then(|| self.top_visible_section())
             .flatten();
         let old_path = self.selected_path.clone();
+        let mut relocated = false;
 
         crate::perf_evt!(
             "snapshot seq={} tree={} diff={} hl={} busy={}",
@@ -331,13 +356,15 @@ impl App {
                 .flat
                 .get(self.selection)
                 .map(|&idx| self.tree.nodes[idx].path.clone());
-            let relocated = new_selected != old_path;
+            relocated = new_selected != old_path;
             self.selected_path = new_selected;
 
             // A relocation (the selected path vanished and a sibling was chosen)
-            // changes the selection without an input event; ask the worker for
-            // its diff so the pane never shows stale content.
+            // changes the selection without an input event; reset the per-file
+            // view state and ask the worker for its diff so the pane never
+            // shows stale content (or the dead file's section indices).
             if relocated {
+                self.reset_diff_view();
                 self.request_diff();
             }
         }
@@ -346,10 +373,15 @@ impl App {
         // (a recompute, context change, or rev switch). Progress-highlight
         // snapshots carry the same `Diff` Arc, so re-anchoring on them would
         // snap a mid-section scroll back that section's header instead of
-        // preserving the user's position.
-        match old_section {
-            Some(section) => self.reanchor_diff_scroll(section),
-            None => self.clamp_diff_scroll(),
+        // preserving the user's position. A relocation already reset the view,
+        // so it only needs a clamp.
+        if relocated {
+            self.clamp_diff_scroll();
+        } else {
+            match old_section {
+                Some(section) => self.reanchor_diff_scroll(section),
+                None => self.clamp_diff_scroll(),
+            }
         }
     }
 
@@ -379,9 +411,20 @@ impl App {
     /// Scroll so the header for `section` is at the top of the diff pane after
     /// a snapshot swap; fall back to clamping when the section is gone.
     fn reanchor_diff_scroll(&mut self, section: usize) {
-        let Some(diff) = self.snapshot.selected_diff.as_ref() else {
+        if self.snapshot.selected_diff.is_none() {
             self.diff_scroll = 0;
             return;
+        }
+        self.scroll_to_section_header(section);
+        self.clamp_diff_scroll();
+    }
+
+    /// Scroll `diff_scroll` to the line just below `section`'s header when that
+    /// header is visible. Returns whether the section was found. Shared by
+    /// re-anchoring after a snapshot swap and by cursor navigation.
+    fn scroll_to_section_header(&mut self, section: usize) -> bool {
+        let Some(diff) = self.diff() else {
+            return false;
         };
         let visible = self.visible_line_indices();
         if let Some(pos) = visible
@@ -389,8 +432,10 @@ impl App {
             .position(|&li| diff.lines[li].kind.is_header() && diff.lines[li].section == section)
         {
             self.diff_scroll = pos + 1;
+            true
+        } else {
+            false
         }
-        self.clamp_diff_scroll();
     }
 
     /// Bump `seq` and send `Request::Diff` for the currently-selected file at
@@ -551,6 +596,12 @@ impl App {
 
     /// Open the base picker populated from the repository's local branches.
     pub fn open_branch_picker(&mut self) {
+        self.picker_error = None;
+        // `local_branches` swallows the repo-open error into an empty list;
+        // probe once so the status line can explain why `b` did nothing.
+        if let Err(e) = crate::git::open_repo() {
+            self.picker_error = Some(format!("branches unavailable: {e}"));
+        }
         let entries = crate::git::local_branches()
             .into_iter()
             .map(|name| PickerEntry {
@@ -565,6 +616,7 @@ impl App {
     /// Commits diff against the full oid, tags against the tag name. The repo is
     /// opened once and shared by both listings.
     pub fn open_commit_picker(&mut self) {
+        self.picker_error = None;
         let entries = match crate::git::open_repo() {
             Ok(repo) => {
                 let commits =
@@ -585,7 +637,10 @@ impl App {
                     });
                 commits.chain(tags).collect()
             }
-            Err(_) => Vec::new(),
+            Err(e) => {
+                self.picker_error = Some(format!("commits unavailable: {e}"));
+                Vec::new()
+            }
         };
         self.open_commit_picker_with(entries);
     }
@@ -701,6 +756,11 @@ impl App {
 
     pub fn diff_error(&self) -> Option<&str> {
         self.snapshot.error.as_deref()
+    }
+
+    /// Transient picker-open failure message for the status line.
+    pub fn picker_error(&self) -> Option<&str> {
+        self.picker_error.as_deref()
     }
 
     pub fn branch_state(&self) -> &crate::git::BranchState {
@@ -1027,11 +1087,17 @@ impl App {
         let end = start
             .saturating_add(self.diff_page_size())
             .min(visible.len());
-        let sticky =
-            visible.iter().take(start).rev().find_map(|&li| {
-                (diff.lines[li].kind.is_header()).then_some(diff.lines[li].section)
-            });
-        if sticky == Some(section) {
+        // Mirror the render path: the pinned headers are the capped sticky pair,
+        // so a file+hunk pin can both count as "in view".
+        let headers = self.header_positions();
+        let pinned =
+            headers.sticky_pair_capped(start, self.diff_page_size().min(u16::MAX as usize) as u16);
+        let sticky_hit = [pinned.0, pinned.1].into_iter().flatten().any(|p| {
+            visible
+                .get(p)
+                .is_some_and(|&li| diff.lines[li].section == section)
+        });
+        if sticky_hit {
             return true;
         }
         visible[start..end]
@@ -1066,7 +1132,8 @@ impl App {
         if start == 0 {
             return 0;
         }
-        let (file_pos, hunk_pos) = headers.sticky_pair(start);
+        let body_height = self.diff_page_size().min(u16::MAX as usize) as u16;
+        let (file_pos, hunk_pos) = headers.sticky_pair_capped(start, body_height);
         usize::from(file_pos.is_some()) + usize::from(hunk_pos.is_some())
     }
 
@@ -1090,11 +1157,21 @@ impl App {
     }
 
     pub fn diff_scroll_right(&mut self, n: usize) {
-        let max = self
-            .max_visible_line_width()
+        self.diff_col = self.diff_col.saturating_add(n).min(self.max_diff_col());
+    }
+
+    /// Re-clamp `diff_col` against the current max. Call when the pane width
+    /// changes (a resize otherwise leaves the horizontal scroll past the new
+    /// maximum until the next `h`/`l`).
+    pub fn clamp_diff_col(&mut self) {
+        self.diff_col = self.diff_col.min(self.max_diff_col());
+    }
+
+    /// Largest valid horizontal scroll for the current diff and pane width.
+    fn max_diff_col(&self) -> usize {
+        self.max_visible_line_width()
             .saturating_sub(self.diff_width as usize)
-            .min(MAX_HSCROLL);
-        self.diff_col = self.diff_col.saturating_add(n).min(max);
+            .min(MAX_HSCROLL)
     }
 
     fn max_visible_line_width(&self) -> usize {
@@ -1242,16 +1319,10 @@ impl App {
     }
 
     fn snap_view_to_chunk(&mut self, section: usize) {
-        let Some(diff) = self.diff() else {
+        if self.diff().is_none() {
             return;
-        };
-        let visible = self.visible_line_indices();
-        if let Some(pos) = visible
-            .iter()
-            .position(|&li| diff.lines[li].kind.is_header() && diff.lines[li].section == section)
-        {
-            self.diff_scroll = pos + 1;
         }
+        self.scroll_to_section_header(section);
         self.active_chunk = Some(section);
         self.clamp_diff_scroll();
     }
@@ -1453,7 +1524,7 @@ fn relocate_selection(flat: &[usize], tree: &Tree, old_path: &Option<String>) ->
         .filter_map(|(pos, &idx)| {
             let n = &tree.nodes[idx];
             let node_parent = n.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-            (node_parent == parent).then(|| (n.name.clone(), pos))
+            (n.kind == tree::Kind::File && node_parent == parent).then(|| (n.name.clone(), pos))
         })
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1946,11 +2017,18 @@ mod tests {
 
     #[test]
     fn current_hunk_is_the_cursor() {
-        let mut app = sample_app();
-        app.active_chunk = Some(2);
-        assert_eq!(app.active_chunk, Some(2));
-        app.active_chunk = None;
-        assert_eq!(app.active_chunk, None);
+        let mut app = app_with_diff(fitting_hunk());
+        app.active_chunk = Some(1);
+
+        // The cursor operation must act on the active hunk, not its neighbours.
+        app.toggle_hunk_at_cursor();
+        assert!(app.collapsed_hunks.contains(&1));
+        assert!(!app.collapsed_hunks.contains(&0));
+        assert!(!app.collapsed_hunks.contains(&2));
+        assert_eq!(app.active_chunk, Some(1));
+
+        app.toggle_hunk_at_cursor();
+        assert!(!app.collapsed_hunks.contains(&1));
     }
 
     #[test]

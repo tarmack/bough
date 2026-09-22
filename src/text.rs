@@ -69,8 +69,12 @@ fn char_width(c: char) -> usize {
 }
 
 /// Display width of `s` in terminal cells (wide glyphs count as 2).
+///
+/// Measured with `Span::width` over the whole string, which handles grapheme
+/// clusters (ZWJ emoji, flags, variation selectors) the same way the renderer
+/// and `elide` do. Summing per-char widths would diverge for those.
 pub(crate) fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    Span::raw(s).width()
 }
 
 /// Drop up to `col` display cells from the front of `spans`, splitting the
@@ -144,7 +148,7 @@ pub fn render_centered(f: &mut Frame, area: Rect, text: &str, style: Style) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let w = text.chars().count() as u16;
+    let w = display_width(text).min(area.width as usize) as u16;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(1) / 2;
     let line = Line::styled(text.to_string(), style);

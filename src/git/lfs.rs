@@ -16,13 +16,26 @@ const LFS_MAGIC: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// 200 bytes; the cap keeps `find_blob` off large real content.
 pub(crate) const POINTER_MAX: u64 = 512;
 
-/// True when `bytes` opens with the LFS pointer spec-version line.
+/// True when `bytes` opens with the LFS pointer spec-version line. The magic
+/// line ends with LF, or CRLF on a Windows checkout, so a trailing `\r` is
+/// accepted.
 pub(crate) fn is_lfs_pointer(bytes: &[u8]) -> bool {
-    bytes.starts_with(LFS_MAGIC) && matches!(bytes.get(LFS_MAGIC.len()), None | Some(b'\n'))
+    bytes.starts_with(LFS_MAGIC) && matches!(bytes.get(LFS_MAGIC.len()), None | Some(b'\n' | b'\r'))
+}
+
+/// True when `value` is exactly 64 lowercase hex characters, i.e. a real
+/// sha256 digest as written by `git-lfs`. Rejecting anything else keeps a
+/// crafted `oid` line out of the diff header.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Parse an LFS pointer's `oid sha256:` digest (without the prefix) and `size`.
-/// Returns `None` when the bytes aren't a pointer or either field is missing.
+/// Returns `None` when the bytes aren't a pointer or either field is missing or
+/// malformed. The `oid` must be exactly 64 lowercase hex characters.
 pub(crate) fn lfs_pointer_info(bytes: &[u8]) -> Option<(String, u64)> {
     if !is_lfs_pointer(bytes) {
         return None;
@@ -32,7 +45,10 @@ pub(crate) fn lfs_pointer_info(bytes: &[u8]) -> Option<(String, u64)> {
     let mut size = None;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("oid sha256:") {
-            oid = Some(value.trim().to_string());
+            let value = value.trim();
+            if is_sha256_hex(value) {
+                oid = Some(value.to_string());
+            }
         } else if let Some(value) = line.strip_prefix("size ") {
             size = value.trim().parse().ok();
         }
@@ -97,16 +113,24 @@ impl<'repo> LfsMatcher<'repo> {
 
 /// Classify a changed path.
 ///
-/// A path is LFS when either known side's blob is a pointer — the old/base blob
-/// or the new-side blob (HEAD or index content when it is in the object
-/// database) — or, failing that, when the `filter=lfs` attribute matches the
-/// path. The attribute is the ground truth for LFS-tracking and is the only
-/// signal available for untracked or added files with no blobs.
+/// The new side decides when it is known: a new-side pointer is LFS and its
+/// metadata is reported (so a file converted *to* LFS stubs with the fresh
+/// pointer). A new side known to be a non-pointer is *not* LFS even if the old
+/// side is a pointer (the file was de-converted and now holds real content).
+/// Only when the new side is unknown (a worktree read, or a path with no new
+/// blob) does the old-side pointer, or failing that the `filter=lfs` attribute,
+/// mark the path as LFS. The attribute is the only signal for untracked or
+/// added files with no blobs.
 ///
-/// `new_id` is the new-side blob when it is known from the object database;
-/// pass `None` for worktree-side entries whose content is read from disk. When
-/// both sides are pointers the new side wins, so a converted file reports the
-/// freshly-converted pointer's metadata.
+/// `new_id` is the best-known new-side blob: the new blob for committed
+/// changes, or the HEAD blob for worktree-dirty entries (the content being
+/// replaced — its pointer-ness decides). Pass `None` only when no new-side
+/// blob exists at all (untracked/added files).
+///
+/// The pointer sniff does not require the `filter=lfs` attribute, so a
+/// committed document that merely starts with the magic line and carries a
+/// valid-looking pointer is stubbed as LFS; that wrong-stub trade-off avoids a
+/// worktree read. A malformed `oid` is rejected outright.
 pub(crate) fn detect(
     repo: &gix::Repository,
     matcher: &mut LfsMatcher<'_>,
@@ -114,17 +138,23 @@ pub(crate) fn detect(
     new_id: Option<gix::ObjectId>,
     path: &str,
 ) -> Option<LfsInfo> {
-    let old = old_id.and_then(|id| pointer_info(repo, id));
+    let new_known = new_id.is_some();
     let new = new_id.and_then(|id| pointer_info(repo, id));
-    if new.is_some() || old.is_some() {
-        return new.or(old);
+    if new.is_some() {
+        return new;
+    }
+    if new_known {
+        return None;
+    }
+    if let Some(old) = old_id.and_then(|id| pointer_info(repo, id)) {
+        return Some(old);
     }
     if !matcher.is_lfs_path(path) {
         return None;
     }
     let size = repo
         .workdir()
-        .and_then(|root| std::fs::metadata(root.join(path)).ok())
+        .and_then(|root| std::fs::symlink_metadata(root.join(path)).ok())
         .map(|meta| meta.len())
         .unwrap_or(0);
     Some(LfsInfo {
@@ -219,5 +249,83 @@ size 12345678\n";
         let info = detect(&repo, &mut matcher, Some(old), Some(new), "data.bin").unwrap();
         assert_eq!(info.oid, OID);
         assert_eq!(info.size, 999);
+    }
+
+    #[test]
+    fn deconverted_file_is_not_lfs() {
+        // Old pointer, new real content: the file is no longer LFS, so it must
+        // not be stubbed with the stale pointer metadata.
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        crate::git::test_util::run_git(dir.path(), &["config", "user.email", "t@e"]);
+        crate::git::test_util::run_git(dir.path(), &["config", "user.name", "T"]);
+
+        const OID: &str = "4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393";
+        let pointer =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{OID}\nsize 999\n");
+        std::fs::write(dir.path().join("data.bin"), pointer).unwrap();
+        crate::git::test_util::run_git(dir.path(), &["add", "."]);
+        crate::git::test_util::run_git(dir.path(), &["commit", "-m", "pointer"]);
+
+        std::fs::write(dir.path().join("data.bin"), "real content, not a pointer\n").unwrap();
+        crate::git::test_util::run_git(dir.path(), &["add", "."]);
+        crate::git::test_util::run_git(dir.path(), &["commit", "-m", "text"]);
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let old = crate::git::resolve_id(&repo, "HEAD~1:data.bin").unwrap();
+        let new = crate::git::resolve_id(&repo, "HEAD:data.bin").unwrap();
+        let mut matcher = LfsMatcher::new(&repo);
+        assert!(detect(&repo, &mut matcher, Some(old), Some(new), "data.bin").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_oid() {
+        // A crafted/uppercase/wrong-length digest must not be accepted (it
+        // would otherwise render in the diff header).
+        let bad = |oid: &str| {
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 1\n")
+                .into_bytes()
+        };
+        assert!(lfs_pointer_info(&bad("ABCDEF")).is_none());
+        assert!(lfs_pointer_info(&bad(&"a".repeat(63))).is_none());
+        assert!(lfs_pointer_info(&bad(&"A".repeat(64))).is_none());
+        assert!(lfs_pointer_info(&bad(&"g".repeat(64))).is_none());
+        // The magic alone still sniffs as a pointer candidate.
+        assert!(is_lfs_pointer(&bad(&"A".repeat(64))));
+        // A valid lowercase digest is still accepted.
+        assert!(lfs_pointer_info(&bad(&"a".repeat(64))).is_some());
+    }
+
+    #[test]
+    fn accepts_crlf_pointer() {
+        let crlf = format!(
+            "version https://git-lfs.github.com/spec/v1\r\n\
+oid sha256:{}\r\nsize 7\r\n",
+            "a".repeat(64)
+        );
+        assert!(is_lfs_pointer(crlf.as_bytes()));
+        let (oid, size) = lfs_pointer_info(crlf.as_bytes()).unwrap();
+        assert_eq!(oid, "a".repeat(64));
+        assert_eq!(size, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attribute_fallback_reads_link_itself() {
+        // The size fallback must stat the link itself, not its target.
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::test_util::repo_with_commits(dir.path(), &["one"]);
+        std::fs::write(dir.path().join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        crate::git::test_util::run_git(dir.path(), &["add", "."]);
+        crate::git::test_util::run_git(dir.path(), &["commit", "-m", "attrs"]);
+
+        std::fs::write(dir.path().join("target.bin"), "x".repeat(100)).unwrap();
+        std::os::unix::fs::symlink("target.bin", dir.path().join("link.bin")).unwrap();
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let mut matcher = LfsMatcher::new(&repo);
+        let info = detect(&repo, &mut matcher, None, None, "link.bin").unwrap();
+        assert!(info.oid.is_empty());
+        assert_eq!(info.size, "target.bin".len() as u64);
     }
 }

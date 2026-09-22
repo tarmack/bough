@@ -44,8 +44,9 @@ pub struct DiffLine {
     /// body lines name the hunk (or file) section they sit in.
     pub section: usize,
     /// Word-level runs, set on Added/Removed lines when LCS word-diff was
-    /// applied to the adjacent pair; `None` otherwise. The same shared vector
-    /// is assigned to both members of a paired removed/added block.
+    /// applied to the adjacent pair; `None` otherwise. Both members of a
+    /// paired removed/added block carry their own equal copy of the runs
+    /// (`apply_word_pairs` clones them per line).
     pub word_runs: Option<Vec<WordRun>>,
 }
 
@@ -192,33 +193,55 @@ impl Diff {
             .position(|x| x.kind == SectionKind::File && x.file == file)
     }
 
-    /// Assemble a multi-file (directory) diff from a list of single-file
-    /// diffs, in document order. Each `file_diffs` entry must be a single-file
-    /// `Diff` (one file, hunk sections only); the result carries a `File`
-    /// section plus a `FileHeader` body row per file under a summary header.
-    /// Children are borrowed behind `Arc`, so streaming a growing directory
-    /// aggregate never deep-clones the already-built child diffs.
-    pub fn from_directory(path: &str, file_diffs: &[Arc<Diff>]) -> Diff {
-        let mut files = Vec::new();
-        let mut sections = Vec::new();
-        let mut lines = Vec::new();
+    /// An empty directory aggregate for `path`: no files, sections or lines,
+    /// with a zeroed summary header. Extend it with
+    /// [`Diff::extend_from_children`].
+    pub fn directory(path: &str) -> Diff {
+        Diff {
+            header: FileHeader {
+                path: path.to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                added: 0,
+                deleted: 0,
+                rename_percent: None,
+                mode_old: None,
+                mode_new: None,
+                binary: false,
+                lfs: None,
+                hunks: Vec::new(),
+            },
+            files: Vec::new(),
+            sections: Vec::new(),
+            lines: Vec::new(),
+        }
+    }
 
-        for (file, d) in file_diffs.iter().enumerate() {
-            debug_assert_eq!(d.files.len(), 1, "from_directory expects single-file diffs");
-            debug_assert!(
-                d.sections.iter().all(|s| s.kind == SectionKind::Hunk),
-                "from_directory expects hunk-only sections"
-            );
-            files.push(d.header.clone());
+    /// Append single-file diffs to a directory aggregate, in document order.
+    ///
+    /// Each child must be a single-file `Diff` (one file, hunk-only sections);
+    /// an invalid child is skipped in every build (debug builds assert) rather
+    /// than silently mis-merged. Each child's hunk sections and body lines are
+    /// re-homed under its own `File` section and its counts fold into the
+    /// summary header. Appending only the new children is what makes a growing
+    /// aggregate linear rather than rebuilt from scratch per chunk.
+    pub fn extend_from_children(&mut self, file_diffs: &[Arc<Diff>]) {
+        for d in file_diffs {
+            if d.files.len() != 1 || d.sections.iter().any(|s| s.kind != SectionKind::Hunk) {
+                debug_assert!(false, "from_directory expects single-file diffs");
+                continue;
+            }
+            let file = self.files.len();
+            self.files.push(d.header.clone());
 
             // A `File` section opens this file's block.
-            let file_section = sections.len();
-            sections.push(Section {
+            let file_section = self.sections.len();
+            self.sections.push(Section {
                 kind: SectionKind::File,
                 file,
                 hunk: None,
             });
-            lines.push(DiffLine {
+            self.lines.push(DiffLine {
                 kind: LineKind::FileHeader,
                 raw_text: d.header.path.clone(),
                 section: file_section,
@@ -228,37 +251,36 @@ impl Diff {
             // Re-home the file's hunk sections and body lines under this file:
             // hunk sections (originally 0..N) become file_section+1.. and every
             // line's `section` shifts by the same base.
-            let base = sections.len();
+            let base = self.sections.len();
             for &section in &d.sections {
-                sections.push(Section { file, ..section });
+                self.sections.push(Section { file, ..section });
             }
             for line in &d.lines {
                 let mut line = line.clone();
                 line.section += base;
-                lines.push(line);
+                self.lines.push(line);
             }
-        }
 
-        let header = FileHeader {
-            path: path.to_string(),
-            old_path: None,
-            status: FileStatus::Modified,
-            added: files.iter().map(|f| f.added).sum(),
-            deleted: files.iter().map(|f| f.deleted).sum(),
-            rename_percent: None,
-            mode_old: None,
-            mode_new: None,
-            binary: files.iter().any(|f| f.binary),
-            lfs: None,
-            hunks: Vec::new(),
-        };
-
-        Diff {
-            header,
-            files,
-            sections,
-            lines,
+            self.header.added += d.header.added;
+            self.header.deleted += d.header.deleted;
+            self.header.binary |= d.header.binary;
         }
+    }
+
+    /// Assemble a multi-file (directory) diff from a list of single-file
+    /// diffs, in document order. Equivalent to [`Diff::directory`] followed by
+    /// [`Diff::extend_from_children`].
+    ///
+    /// Note that each child's body lines are copied into the aggregate (the
+    /// children themselves are borrowed behind `Arc`, but their content is
+    /// not shared); streaming callers that build a directory in chunks should
+    /// instead keep one aggregate and call [`Diff::extend_from_children`] with
+    /// only the newly arrived children.
+    #[cfg(test)]
+    pub fn from_directory(path: &str, file_diffs: &[Arc<Diff>]) -> Diff {
+        let mut diff = Diff::directory(path);
+        diff.extend_from_children(file_diffs);
+        diff
     }
 }
 
@@ -273,6 +295,14 @@ const WORD_DIFF_MAX_RUNS: usize = 6;
 /// word diff is abandoned and the renderer falls back to a plain tint.
 const WORD_DIFF_MAX_TOKENS: usize = 256;
 
+/// Upper bound on either line's byte length before word-level diff. A line
+/// longer than this is almost certainly a machine-generated one-liner whose
+/// word diff would be useless and whose tokenization (one `String` per token)
+/// would only be thrown away; bailing first avoids that allocation entirely.
+/// Set well above the byte span of a typical [`WORD_DIFF_MAX_TOKENS`]-token
+/// line so ordinary long lines still get word highlighting.
+const WORD_DIFF_MAX_BYTES: usize = WORD_DIFF_MAX_TOKENS * 16;
+
 /// Tokenize a line into word runs for LCS comparison.
 ///
 /// Each character falls into one of three token classes — word
@@ -281,7 +311,10 @@ const WORD_DIFF_MAX_TOKENS: usize = 256;
 /// whitespace out of punctuation keeps a line like `"fn main() {}"` split as
 /// `["fn", " ", "main", "()", " ", "{}"]`, so whitespace boundaries are
 /// preserved while punctuation clusters stay whole.
-fn tokenize_words(text: &str) -> Vec<String> {
+///
+/// Returns `None` as soon as more than [`WORD_DIFF_MAX_TOKENS`] tokens have
+/// formed, so a heavily tokenized line is never fully materialized.
+fn tokenize_words(text: &str) -> Option<Vec<String>> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut cur_cat: Option<TokenCat> = None;
@@ -295,6 +328,9 @@ fn tokenize_words(text: &str) -> Vec<String> {
             Some(c) if c == cat => cur.push(ch),
             Some(_) => {
                 tokens.push(std::mem::take(&mut cur));
+                if tokens.len() > WORD_DIFF_MAX_TOKENS {
+                    return None;
+                }
                 cur.push(ch);
                 cur_cat = Some(cat);
             }
@@ -302,8 +338,11 @@ fn tokenize_words(text: &str) -> Vec<String> {
     }
     if !cur.is_empty() {
         tokens.push(cur);
+        if tokens.len() > WORD_DIFF_MAX_TOKENS {
+            return None;
+        }
     }
-    tokens
+    Some(tokens)
 }
 
 /// Character token class. Whitespace is split out of punctuation so that a
@@ -332,14 +371,16 @@ fn classify_char(c: char) -> TokenCat {
 /// [`WORD_DIFF_MAX_RUNS`]; `None` (caller falls back to a plain tint) when the
 /// line was rewritten too heavily.
 fn word_diff(old: &str, new: &str) -> Option<Vec<WordRun>> {
-    let old_tokens = tokenize_words(old);
-    let new_tokens = tokenize_words(new);
-    let n = old_tokens.len();
-    let m = new_tokens.len();
-
-    if n > WORD_DIFF_MAX_TOKENS || m > WORD_DIFF_MAX_TOKENS {
+    // Bail on oversized lines before tokenizing: the token vectors would be
+    // allocated only to be discarded (see WORD_DIFF_MAX_BYTES).
+    if old.len() > WORD_DIFF_MAX_BYTES || new.len() > WORD_DIFF_MAX_BYTES {
         return None;
     }
+    let old_tokens = tokenize_words(old)?;
+    let new_tokens = tokenize_words(new)?;
+    let n = old_tokens.len();
+    let m = new_tokens.len();
+    // `tokenize_words` already caps each side at WORD_DIFF_MAX_TOKENS.
 
     // LCS length of old_tokens[i..] and new_tokens[j..], stored flat in a
     // single `(n + 1) * (m + 1)` table at `dp[i * stride + j]`. The LCS is at
@@ -477,7 +518,7 @@ mod tests {
     fn tokenizes_fn_main() {
         // `()` and `{}` are each a single non-word run, hence kept whole.
         assert_eq!(
-            tokenize_words("fn main() {}"),
+            tokenize_words("fn main() {}").unwrap(),
             vec!["fn", " ", "main", "()", " ", "{}"]
         );
     }
@@ -525,7 +566,7 @@ mod tests {
         // 128 word tokens + 128 space tokens == the exact cap; the flattened
         // table allocation must work at the boundary.
         let line = "a ".repeat(WORD_DIFF_MAX_TOKENS / 2);
-        assert_eq!(tokenize_words(&line).len(), WORD_DIFF_MAX_TOKENS);
+        assert_eq!(tokenize_words(&line).unwrap().len(), WORD_DIFF_MAX_TOKENS);
         assert_eq!(
             word_diff(&line, &line),
             Some(vec![WordRun {
@@ -534,6 +575,23 @@ mod tests {
                 kind: LineKind::Context,
             }])
         );
+    }
+
+    #[test]
+    fn tokenize_words_bails_past_cap() {
+        // One token over the cap aborts tokenization rather than building the
+        // whole (potentially enormous) vector.
+        let line = "a ".repeat(WORD_DIFF_MAX_TOKENS);
+        assert!(tokenize_words(&line).is_none());
+    }
+
+    #[test]
+    fn word_diff_bails_on_oversized_line() {
+        // A multi-megabyte one-liner must be rejected before tokenizing; a
+        // single word of this length is one token, so only the byte cap stops
+        // it from being copied whole.
+        let huge = "a".repeat(WORD_DIFF_MAX_BYTES + 1);
+        assert_eq!(word_diff(&huge, &huge), None);
     }
 
     fn line(kind: LineKind, text: &str) -> DiffLine {
@@ -546,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_word_pairs_shares_runs_between_pair() {
+    fn apply_word_pairs_equal_runs_between_pair() {
         let mut lines = vec![line(LineKind::Removed, "foo"), line(LineKind::Added, "bar")];
         apply_word_pairs(&mut lines);
         assert_eq!(lines[0].word_runs, lines[1].word_runs);
@@ -696,5 +754,88 @@ mod tests {
         assert_eq!(diff.header.added, 2);
         assert_eq!(diff.header.deleted, 1);
         assert!(diff.header.binary);
+    }
+
+    #[test]
+    fn directory_extend_from_children_matches_one_shot() {
+        // Appending children incrementally must produce exactly the same
+        // aggregate as passing them all at once.
+        let children: Vec<Arc<Diff>> = (0..5)
+            .map(|i| Arc::new(single_file(&format!("f{i}.rs"), i, i)))
+            .collect();
+        let one_shot = Diff::from_directory("src", &children);
+
+        let mut incremental = Diff::directory("src");
+        for child in &children {
+            incremental.extend_from_children(std::slice::from_ref(child));
+        }
+        assert_eq!(one_shot, incremental);
+    }
+
+    /// Perf harness for the streaming directory aggregate. Run with
+    /// `cargo test --release directory_chunk_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf harness; run manually in release"]
+    fn directory_chunk_cost_900_files() {
+        use std::time::Instant;
+
+        // 900 synthetic single-file diffs of 60 body lines each.
+        let big = |i: usize| -> Arc<Diff> {
+            let header = FileHeader {
+                path: format!("f{i:04}.rs"),
+                old_path: None,
+                status: FileStatus::Modified,
+                added: 30,
+                deleted: 30,
+                rename_percent: None,
+                mode_old: None,
+                mode_new: None,
+                binary: false,
+                lfs: None,
+                hunks: vec![HunkMeta {
+                    added: 30,
+                    deleted: 30,
+                }],
+            };
+            let lines = (0..60)
+                .map(|k| DiffLine {
+                    kind: LineKind::Context,
+                    raw_text: format!("line {k} of file {i} with some content"),
+                    section: 0,
+                    word_runs: None,
+                })
+                .collect();
+            Arc::new(Diff {
+                header: header.clone(),
+                files: vec![header],
+                sections: vec![Section {
+                    kind: SectionKind::Hunk,
+                    file: 0,
+                    hunk: Some(0),
+                }],
+                lines,
+            })
+        };
+        let children: Vec<Arc<Diff>> = (0..900).map(big).collect();
+        const CHUNK: usize = 25;
+
+        // Old shape: rebuild the whole aggregate from every accumulated child.
+        let t = Instant::now();
+        let mut lines = 0;
+        for k in (CHUNK..=children.len()).step_by(CHUNK) {
+            lines = Diff::from_directory("src", &children[..k]).lines.len();
+        }
+        let old = t.elapsed();
+
+        // New shape: append only the newly arrived chunk.
+        let t = Instant::now();
+        let mut aggregate = Diff::directory("src");
+        for k in (CHUNK..=children.len()).step_by(CHUNK) {
+            aggregate.extend_from_children(&children[k - CHUNK..k]);
+        }
+        let new = t.elapsed();
+        assert_eq!(aggregate.lines.len(), lines);
+
+        eprintln!("900-file directory chunk cost: from_directory={old:?} incremental={new:?}");
     }
 }

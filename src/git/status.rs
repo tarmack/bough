@@ -15,8 +15,8 @@ use gix::{diff, progress};
 use crate::diff::FileStatus;
 use crate::git::lfs::{self, LfsMatcher};
 use crate::git::{
-    diff_resource_cache, odb_resource_cache, open_repo, resolve_id, set_blob_resources,
-    set_odb_resources, FileMeta, GitError,
+    diff_resource_cache, entry_kind_for, odb_resource_cache, open_repo, resolve_id,
+    set_blob_resources, set_odb_resources, worktree_entry_kind, FileMeta, GitError,
 };
 
 /// A single changed file's details, enough to derive the tree listing, the
@@ -79,7 +79,7 @@ pub fn file_meta_untracked(path: &str) -> Result<FileMeta, GitError> {
     let mut cache = diff_resource_cache(&repo)?;
     let mut lfs = LfsMatcher::new(&repo);
     let (added, deleted, binary) =
-        count_worktree_changes(&mut cache, &mut lfs, &repo, None, None, path)?;
+        count_worktree_changes(&mut cache, &mut lfs, &repo, (None, None), None, path)?;
     Ok(FileMeta {
         status: FileStatus::Added,
         added,
@@ -193,6 +193,17 @@ struct UnstagedChange {
 /// worktree only for paths that actually differ from HEAD; a committed-only
 /// change is diffed entirely from the object database, so a clean worktree
 /// reads no file content and runs no content filters.
+///
+/// Precedence (scenario → status / diff sides):
+/// - committed `D` present in index/worktree → the re-add's status, base → present content;
+/// - committed `D` absent everywhere → `D`, base → empty (ODB);
+/// - committed `A` removed from worktree → `D`, empty (no worktree read);
+/// - other committed → committed status, base → worktree when dirty else HEAD;
+/// - staged `rm --cached` (index `D`, file still on disk) → `A`, base → worktree;
+/// - staged `D` with the file gone → `D`, base → empty (no worktree read);
+/// - other staged → staged status, base → worktree;
+/// - unstaged → its status, index → worktree;
+/// - untracked → `A`, empty → worktree.
 pub(crate) fn collect_changes(
     repo: &gix::Repository,
     revision: &str,
@@ -218,17 +229,32 @@ pub(crate) fn collect_changes(
     paths.extend(unstaged.keys().cloned());
     paths.extend(untracked.iter().cloned());
 
+    // The on-disk index distinguishes an absent path (a real committed
+    // deletion) from one re-added to the index.
+    let index = repo.index_or_empty().ok();
+
     let mut changes = Vec::with_capacity(paths.len());
     for path in paths {
         let c = committed.remove(&path);
         let s = staged.remove(&path);
         let u = unstaged.remove(&path);
+        let is_untracked = untracked.contains(&path);
+        let worktree_present =
+            is_untracked || u.as_ref().is_some_and(|u| u.status != FileStatus::Deleted);
         let worktree_dirty = s.is_some() || u.is_some();
+        let index_has = index.as_ref().is_some_and(|index| {
+            index
+                .entry_by_path(gix::bstr::BStr::new(path.as_bytes()))
+                .is_some()
+        });
 
         // Resolve the status and the diff sides. The committed kind wins when
-        // present (a worktree edit on a file committed as `A` stays `A`). A path
-        // in the dirty set but not committed compares HEAD against the worktree;
-        // a committed path compares base against the worktree when dirty, else
+        // present (a worktree edit on a file committed as `A` stays `A`), except
+        // where the committed record would hide content that is actually
+        // present: a committed deletion whose path was re-added/recreated, or a
+        // committed addition whose file was removed from the worktree. A path in
+        // the dirty set but not committed compares HEAD against the worktree; a
+        // committed path compares base against the worktree when dirty, else
         // entirely from the object database.
         let (
             status,
@@ -242,26 +268,132 @@ pub(crate) fn collect_changes(
             use_worktree,
             force_zero,
         ) = if let Some(c) = c {
-            let deleted = c.status == FileStatus::Deleted;
-            let use_worktree = !deleted && worktree_dirty;
-            let odb_new = if use_worktree { None } else { c.new_id };
-            (
-                c.status,
-                c.old_id,
-                odb_new,
-                c.new_id,
-                c.old_path,
-                c.rename_percent,
-                c.mode_old,
-                c.mode_new,
-                use_worktree,
-                false,
-            )
+            match c.status {
+                FileStatus::Deleted if index_has || worktree_present => {
+                    // Re-added to the index or recreated in the worktree: diff
+                    // the base content against what is present now.
+                    if let Some(s) = s {
+                        let use_worktree = worktree_present;
+                        (
+                            s.status,
+                            c.old_id,
+                            if use_worktree { None } else { s.new_id },
+                            s.new_id,
+                            s.old_path,
+                            None,
+                            s.mode_old.or(c.mode_old),
+                            s.mode_new,
+                            use_worktree,
+                            false,
+                        )
+                    } else if let Some(u) = u {
+                        (
+                            u.status,
+                            c.old_id,
+                            None,
+                            None,
+                            u.old_path,
+                            u.rename_percent,
+                            u.mode_old.or(c.mode_old),
+                            u.mode_new,
+                            true,
+                            u.conflicted,
+                        )
+                    } else {
+                        (
+                            FileStatus::Added,
+                            c.old_id,
+                            None,
+                            None,
+                            None,
+                            None,
+                            c.mode_old,
+                            worktree_mode(repo, &path),
+                            true,
+                            false,
+                        )
+                    }
+                }
+                FileStatus::Deleted => (
+                    c.status,
+                    c.old_id,
+                    None,
+                    c.new_id,
+                    c.old_path,
+                    c.rename_percent,
+                    c.mode_old,
+                    c.mode_new,
+                    false,
+                    false,
+                ),
+                // Added in HEAD but removed from the worktree: the net
+                // base→worktree change is empty, so report the worktree
+                // deletion rather than a phantom addition with zero stats.
+                FileStatus::Added
+                    if u.as_ref().is_some_and(|u| u.status == FileStatus::Deleted) =>
+                {
+                    (
+                        FileStatus::Deleted,
+                        c.old_id,
+                        None,
+                        c.new_id,
+                        c.old_path,
+                        c.rename_percent,
+                        c.mode_old,
+                        c.mode_new,
+                        false,
+                        true,
+                    )
+                }
+                _ => {
+                    let use_worktree = worktree_dirty;
+                    (
+                        c.status,
+                        c.old_id,
+                        if use_worktree { None } else { c.new_id },
+                        c.new_id,
+                        c.old_path,
+                        c.rename_percent,
+                        c.mode_old,
+                        c.mode_new,
+                        use_worktree,
+                        false,
+                    )
+                }
+            }
         } else if let Some(s) = s {
-            (
-                s.status, s.old_id, None, s.new_id, s.old_path, None, s.mode_old, s.mode_new, true,
-                false,
-            )
+            if s.status == FileStatus::Deleted {
+                if is_untracked {
+                    // `git rm --cached`: the file is still on disk and shows as
+                    // untracked; keep one row as the added content the user
+                    // actually sees instead of a deletion that would read the
+                    // worktree.
+                    (
+                        FileStatus::Added,
+                        s.old_id,
+                        if worktree_present { None } else { s.new_id },
+                        s.new_id,
+                        s.old_path,
+                        None,
+                        s.mode_old,
+                        worktree_mode(repo, &path),
+                        worktree_present,
+                        false,
+                    )
+                } else {
+                    // A real staged deletion: diff entirely from the object
+                    // database, with no worktree read.
+                    (
+                        s.status, s.old_id, None, s.new_id, s.old_path, None, s.mode_old,
+                        s.mode_new, false, false,
+                    )
+                }
+            } else {
+                (
+                    s.status, s.old_id, None, s.new_id, s.old_path, None, s.mode_old, s.mode_new,
+                    true, false,
+                )
+            }
         } else if let Some(u) = u {
             (
                 u.status,
@@ -274,6 +406,19 @@ pub(crate) fn collect_changes(
                 u.mode_new,
                 true,
                 u.conflicted,
+            )
+        } else if is_untracked {
+            (
+                FileStatus::Added,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                worktree_mode(repo, &path),
+                true,
+                false,
             )
         } else {
             (
@@ -296,9 +441,23 @@ pub(crate) fn collect_changes(
         let counted = if force_zero {
             Ok((0, 0, false))
         } else if use_worktree {
-            count_worktree_changes(&mut wt_cache, &mut lfs, repo, old_id, hint, &path)
+            count_worktree_changes(
+                &mut wt_cache,
+                &mut lfs,
+                repo,
+                (old_id, mode_old),
+                hint,
+                &path,
+            )
         } else {
-            count_odb_changes(&mut odb_cache, &mut lfs, repo, old_id, odb_new, &path)
+            count_odb_changes(
+                &mut odb_cache,
+                &mut lfs,
+                repo,
+                (old_id, mode_old),
+                (odb_new, mode_new),
+                &path,
+            )
         };
         let (added, deleted, binary) = counted.unwrap_or((0, 0, false));
         wt_cache.clear_resource_cache_keep_allocation();
@@ -453,9 +612,10 @@ fn committed_changes(
     Ok(map)
 }
 
-/// The staged set: changes between HEAD's tree and the on-disk index. Degrades
-/// to an empty set when the comparison is unavailable (e.g. path validation
-/// rejects a tracked name) rather than blanking the whole listing.
+/// The staged set: changes between HEAD's tree and the on-disk index. When the
+/// comparison stops early (e.g. path validation rejects a tracked name), the
+/// entries already produced are kept — a failure degrades per-path rather than
+/// blanking the whole listing.
 fn staged_changes(
     repo: &gix::Repository,
     head_tree: &gix::ObjectId,
@@ -530,7 +690,9 @@ fn staged_changes(
             }
             diff::index::Change::Rewrite {
                 source_location,
+                source_entry_mode,
                 source_id,
+                entry_mode,
                 location,
                 id,
                 copy,
@@ -547,17 +709,17 @@ fn staged_changes(
                         old_id: Some(source_id.into_owned()),
                         new_id: Some(id.into_owned()),
                         old_path: Some(source_location.to_string()),
-                        mode_old: None,
-                        mode_new: None,
+                        mode_old: Some(source_entry_mode.bits()),
+                        mode_new: Some(entry_mode.bits()),
                     },
                 );
             }
         }
         Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
     });
-    if result.is_err() {
-        map.clear();
-    }
+    // Keep whatever was collected before an early stop: one rejected path must
+    // not discard the staged changes already found.
+    let _ = result;
     map
 }
 
@@ -608,12 +770,13 @@ fn unstaged_changes(
                         old_path: None,
                         rename_percent: None,
                         mode_old: Some(entry.mode.bits()),
-                        mode_new: Some(entry.mode.bits()),
+                        mode_new: None,
                         conflicted: false,
                     },
                 );
             }
             (IWItem::Modification { entry, .. }, Summary::TypeChange) => {
+                let mode_new = worktree_mode(repo, &path);
                 map.insert(
                     path,
                     UnstagedChange {
@@ -622,12 +785,13 @@ fn unstaged_changes(
                         old_path: None,
                         rename_percent: None,
                         mode_old: Some(entry.mode.bits()),
-                        mode_new: Some(entry.mode.bits()),
+                        mode_new,
                         conflicted: false,
                     },
                 );
             }
             (IWItem::Modification { entry, .. }, Summary::Modified) => {
+                let mode_new = worktree_mode(repo, &path);
                 map.insert(
                     path,
                     UnstagedChange {
@@ -636,7 +800,7 @@ fn unstaged_changes(
                         old_path: None,
                         rename_percent: None,
                         mode_old: Some(entry.mode.bits()),
-                        mode_new: Some(entry.mode.bits()),
+                        mode_new,
                         conflicted: false,
                     },
                 );
@@ -760,43 +924,66 @@ pub(crate) fn base_tree_id(
     Ok(tree.detach())
 }
 
-/// Count added/deleted lines and detect binary by diffing the blob at `old_id`
-/// (or the empty blob when `None`) against the worktree content at `path`. This
-/// is the only scan path that reads worktree content, so it may run content
-/// filters (e.g. `git lfs clean`). `new_hint` is the new-side blob when known
-/// from the object database, used solely to classify LFS without a worktree
-/// read.
+/// One side of a blob diff: its object id (absent when empty) and git mode.
+type DiffSide = (Option<gix::ObjectId>, Option<u32>);
+
+/// Count added/deleted lines and detect binary by diffing the blob on `old`
+/// (or the empty blob when its id is absent) against the worktree content at
+/// `path`. This is the only scan path that reads worktree content, so it may
+/// run content filters (e.g. `git lfs clean`). `new_hint` is the new-side blob
+/// when known from the object database, used solely to classify LFS without a
+/// worktree read.
 fn count_worktree_changes(
     cache: &mut diff::blob::Platform,
     lfs: &mut LfsMatcher<'_>,
     repo: &gix::Repository,
-    old_id: Option<gix::ObjectId>,
+    old: DiffSide,
     new_hint: Option<gix::ObjectId>,
     path: &str,
 ) -> Result<(usize, usize, bool), GitError> {
+    let (old_id, mode_old) = old;
     if lfs::detect(repo, lfs, old_id, new_hint, path).is_some() {
         return Ok((0, 0, true));
     }
-    set_blob_resources(cache, repo, old_id, path)?;
+    let old_kind = entry_kind_for(mode_old);
+    let Some(new_kind) = worktree_entry_kind(repo, path) else {
+        return Ok((0, 0, true));
+    };
+    // A submodule is a commit, not a blob; never read it as content.
+    if old_kind == gix::object::tree::EntryKind::Commit
+        || new_kind == gix::object::tree::EntryKind::Commit
+    {
+        return Ok((0, 0, true));
+    }
+    set_blob_resources(cache, repo, old_id, old_kind, path, new_kind)?;
     finish_count(cache, path)
 }
 
 /// Count added/deleted lines and detect binary for an object-database-only diff
-/// of the blobs at `old_id` and `new_id` (each the empty blob when `None`). No
-/// worktree content is read and no content filter runs. LFS pointers are
-/// reported as `(0, 0, binary)`.
+/// of the blobs on `old` and `new` (each the empty blob when its id is absent).
+/// No worktree content is read and no content filter runs. LFS pointers and
+/// submodules are reported as `(0, 0, binary)`.
 fn count_odb_changes(
     cache: &mut diff::blob::Platform,
     lfs: &mut LfsMatcher<'_>,
     repo: &gix::Repository,
-    old_id: Option<gix::ObjectId>,
-    new_id: Option<gix::ObjectId>,
+    old: DiffSide,
+    new: DiffSide,
     path: &str,
 ) -> Result<(usize, usize, bool), GitError> {
+    let (old_id, mode_old) = old;
+    let (new_id, mode_new) = new;
     if lfs::detect(repo, lfs, old_id, new_id, path).is_some() {
         return Ok((0, 0, true));
     }
-    set_odb_resources(cache, repo, old_id, new_id, path)?;
+    let old_kind = entry_kind_for(mode_old);
+    let new_kind = entry_kind_for(mode_new);
+    if old_kind == gix::object::tree::EntryKind::Commit
+        || new_kind == gix::object::tree::EntryKind::Commit
+    {
+        return Ok((0, 0, true));
+    }
+    set_odb_resources(cache, repo, old_id, old_kind, new_id, new_kind, path)?;
     finish_count(cache, path)
 }
 
@@ -886,9 +1073,21 @@ fn workdir_path(repo: &gix::Repository, path: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(path))
 }
 
+/// The git mode bits of a worktree path's destination side: the worktree's real
+/// mode, not the index entry's, so a `chmod +x` is not reported as unchanged.
+/// A non-regular or missing entry yields `None`.
+fn worktree_mode(repo: &gix::Repository, path: &str) -> Option<u32> {
+    worktree_entry_kind(repo, path).map(|kind| u32::from(kind as u16))
+}
+
 /// Count the lines (LF) in a regular file; 0 when it is missing, is not a
 /// regular file (so symlinks, FIFOs and devices are never followed or read), or
 /// cannot be read. At most [`MAX_COUNT_BYTES`] are read.
+///
+/// The cap is a *read* cap, not a line guarantee: a file larger than
+/// [`MAX_COUNT_BYTES`] is counted only up to it. The count is display-only for
+/// the initial-commit listing; binary detection is done elsewhere, so counting
+/// `\n` bytes here is not a claim that the file is text.
 fn line_count(path: &Path) -> usize {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return 0;
@@ -962,47 +1161,38 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_worktree_file_does_not_abort_scan() {
-        // One file whose content cannot be read must not blank the tree. The
-        // untracked one degrades to a zero-stat entry; the modified one is
-        // rejected by the scanner itself (no path info on the item error) and
-        // is skipped — either way the scan must succeed for the rest.
-        // (Runs as root both stay readable and the assertions still hold.)
+        // An untracked file whose content cannot be read must still be listed,
+        // with zero stats, rather than aborting the scan. The fixture is
+        // verified actually unreadable; only a privileged runner (where 0o000
+        // is bypassed) skips.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commits(dir.path(), &["one"]);
         let repo = gix::discover(dir.path()).unwrap();
 
-        // A modified tracked file and an untracked file, both unreadable.
-        std::fs::write(dir.path().join("file0.txt"), "changed\n").unwrap();
-        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        let path = dir.path().join("new.txt");
+        std::fs::write(&path, "hello\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            dir.path().join("file0.txt"),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            dir.path().join("new.txt"),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            eprintln!(
+                "skipping unreadable_worktree_file_does_not_abort_scan: could not make the fixture unreadable (privileged runner)"
+            );
+            return;
+        }
 
         let changes = collect_changes(&repo, "HEAD").unwrap();
-        let by_path: HashMap<_, _> = changes.into_iter().map(|c| (c.path.clone(), c)).collect();
-        assert!(
-            by_path.contains_key("new.txt"),
-            "unreadable untracked file must still appear: {by_path:?}"
-        );
-        // When the modified file is listed at all, its stats degrade to zero
-        // rather than aborting.
-        if let Some(c) = by_path.get("file0.txt") {
-            assert_eq!((c.added, c.deleted), (0, 0));
-        }
+        let by_path = by_path(changes);
+        let entry = by_path
+            .get("new.txt")
+            .expect("an unreadable untracked file must still appear");
+        assert_eq!((entry.added, entry.deleted), (0, 0));
     }
 
     #[test]
     fn windows_illegal_filename_does_not_abort_listing() {
         // A name with a `:` is legal on Linux but rejected by gix's default
-        // (protect_windows) path validation. bough must still list changes.
+        // (protect_windows) path validation. bough must still list changes,
+        // including the illegal name itself.
         let dir = tempfile::tempdir().unwrap();
         let repo = gix::init(dir.path()).unwrap();
         let run = |args: &[&str]| {
@@ -1020,13 +1210,18 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-m", "c"]);
 
-        // Modify a tracked file so there is a change to report.
+        // Modify both so each has a change to report.
+        std::fs::write(dir.path().join("a:b.txt"), "one\ntwo\n").unwrap();
         std::fs::write(dir.path().join("plain.txt"), "one\ntwo\n").unwrap();
 
         let changes = collect_changes(&repo, "HEAD").unwrap();
-        let by_path: HashMap<_, _> = changes.into_iter().map(|c| (c.path.clone(), c)).collect();
+        let by_path = by_path(changes);
         assert!(by_path.contains_key("plain.txt"));
         assert_eq!(by_path["plain.txt"].status, FileStatus::Modified);
+        assert!(
+            by_path.contains_key("a:b.txt"),
+            "the illegal filename must still be listed: {by_path:?}"
+        );
     }
 
     #[test]
@@ -1462,5 +1657,137 @@ mod tests {
         let renamed = &changes["new.txt"];
         assert_eq!(renamed.status, FileStatus::Renamed);
         assert_eq!(renamed.old_path.as_deref(), Some("old.txt"));
+    }
+
+    /// `main` deletes `file0.txt` on `feature`; callers then re-add it. Returns
+    /// the repo on `feature` with the deletion committed.
+    fn repo_with_committed_deletion(dir: &Path) {
+        crate::git::test_util::run_git(dir, &["config", "user.email", "t@e"]);
+        crate::git::test_util::run_git(dir, &["config", "user.name", "T"]);
+        std::fs::write(dir.join("file0.txt"), "one\n").unwrap();
+        crate::git::test_util::run_git(dir, &["add", "."]);
+        crate::git::test_util::run_git(dir, &["commit", "-m", "base"]);
+        crate::git::test_util::run_git(dir, &["branch", "-m", "main"]);
+        crate::git::test_util::run_git(dir, &["checkout", "-b", "feature"]);
+        crate::git::test_util::run_git(dir, &["rm", "file0.txt"]);
+        crate::git::test_util::run_git(dir, &["commit", "-m", "delete"]);
+    }
+
+    #[test]
+    fn committed_deletion_readded_to_index_reports_present_content() {
+        // A committed deletion must not win when the path was re-added to the
+        // index: diff base content against the present content instead.
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        repo_with_committed_deletion(dir.path());
+        std::fs::write(dir.path().join("file0.txt"), "one\ntwo\n").unwrap();
+        crate::git::test_util::run_git(dir.path(), &["add", "file0.txt"]);
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let changes = by_path(collect_changes(&repo, "main...HEAD").unwrap());
+        let f = &changes["file0.txt"];
+        assert_eq!(f.status, FileStatus::Added);
+        assert_eq!((f.added, f.deleted), (1, 0));
+    }
+
+    #[test]
+    fn committed_deletion_recreated_in_worktree_reports_present_content() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        repo_with_committed_deletion(dir.path());
+        // Recreated but not staged: it shows up as untracked.
+        std::fs::write(dir.path().join("file0.txt"), "one\ntwo\n").unwrap();
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let changes = by_path(collect_changes(&repo, "main...HEAD").unwrap());
+        let f = &changes["file0.txt"];
+        assert_eq!(f.status, FileStatus::Added);
+        assert_eq!((f.added, f.deleted), (1, 0));
+    }
+
+    #[test]
+    fn committed_addition_removed_from_worktree_reports_deleted() {
+        // Net base→worktree is empty; report the worktree deletion rather than a
+        // phantom addition with zero stats.
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        crate::git::test_util::run_git(dir.path(), &["config", "user.email", "t@e"]);
+        crate::git::test_util::run_git(dir.path(), &["config", "user.name", "T"]);
+        std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+        crate::git::test_util::run_git(dir.path(), &["add", "."]);
+        crate::git::test_util::run_git(dir.path(), &["commit", "-m", "base"]);
+        crate::git::test_util::run_git(dir.path(), &["branch", "-m", "main"]);
+        crate::git::test_util::run_git(dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        crate::git::test_util::run_git(dir.path(), &["add", "new.txt"]);
+        crate::git::test_util::run_git(dir.path(), &["commit", "-m", "add"]);
+        std::fs::remove_file(dir.path().join("new.txt")).unwrap();
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let changes = by_path(collect_changes(&repo, "main...HEAD").unwrap());
+        let f = &changes["new.txt"];
+        assert_eq!(f.status, FileStatus::Deleted);
+        assert_eq!((f.added, f.deleted), (0, 0));
+    }
+
+    #[test]
+    fn rm_cached_file_reports_added_with_content() {
+        // `git rm --cached` leaves the file on disk; the single row should show
+        // the added content the user sees, not a deletion.
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        crate::git::test_util::run_git(dir.path(), &["config", "user.email", "t@e"]);
+        crate::git::test_util::run_git(dir.path(), &["config", "user.name", "T"]);
+        std::fs::write(dir.path().join("file0.txt"), "one\n").unwrap();
+        crate::git::test_util::run_git(dir.path(), &["add", "."]);
+        crate::git::test_util::run_git(dir.path(), &["commit", "-m", "base"]);
+        crate::git::test_util::run_git(dir.path(), &["rm", "--cached", "file0.txt"]);
+        std::fs::write(dir.path().join("file0.txt"), "one\ntwo\n").unwrap();
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let changes = by_path(collect_changes(&repo, "HEAD").unwrap());
+        let f = &changes["file0.txt"];
+        assert_eq!(f.status, FileStatus::Added);
+        assert_eq!((f.added, f.deleted), (1, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unstaged_mode_change_reports_worktree_mode() {
+        // chmod +x is a worktree-only change; the destination mode must come
+        // from the worktree, otherwise both sides read as 100644.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["one"]);
+        std::fs::set_permissions(
+            dir.path().join("file0.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let changes = by_path(collect_changes(&repo, "HEAD").unwrap());
+        let f = &changes["file0.txt"];
+        assert_eq!(f.status, FileStatus::Modified);
+        assert_eq!(f.mode_old.unwrap() & 0o111, 0);
+        assert_ne!(
+            f.mode_new.expect("worktree mode") & 0o111,
+            0,
+            "the executable bit must be visible in the destination mode"
+        );
+    }
+
+    #[test]
+    fn staged_rename_carries_both_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commits(dir.path(), &["one"]);
+        crate::git::test_util::run_git(dir.path(), &["mv", "file0.txt", "renamed.txt"]);
+
+        let repo = gix::discover(dir.path()).unwrap();
+        let changes = by_path(collect_changes(&repo, "HEAD").unwrap());
+        let f = &changes["renamed.txt"];
+        assert_eq!(f.status, FileStatus::Renamed);
+        assert_eq!(f.mode_old, Some(0o100644));
+        assert_eq!(f.mode_new, Some(0o100644));
     }
 }

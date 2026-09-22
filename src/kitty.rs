@@ -153,9 +153,12 @@ pub fn place(
     let b64 = STANDARD.encode(png);
     let chunks: Vec<&[u8]> = b64.as_bytes().chunks(CHUNK_B64).collect();
     if chunks.is_empty() {
-        let control = format!("a=T,f=100,t=d,C=1,i={id},s={src_w},v={src_h},c={c},r={r},m=0,q=1");
-        write!(w, "\x1b_G{};\x1b\\", control)?;
-        return Ok(());
+        // An empty payload would transmit an empty (`m=0;` with no data) frame,
+        // which kitty rejects. Reject it here instead.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty png payload",
+        ));
     }
 
     let n = chunks.len();
@@ -278,6 +281,16 @@ mod tests {
         assert!(parts.len() > 1);
         assert!(parts[1].starts_with("\x1b_Gm=1;"));
         assert!(parts.last().unwrap().contains("m=0;"));
+    }
+
+    #[test]
+    fn place_rejects_empty_payload() {
+        let mut out = Vec::new();
+        let err = place(&mut out, 1, b"", 1, 1, Rect::new(0, 0, 1, 1), (10, 20)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // No payload frame was emitted (only the leading cursor move).
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("\x1b_G"), "unexpected escape: {s:?}");
     }
 
     #[test]
