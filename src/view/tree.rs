@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::app::{App, Mode, Origin};
+use crate::app::{App, FooterZone, Mode, Origin};
 use crate::diff::FileStatus;
 use crate::theme;
 use crate::theme::Focus;
@@ -178,7 +178,9 @@ pub fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
 /// `Uncommitted`), mirroring vim's mode colors. The *shape* of the change
 /// (file count, per-status breakdown) lives in the tree pane's header, next
 /// to the list it summarizes.
-pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>) {
+pub fn render_footer(f: &mut Frame, app: &mut App, area: Rect, message: Option<&str>) {
+    // Rebuilt from scratch every frame so a hidden pill leaves no stale hitbox.
+    app.mouse.footer_zones.clear();
     if area.width < 8 || area.height < 1 {
         return;
     }
@@ -295,7 +297,6 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>
     let pill_cap = |end: &'static str, color: Color| {
         Span::styled(end, Style::default().fg(color).bg(Color::DarkGray))
     };
-    let mut right: Vec<Span<'static>> = Vec::new();
     // The branch's divergence from the origin, shown inside the source part
     // between the two branches it compares — `feature/x 3 ⇄ 1  vs main`:
     // the source-side count first (next to its name), the origin-side count
@@ -317,35 +318,41 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>
         }
         out
     };
+    let mut source: Vec<Span<'static>> = Vec::new();
     if let Some(name) = &state.name {
-        right.push(pill_cap(CAP_LEFT, Color::Magenta));
-        right.push(Span::styled(
+        source.push(pill_cap(CAP_LEFT, Color::Magenta));
+        source.push(Span::styled(
             format!(" \u{f418} {name} "),
             on_pill(Color::Magenta),
         ));
-        right = divergence(right);
+        source = divergence(source);
         // The source's purple flows into the origin's mode color.
-        right.push(Span::styled(
+        source.push(Span::styled(
             CAP_RIGHT,
             Style::default().fg(Color::Magenta).bg(mode_bg),
         ));
     } else if state.unpushed.is_some() || state.base.is_some() {
         // Detached HEAD: a source part without a branch name.
-        right.push(pill_cap(CAP_LEFT, Color::Magenta));
-        right.push(Span::styled(" (detached) ", on_pill(Color::Magenta)));
-        right = divergence(right);
-        right.push(Span::styled(
+        source.push(pill_cap(CAP_LEFT, Color::Magenta));
+        source.push(Span::styled(" (detached) ", on_pill(Color::Magenta)));
+        source = divergence(source);
+        source.push(Span::styled(
             CAP_RIGHT,
             Style::default().fg(Color::Magenta).bg(mode_bg),
         ));
-    } else {
-        // No branch state yet (initial frame): the origin part alone.
-        right.push(pill_cap(CAP_LEFT, mode_bg));
     }
-    right.push(Span::styled(format!(" {label} "), on_pill(mode_bg)));
-    right.push(pill_cap(CAP_RIGHT, mode_bg));
-    let right = Line::from(right);
 
+    let mut mode: Vec<Span<'static>> = Vec::new();
+    if source.is_empty() {
+        // No branch state yet (initial frame): the origin part alone.
+        mode.push(pill_cap(CAP_LEFT, mode_bg));
+    }
+    mode.push(Span::styled(format!(" {label} "), on_pill(mode_bg)));
+    mode.push(pill_cap(CAP_RIGHT, mode_bg));
+
+    app.mouse.footer_zones = footer_pill_zones(area, &source, &mode);
+
+    let right = Line::from(source.into_iter().chain(mode).collect::<Vec<_>>());
     draw_aligned(f, area.x, area.y, area.width, &left, Some(&right));
 }
 
@@ -357,6 +364,48 @@ fn bar_style() -> Style {
 /// Powerline rounded chip caps, shared with the diff pane's header tabs.
 const CAP_LEFT: &str = crate::theme::CAP_LEFT;
 const CAP_RIGHT: &str = crate::theme::CAP_RIGHT;
+
+/// Hitboxes for the footer's right pill, one per part in draw order. `source`
+/// precedes `mode`; either may be empty. The pill is right-aligned like
+/// [`draw_aligned`], so when it overflows the pane only its leading columns
+/// survive: zones clip to `area`, and a fully-clipped part is dropped.
+fn footer_pill_zones(area: Rect, source: &[Span], mode: &[Span]) -> Vec<(FooterZone, Rect)> {
+    if area.height == 0 {
+        return Vec::new();
+    }
+    let source_w = Line::from(source.to_vec()).width();
+    let mode_w = Line::from(mode.to_vec()).width();
+    let total = source_w + mode_w;
+    if total == 0 {
+        return Vec::new();
+    }
+    let drawn = total.min(area.width as usize) as u16;
+    let edge = area.x.saturating_add(area.width);
+    let x = area.x + area.width.saturating_sub(drawn);
+
+    let mut zones = Vec::new();
+    let mut push = |zone: FooterZone, x0: u16, w: usize| {
+        let end = x0.saturating_add(u16::try_from(w).unwrap_or(u16::MAX));
+        if x0 >= edge || end <= x0 {
+            return;
+        }
+        zones.push((
+            zone,
+            Rect::new(x0, area.y, end.min(edge).saturating_sub(x0), 1),
+        ));
+    };
+    if source_w > 0 {
+        push(FooterZone::Source, x, source_w);
+    }
+    if mode_w > 0 {
+        push(
+            FooterZone::Mode,
+            x.saturating_add(u16::try_from(source_w).unwrap_or(u16::MAX)),
+            mode_w,
+        );
+    }
+    zones
+}
 
 /// Draw `left` left-aligned at the pane origin and `right` right-aligned at
 /// the pane's right edge, leaving one separating cell, over `width` columns.
@@ -511,8 +560,9 @@ mod tests {
         assert_eq!(buf.cell((54, 1)).unwrap().bg, Color::Rgb(0x34, 0x35, 0x2f));
     }
 
-    #[test]
-    fn branch_footer_renders() {
+    /// A snapshot carrying a `feature/x` branch tracking `main`, ready for
+    /// footer/pill assertions.
+    fn branch_snapshot() -> crate::snapshot::ArcSnapshot {
         let mut snap = sample_snapshot(crate::tree::Tree::build(vec![('M', "x.rs".to_string())]));
         Arc::get_mut(&mut snap).unwrap().branch_state = crate::git::BranchState {
             name: Some("feature/x".into()),
@@ -522,13 +572,23 @@ mod tests {
             upstream: Some("origin/feature/x".into()),
             unpushed: Some(2),
         };
-        let mut app = App::new(
-            snap,
+        snap
+    }
+
+    /// An `App` over [`branch_snapshot`].
+    fn branch_app() -> App {
+        App::new(
+            branch_snapshot(),
             crossbeam_channel::bounded::<crate::snapshot::Request>(4).0,
             false,
             "main...HEAD".to_string(),
             "HEAD".to_string(),
-        );
+        )
+    }
+
+    #[test]
+    fn branch_footer_renders() {
+        let mut app = branch_app();
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| super::super::ui(f, &mut app)).unwrap();
@@ -716,5 +776,84 @@ mod tests {
             .collect();
         assert!(header.contains("no changes"), "{header}");
         assert!(!header.contains("scanning"), "{header}");
+    }
+
+    #[test]
+    fn footer_records_pill_zones() {
+        let mut app = branch_app();
+        render(&mut app);
+        let zones = &app.mouse.footer_zones;
+        assert_eq!(zones.len(), 2, "{zones:?}");
+        let source = zones
+            .iter()
+            .find(|(z, _)| *z == FooterZone::Source)
+            .expect("source zone")
+            .1;
+        let mode = zones
+            .iter()
+            .find(|(z, _)| *z == FooterZone::Mode)
+            .expect("mode zone")
+            .1;
+
+        assert_eq!(source.y, 23);
+        assert_eq!(mode.y, 23);
+        assert_eq!(source.height, 1);
+        assert_eq!(mode.height, 1);
+        // Source sits left of Mode with no overlap, both inside the terminal.
+        assert!(source.x + source.width <= mode.x, "{zones:?}");
+        assert!(mode.x + mode.width <= 80, "{zones:?}");
+        // Mode = leading space + label + trailing space + closing cap, in
+        // display cells (`Line::width`), not `chars()` — wide glyphs diverge.
+        let expected = Line::from(vec![
+            Span::raw(format!(" {} ", app.mode_label())),
+            Span::raw(CAP_RIGHT),
+        ])
+        .width();
+        assert_eq!(mode.width as usize, expected, "{zones:?}");
+    }
+
+    #[test]
+    fn footer_zones_empty_when_footer_does_not_draw() {
+        let mut app = branch_app();
+        // Below the footer's own 8-column minimum: nothing draws, no hitboxes.
+        let mut terminal = Terminal::new(TestBackend::new(7, 24)).unwrap();
+        terminal.draw(|f| super::super::ui(f, &mut app)).unwrap();
+        assert!(app.mouse.footer_zones.is_empty());
+    }
+
+    #[test]
+    fn footer_zones_clip_when_pill_overflows() {
+        let mut app = branch_app();
+        // Pill wider than the pane: it draws from the left edge and clips, so
+        // the mode part falls off-screen and only a clipped source survives.
+        let mut terminal = Terminal::new(TestBackend::new(12, 24)).unwrap();
+        terminal.draw(|f| super::super::ui(f, &mut app)).unwrap();
+        let zones = &app.mouse.footer_zones;
+        assert_eq!(zones.len(), 1, "{zones:?}");
+        assert_eq!(zones[0].0, FooterZone::Source);
+        assert_eq!(zones[0].1, Rect::new(0, 23, 12, 1));
+    }
+
+    #[test]
+    fn footer_zones_record_with_busy_and_message() {
+        let mut snap = branch_snapshot();
+        {
+            let s = Arc::get_mut(&mut snap).unwrap();
+            s.busy = true;
+            s.error = Some("boom".into());
+        }
+        let mut app = App::new(
+            snap,
+            crossbeam_channel::bounded::<crate::snapshot::Request>(4).0,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let buf = render(&mut app);
+        assert_eq!(app.mouse.footer_zones.len(), 2, "pill draws while busy");
+        let bar: String = (0..80)
+            .map(|x| buf.cell((x, 23)).unwrap().symbol().to_string())
+            .collect();
+        assert!(bar.contains("boom"), "bar: {bar}");
     }
 }

@@ -14,6 +14,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::app::{App, CONTEXT_STEP, HSCROLL_STEP};
@@ -270,6 +271,7 @@ pub fn run(
     let mut worker_dead = false;
     let mut redraw = Redraw::new();
     let mut last_beat = Instant::now();
+    let mut flash_live = false;
     loop {
         if last_beat.elapsed() >= Duration::from_secs(1) {
             perf::beat();
@@ -285,6 +287,18 @@ pub fn run(
         }
         app.maybe_request_highlight();
 
+        // `status_line` drops a stale flash only on the next draw, and the idle
+        // wait never wakes for its expiry. Catch the fresh→stale transition to
+        // force that draw, and cap the wait so it lands right after expiry.
+        let flash_fresh = app
+            .flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < view::FLASH_TTL);
+        if flash_live && !flash_fresh {
+            redraw.mark();
+        }
+        flash_live = flash_fresh;
+
         if redraw.take() {
             terminal.draw(|f| view::ui(f, app))?;
             perf::tally(Counter::Draws);
@@ -292,7 +306,12 @@ pub fn run(
             perf::tally(Counter::PreviewSyncs);
         }
 
-        let timeout = if app.is_busy() { BUSY_POLL } else { IDLE_POLL };
+        let mut timeout = if app.is_busy() { BUSY_POLL } else { IDLE_POLL };
+        if flash_fresh {
+            if let Some((_, at)) = &app.flash {
+                timeout = timeout.min(view::FLASH_TTL.saturating_sub(at.elapsed()));
+            }
+        }
         let wake = classify_wake(events.recv_timeout(timeout));
         perf::tally(Counter::PollWakes);
         match wake {
@@ -343,40 +362,138 @@ pub fn run(
     Ok(())
 }
 
+/// True when `column` lies in the tree pane. The diff pane owns
+/// `[0, diff_width)` and the one-column divider sits at `diff_width`, so the
+/// tree starts after it.
+fn in_tree_pane(app: &App, column: u16) -> bool {
+    column >= app.diff_width.saturating_add(1)
+}
+
+/// True when `(column, row)` falls inside `rect`. `None` is never inside.
+fn rect_contains(rect: Option<Rect>, column: u16, row: u16) -> bool {
+    rect.is_some_and(|r| {
+        column >= r.x
+            && column < r.x.saturating_add(r.width)
+            && row >= r.y
+            && row < r.y.saturating_add(r.height)
+    })
+}
+
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
-    // A preview covers the diff pane: hunk hit-testing and diff scrolling
-    // would target invisible content, so ignore events over that pane. Tree
-    // scrolls (the right pane) still work.
-    if app.preview.active() && mouse.column < app.diff_width {
+    // An open base picker owns the mouse: every event is consumed while it is
+    // up, so nothing falls through to the panes underneath.
+    if app.base_picker.is_some() {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                app.click_picker(mouse.column, mouse.row);
+            }
+            MouseEventKind::ScrollUp => app.picker_scroll(true),
+            MouseEventKind::ScrollDown => app.picker_scroll(false),
+            MouseEventKind::Down(MouseButton::Right) => app.close_picker(),
+            // A picker opened mid-drag swallows the release; cancel the drag
+            // so no later Up can copy a stale range.
+            MouseEventKind::Up(MouseButton::Left) => app.cancel_diff_selection(),
+            _ => {}
+        }
         return;
     }
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        // Left-click inside the diff pane on a hunk header toggles it.
-        if mouse.column < app.diff_width {
-            if let Some(hunk) = app.hunk_at_screen_row(mouse.row) {
-                app.toggle_hunk(hunk);
-                return;
+
+    let column = mouse.column;
+    let row = mouse.row;
+    let in_footer = rect_contains(app.mouse.footer, column, row);
+
+    // A release ends an in-progress diff drag even if a preview appeared
+    // mid-drag: the preview gate below would otherwise swallow it and leave the
+    // anchor live, so the next Up anywhere would copy a stale range.
+    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+        && app.diff_selection.anchor.is_some()
+    {
+        app.finish_diff_selection();
+        return;
+    }
+
+    // A preview covers the diff pane: hunk hit-testing and diff scrolling
+    // would target invisible content. The footer row and the tree pane are
+    // outside the preview, so they stay interactive.
+    if app.preview.active() && column < app.diff_width && !in_footer {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if in_footer {
+                app.click_footer(column, false);
+            } else if in_tree_pane(app, column) {
+                // Any click in the tree pane — header strip, entry, or empty
+                // space below — focuses the tree pane.
+                app.focus = Focus::Tree;
+                if rect_contains(app.mouse.tree_list, column, row) {
+                    app.click_tree_row(row);
+                }
+            } else if column < app.diff_width {
+                // A click on a hunk header toggles it; otherwise it starts a
+                // linewise text selection (or, past the last line, just
+                // focuses the pane).
+                if let Some(hunk) = app.hunk_at_screen_row(row) {
+                    app.toggle_hunk(hunk);
+                } else if !app.begin_diff_selection(row) {
+                    app.focus = Focus::Diff;
+                }
             }
         }
-        return; // clicks outside a toggleable header do nothing
-    }
-    match mouse.kind {
-        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {}
-        _ => return,
-    }
-    let tree_start = app.diff_width.saturating_add(1);
-    let in_tree = mouse.column >= tree_start;
-    let direction = matches!(mouse.kind, MouseEventKind::ScrollUp);
-    if in_tree {
-        if direction {
-            app.move_up(1);
-        } else {
-            app.move_down(1);
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if column < app.diff_width && !in_footer {
+                app.extend_diff_selection(row);
+            }
         }
-    } else if direction {
-        app.diff_scroll_up(1);
-    } else {
-        app.diff_scroll_down(1);
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Releases reaching here have no live drag anchor (the pre-gate
+            // handler above finishes those); nothing to do.
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if in_footer {
+                app.click_footer(column, true);
+            } else if in_tree_pane(app, column) && rect_contains(app.mouse.tree_list, column, row) {
+                app.copy_tree_path(row);
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if in_footer {
+                return;
+            }
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            // Shift+wheel scrolls the diff horizontally: most terminals
+            // translate a horizontal wheel (or Shift+wheel) into
+            // Shift+vertical events, never native `ScrollLeft`/`ScrollRight`.
+            if mouse.modifiers.contains(KeyModifiers::SHIFT) && column < app.diff_width {
+                if up {
+                    app.diff_scroll_left(HSCROLL_STEP);
+                } else {
+                    app.diff_scroll_right(HSCROLL_STEP);
+                }
+                return;
+            }
+            let over_tree =
+                rect_contains(app.mouse.tree_list, column, row) || in_tree_pane(app, column);
+            if over_tree {
+                if up {
+                    app.move_up(1);
+                } else {
+                    app.move_down(1);
+                }
+            } else if up {
+                app.diff_scroll_up(1);
+            } else {
+                app.diff_scroll_down(1);
+            }
+        }
+        MouseEventKind::ScrollLeft if column < app.diff_width => {
+            app.diff_scroll_left(HSCROLL_STEP);
+        }
+        MouseEventKind::ScrollRight if column < app.diff_width => {
+            app.diff_scroll_right(HSCROLL_STEP);
+        }
+        _ => {}
     }
 }
 
@@ -594,7 +711,7 @@ fn focus_key(key: KeyEvent, app: &mut App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{FileHeader, FileStatus, HunkMeta};
+    use crate::diff::{DiffLine, FileHeader, FileStatus, HunkMeta, LineKind};
     use crate::test_support::*;
     use ratatui::backend::TestBackend;
 
@@ -1660,5 +1777,521 @@ mod tests {
             &mut app
         ));
         assert_eq!(app.selection, 0);
+    }
+
+    /// A synthetic mouse event with no modifiers.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// An `App` with two files and a live request channel; the initial `Diff`
+    /// request is drained so later requests are unambiguous.
+    fn routed_app() -> (App, Receiver<crate::snapshot::Request>) {
+        let tree =
+            crate::tree::Tree::build(vec![('M', "a.rs".to_string()), ('M', "b.rs".to_string())]);
+        let (tx, rx) = crossbeam_channel::bounded::<crate::snapshot::Request>(8);
+        let mut app = App::new(
+            crate::test_support::sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.selection = 0;
+        let _ = rx.try_recv();
+        (app, rx)
+    }
+
+    #[test]
+    fn mouse_click_tree_row_routes_to_selection() {
+        let (mut app, rx) = routed_app();
+        app.mouse.tree_list = Some(Rect::new(40, 1, 39, 10));
+        // row 2 → idx = tree_scroll(0) + (2 - 1) = 1 → b.rs.
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 45, 2),
+            &mut app,
+        );
+        assert_eq!(app.selection, 1);
+        assert_eq!(app.focus, Focus::Tree);
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::Diff { path, .. } => assert_eq!(path, "b.rs"),
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_over_tree_moves_selection() {
+        let (mut app, _rx) = routed_app();
+        app.mouse.tree_list = Some(Rect::new(40, 1, 39, 10));
+        handle_mouse(mouse(MouseEventKind::ScrollDown, 45, 3), &mut app);
+        assert_eq!(app.selection, 1);
+        handle_mouse(mouse(MouseEventKind::ScrollUp, 45, 3), &mut app);
+        assert_eq!(app.selection, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_over_diff_scrolls() {
+        let mut app = sample_app();
+        app.focus = Focus::Diff;
+        app.selected_path = Some("x.rs".into());
+        app.snapshot = snapshot_with_diff(single_diff(
+            header_full(None, None),
+            std::iter::once(hunk_header(0))
+                .chain((0..20).map(|i| ctx_line(i, 0)))
+                .collect(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| view::ui(f, &mut app)).unwrap();
+        app.diff_scroll = 0;
+
+        handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 5), &mut app);
+        assert!(app.diff_scroll > 0);
+        let down = app.diff_scroll;
+        handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 5), &mut app);
+        assert!(app.diff_scroll < down);
+    }
+
+    #[test]
+    fn mouse_horizontal_scroll_over_diff() {
+        let mut app = sample_app();
+        app.focus = Focus::Diff;
+        app.selected_path = Some("x.rs".into());
+        app.snapshot = snapshot_with_diff(single_diff(
+            header_full(None, None),
+            vec![
+                hunk_header(0),
+                DiffLine {
+                    kind: LineKind::Context,
+                    raw_text: "y".repeat(300),
+                    section: 0,
+                    word_runs: None,
+                },
+                ctx_line(1, 0),
+            ],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| view::ui(f, &mut app)).unwrap();
+        app.diff_col = 0;
+
+        handle_mouse(mouse(MouseEventKind::ScrollRight, 0, 5), &mut app);
+        assert!(app.diff_col > 0, "ScrollRight shows content further right");
+        handle_mouse(mouse(MouseEventKind::ScrollLeft, 0, 5), &mut app);
+        assert_eq!(app.diff_col, 0);
+        handle_mouse(mouse(MouseEventKind::ScrollLeft, 0, 5), &mut app);
+        assert_eq!(app.diff_col, 0, "clamped at the left edge");
+    }
+
+    /// A body line with the given kind and raw text, in hunk 0.
+    fn marked(kind: LineKind, raw: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            raw_text: raw.into(),
+            section: 0,
+            word_runs: None,
+        }
+    }
+
+    /// A rendered app with a four-line single-file diff, so `line_at_screen_row`
+    /// is live: screen row 1 is the hunk header, row 2.. line 1..3.
+    fn selection_app() -> App {
+        let mut app = sample_app();
+        app.focus = Focus::Diff;
+        app.selected_path = Some("x.rs".into());
+        app.snapshot = snapshot_with_diff(single_diff(
+            header_full(None, None),
+            vec![
+                hunk_header(0),
+                marked(LineKind::Added, "one"),
+                marked(LineKind::Context, "two"),
+                marked(LineKind::Removed, "three"),
+            ],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| view::ui(f, &mut app)).unwrap();
+        app.diff_scroll = 0;
+        app.diff_selection = Default::default();
+        app
+    }
+
+    #[test]
+    fn mouse_drag_over_diff_selects_and_up_copies() {
+        let mut app = selection_app();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 2),
+            &mut app,
+        );
+        assert_eq!(app.diff_selection.range, Some((1, 1)));
+
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut app,
+        );
+        assert_eq!(app.diff_selection.range, Some((1, 3)));
+
+        handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 4), &mut app);
+        assert_eq!(app.diff_selection.range, Some((1, 3)), "highlight survives");
+        let (msg, _) = app.flash.clone().expect("flash set");
+        assert_eq!(msg, "copied 3 lines");
+    }
+
+    #[test]
+    fn mouse_plain_click_over_diff_clears_selection() {
+        let mut app = selection_app();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 2),
+            &mut app,
+        );
+        handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 2), &mut app);
+        assert!(app.diff_selection.range.is_none());
+        assert!(app.flash.is_none());
+    }
+
+    #[test]
+    fn mouse_drag_while_preview_active_is_ignored() {
+        let mut app = selection_app();
+        app.preview.enabled = true;
+        app.preview.current = Some(PreviewImage {
+            path: "x.png".into(),
+            png: Vec::new(),
+            width: 1,
+            height: 1,
+        });
+        app.diff_selection.range = Some((1, 1));
+        app.diff_selection.anchor = Some(1);
+
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut app,
+        );
+        assert_eq!(app.diff_selection.range, Some((1, 1)), "preview consumes");
+        assert!(!app.diff_selection.dragged);
+
+        // A release over the diff pane still ends the (non-dragged) selection
+        // even though the preview gate would otherwise swallow it.
+        handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 4), &mut app);
+        assert!(app.diff_selection.anchor.is_none());
+        assert!(app.diff_selection.range.is_none());
+        assert!(
+            app.flash.is_none(),
+            "a non-dragged selection copies nothing"
+        );
+    }
+
+    #[test]
+    fn mouse_up_over_diff_with_preview_finishes_drag() {
+        let mut app = selection_app();
+        // Start and extend a real drag while the preview is inactive.
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 2),
+            &mut app,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut app,
+        );
+        assert_eq!(app.diff_selection.range, Some((1, 3)));
+        assert!(app.diff_selection.dragged);
+        assert!(app.diff_selection.anchor.is_some());
+
+        // A preview arrives mid-drag: the release over the diff pane must still
+        // finish the drag instead of leaving the anchor live for a later Up to
+        // copy a stale range.
+        app.preview.enabled = true;
+        app.preview.current = Some(PreviewImage {
+            path: "x.png".into(),
+            png: Vec::new(),
+            width: 1,
+            height: 1,
+        });
+        handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 4), &mut app);
+        assert!(app.diff_selection.anchor.is_none(), "no stale anchor");
+        assert!(!app.diff_selection.dragged);
+        assert_eq!(app.diff_selection.range, Some((1, 3)), "highlight survives");
+        let (msg, _) = app.flash.clone().expect("flash set");
+        assert_eq!(msg, "copied 3 lines");
+    }
+
+    #[test]
+    fn mouse_up_outside_diff_still_finishes_drag() {
+        let mut app = selection_app();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 2),
+            &mut app,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut app,
+        );
+        // Release over the tree pane (column >= diff_width + 1).
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 60, 4),
+            &mut app,
+        );
+        let (msg, _) = app.flash.clone().expect("flash set");
+        assert_eq!(msg, "copied 3 lines");
+    }
+
+    #[test]
+    fn mouse_right_click_tree_copies_path() {
+        let (mut app, _rx) = routed_app();
+        app.mouse.tree_list = Some(Rect::new(40, 1, 39, 10));
+        // row 2 → idx 1 → b.rs.
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 45, 2),
+            &mut app,
+        );
+        let (msg, _) = app.flash.clone().expect("flash set");
+        assert!(msg.contains("b.rs"), "flash names the copied path: {msg}");
+    }
+
+    #[test]
+    fn mouse_footer_left_click_mode_cycles() {
+        let (mut app, rx) = routed_app();
+        app.mouse.footer = Some(Rect::new(0, 19, 80, 1));
+        app.mouse.footer_zones = vec![(crate::app::FooterZone::Mode, Rect::new(60, 19, 8, 1))];
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 62, 19),
+            &mut app,
+        );
+        assert_eq!(app.mode, crate::app::Mode::Uncommitted);
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_footer_right_click_source_opens_commit_picker() {
+        let (mut app, _rx) = routed_app();
+        app.mouse.footer = Some(Rect::new(0, 19, 80, 1));
+        app.mouse.footer_zones = vec![(crate::app::FooterZone::Source, Rect::new(0, 19, 20, 1))];
+        assert!(app.base_picker.is_none());
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 5, 19),
+            &mut app,
+        );
+        assert_eq!(
+            app.base_picker.as_ref().map(|p| p.title.as_str()),
+            Some(" compare against a commit or tag ")
+        );
+    }
+
+    #[test]
+    fn mouse_click_inside_picker_picks_and_closes() {
+        let (mut app, rx) = picker_app();
+        app.mouse.picker = Some(crate::app::PickerGeometry {
+            popup: Rect::new(0, 0, 20, 6),
+            inner: Rect::new(1, 1, 18, 4),
+            first_row: 0,
+        });
+        // inner.y = 1, so row 2 is entry 1 (`feature`).
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 3, 2),
+            &mut app,
+        );
+        assert!(app.base_picker.is_none());
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_click_outside_picker_closes_without_request() {
+        let (mut app, rx) = picker_app();
+        app.mouse.picker = Some(crate::app::PickerGeometry {
+            popup: Rect::new(5, 5, 10, 4),
+            inner: Rect::new(6, 6, 8, 2),
+            first_row: 0,
+        });
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 50, 15),
+            &mut app,
+        );
+        assert!(app.base_picker.is_none());
+        assert!(rx.try_recv().is_err(), "outside click sends no request");
+    }
+
+    #[test]
+    fn mouse_wheel_inside_picker_moves_selection() {
+        let (mut app, _rx) = picker_app();
+        app.mouse.picker = Some(crate::app::PickerGeometry {
+            popup: Rect::new(0, 0, 20, 6),
+            inner: Rect::new(1, 1, 18, 4),
+            first_row: 0,
+        });
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0);
+        handle_mouse(mouse(MouseEventKind::ScrollDown, 3, 2), &mut app);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1);
+        handle_mouse(mouse(MouseEventKind::ScrollUp, 3, 2), &mut app);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0);
+    }
+
+    #[test]
+    fn mouse_click_tree_while_picker_open_is_consumed() {
+        let (mut app, _rx) = picker_app();
+        app.mouse.tree_list = Some(Rect::new(40, 1, 39, 10));
+        app.mouse.picker = Some(crate::app::PickerGeometry {
+            popup: Rect::new(0, 0, 20, 6),
+            inner: Rect::new(1, 1, 18, 4),
+            first_row: 0,
+        });
+        let sel = app.selection;
+        // A click over the tree is outside the popup: it closes the picker and
+        // must not select a tree entry.
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 45, 2),
+            &mut app,
+        );
+        assert!(app.base_picker.is_none());
+        assert_eq!(app.selection, sel);
+    }
+
+    #[test]
+    fn mouse_footer_click_while_picker_open_is_consumed() {
+        let (mut app, _rx) = picker_app();
+        app.mouse.footer = Some(Rect::new(0, 19, 80, 1));
+        app.mouse.footer_zones = vec![(crate::app::FooterZone::Mode, Rect::new(60, 19, 8, 1))];
+        // A popup covering the footer: the click lands on its border, so the
+        // picker consumes it without acting.
+        app.mouse.picker = Some(crate::app::PickerGeometry {
+            popup: Rect::new(0, 0, 80, 20),
+            inner: Rect::new(1, 1, 78, 18),
+            first_row: 0,
+        });
+        let mode = app.mode.clone();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 62, 19),
+            &mut app,
+        );
+        assert_eq!(app.mode, mode, "picker consumes the footer click");
+        assert!(app.base_picker.is_some(), "picker stays open");
+    }
+
+    #[test]
+    fn mouse_click_routes_focus() {
+        let (mut app, _rx) = routed_app();
+        app.focus = Focus::Tree;
+        app.diff_width = 40;
+
+        // A diff-pane body click (no hunk header there) focuses the diff.
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 5),
+            &mut app,
+        );
+        assert_eq!(app.focus, Focus::Diff);
+
+        app.mouse.tree_list = Some(Rect::new(40, 1, 39, 10));
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 45, 2),
+            &mut app,
+        );
+        assert_eq!(app.focus, Focus::Tree);
+
+        // Clicking the tree header strip (row 0) or empty space below the
+        // entries focuses the tree without selecting anything.
+        app.focus = Focus::Diff;
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 45, 0),
+            &mut app,
+        );
+        assert_eq!(app.focus, Focus::Tree, "tree header click focuses the tree");
+        app.focus = Focus::Diff;
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 45, 30),
+            &mut app,
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Tree,
+            "empty tree space click focuses the tree"
+        );
+    }
+
+    #[test]
+    fn mouse_shift_wheel_over_diff_scrolls_horizontally() {
+        let mut app = sample_app();
+        app.focus = Focus::Diff;
+        app.selected_path = Some("x.rs".into());
+        app.snapshot = snapshot_with_diff(single_diff(
+            header_full(None, None),
+            vec![
+                hunk_header(0),
+                DiffLine {
+                    kind: LineKind::Context,
+                    raw_text: "y".repeat(300),
+                    section: 0,
+                    word_runs: None,
+                },
+                ctx_line(1, 0),
+            ],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| view::ui(f, &mut app)).unwrap();
+        app.diff_col = 0;
+
+        let shift_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        handle_mouse(shift_down, &mut app);
+        assert!(app.diff_col > 0, "Shift+wheel-down scrolls right");
+        let shifted = app.diff_col;
+
+        let shift_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        handle_mouse(shift_up, &mut app);
+        assert!(app.diff_col < shifted, "Shift+wheel-up scrolls back left");
+    }
+
+    #[test]
+    fn mouse_preview_suppresses_diff_but_not_footer_or_tree() {
+        let (mut app, _rx) = routed_app();
+        app.diff_width = 40;
+        app.preview.set_enabled(true);
+        app.preview.current = Some(PreviewImage {
+            path: "a.rs".into(),
+            png: Vec::new(),
+            width: 1,
+            height: 1,
+        });
+        assert!(app.preview.active());
+
+        // A diff-pane click is ignored while the preview covers it.
+        app.focus = Focus::Tree;
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 5),
+            &mut app,
+        );
+        assert_eq!(app.focus, Focus::Tree);
+
+        // A footer click still works (Source left opens the branch picker).
+        app.mouse.footer = Some(Rect::new(0, 19, 80, 1));
+        app.mouse.footer_zones = vec![(crate::app::FooterZone::Source, Rect::new(0, 19, 20, 1))];
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 19),
+            &mut app,
+        );
+        assert!(app.base_picker.is_some());
+
+        // A tree click still selects.
+        app.base_picker = None;
+        app.mouse.tree_list = Some(Rect::new(40, 1, 39, 10));
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 45, 2),
+            &mut app,
+        );
+        assert_eq!(app.selection, 1);
     }
 }

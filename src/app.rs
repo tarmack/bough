@@ -8,11 +8,16 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use crossbeam_channel::Sender;
+use ratatui::layout::Rect;
 
 use crate::diff::{Diff, LineKind};
 use crate::highlight::TokenOwned;
@@ -72,6 +77,42 @@ pub struct BasePicker {
     pub entries: Vec<PickerEntry>,
     /// Selected row index.
     pub selection: usize,
+}
+
+/// Interactive screen regions recorded by the last render for mouse
+/// hit-testing. Defaults are inert so a skipped frame (tiny terminal)
+/// never routes a stale click.
+#[derive(Debug, Default, Clone)]
+pub struct MouseGeometry {
+    /// Tree list rows (the area below the header strip).
+    pub tree_list: Option<Rect>,
+    /// The footer row.
+    pub footer: Option<Rect>,
+    /// Footer pill hitboxes with their action zones, in draw order.
+    pub footer_zones: Vec<(FooterZone, Rect)>,
+    /// Base-picker popup geometry while the picker is open.
+    pub picker: Option<PickerGeometry>,
+}
+
+/// The footer pill a click activates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterZone {
+    /// The source/origin pill: left-click opens the branch picker,
+    /// right-click the commit/tag picker.
+    Source,
+    /// The mode pill: cycles the view mode.
+    Mode,
+}
+
+/// Base-picker popup geometry in screen coordinates.
+#[derive(Debug, Clone, Copy)]
+pub struct PickerGeometry {
+    /// Outer popup rect, border included.
+    pub popup: Rect,
+    /// Inner rect, inside the border — the entry-list area.
+    pub inner: Rect,
+    /// Index of the first entry visible at the top of `inner`.
+    pub first_row: usize,
 }
 
 /// Cache for [`App::visible_line_indices`]. The visibility set depends only on
@@ -163,6 +204,16 @@ impl HeaderPositions {
     }
 }
 
+/// Linewise mouse selection in the diff pane: `anchor` holds the line where
+/// the drag started while a click/drag is in progress; `range` is the
+/// highlighted span (inclusive line indices) that survives after release.
+#[derive(Debug, Default, Clone)]
+pub struct DiffSelection {
+    pub anchor: Option<usize>,
+    pub range: Option<(usize, usize)>,
+    pub dragged: bool,
+}
+
 pub struct App {
     /// Immutable data from the worker; swapped atomically between frames.
     pub snapshot: ArcSnapshot,
@@ -227,8 +278,16 @@ pub struct App {
     picker_error: Option<String>,
     /// Memoized `visible_line_indices` (see [`VisibleCache`]).
     visible_cache: RefCell<VisibleCache>,
+    /// Interactive screen regions recorded by the last render (see
+    /// [`MouseGeometry`]).
+    pub mouse: MouseGeometry,
     /// Kitty-protocol image preview state for the selected file.
     pub preview: crate::preview::Preview,
+    /// Linewise mouse selection in the diff pane.
+    pub diff_selection: DiffSelection,
+    /// Transient status-line message ("copied N lines", "copied path") with its
+    /// expiry; shown for ~3 seconds.
+    pub flash: Option<(String, Instant)>,
 }
 
 impl App {
@@ -295,7 +354,10 @@ impl App {
                 headers: Rc::new(HeaderPositions::default()),
                 max_width: 0,
             }),
+            mouse: MouseGeometry::default(),
             preview: crate::preview::Preview::new(),
+            diff_selection: DiffSelection::default(),
+            flash: None,
         };
         app.request_diff();
         app
@@ -340,6 +402,8 @@ impl App {
             // raw range; without re-arming, `maybe_request_highlight` would
             // suppress the request and the fresh diff would render bare.
             self.last_highlight_range = None;
+            // The old selection's indices refer to the replaced diff's lines.
+            self.diff_selection = DiffSelection::default();
         }
 
         if tree_changed {
@@ -589,6 +653,8 @@ impl App {
         self.collapsed_hunks.clear();
         // The worker drops its cache on SetRev, so highlights must be re-armed.
         self.last_highlight_range = None;
+        // The swapped diff retires the old line indices.
+        self.diff_selection = DiffSelection::default();
         let _ = self.request_tx.send(Request::SetRev {
             rev: self.current_rev(),
         });
@@ -740,6 +806,230 @@ impl App {
         }
     }
 
+    // ── Mouse ───────────────────────────────────────────────────────────
+
+    /// Resolve a screen `row` in the tree list to its flat index, or `None`
+    /// when no list geometry was recorded, the row is outside the list's
+    /// vertical span, or it holds no entry.
+    fn tree_row_index(&self, row: u16) -> Option<usize> {
+        let rect = self.mouse.tree_list?;
+        if row < rect.y || row >= rect.y.saturating_add(rect.height) {
+            return None;
+        }
+        let idx = self.tree_scroll + (row - rect.y) as usize;
+        self.flat.get(idx)?;
+        Some(idx)
+    }
+
+    /// A left-click inside the tree list at screen `row`. Selects the entry on
+    /// that row (loading its diff) and focuses the tree pane; a directory row
+    /// also toggles its expansion in the same click. Returns `true` when the
+    /// row held an entry.
+    pub fn click_tree_row(&mut self, row: u16) -> bool {
+        let Some(idx) = self.tree_row_index(row) else {
+            return false;
+        };
+        let node_idx = self.flat[idx];
+        self.focus = Focus::Tree;
+        let is_dir = self.tree.nodes[node_idx].kind == tree::Kind::Dir;
+        // Select the entry (loading its diff); a directory click also toggles
+        // its expansion in the same click — one click opens AND shows, like a
+        // file manager's double-click.
+        if idx != self.selection {
+            self.selection = idx;
+            self.select_and_request();
+        }
+        if is_dir {
+            self.toggle_dir();
+        }
+        true
+    }
+
+    /// Right-click on a tree row: copies that entry's repo-relative path to the
+    /// clipboard (OSC52) and flashes a confirmation (or a failure). `false`
+    /// when the row holds no entry. Directories copy the directory path.
+    pub fn copy_tree_path(&mut self, row: u16) -> bool {
+        let Some(idx) = self.tree_row_index(row) else {
+            return false;
+        };
+        let path = self.tree.nodes[self.flat[idx]].path.clone();
+        match copy_osc52(&path) {
+            Ok(_) => self.flash = Some((format!("copied {path}"), Instant::now())),
+            Err(_) => self.flash = Some(("copy failed".to_string(), Instant::now())),
+        }
+        true
+    }
+
+    /// Mouse-down on a diff body line: starts a selection anchor there and
+    /// focuses the diff pane. `false` when the row maps to a header or nothing.
+    pub fn begin_diff_selection(&mut self, row: u16) -> bool {
+        let Some(line) = self.line_at_screen_row(row) else {
+            return false;
+        };
+        let Some(diff) = self.diff() else {
+            return false;
+        };
+        if diff.lines[line].kind.is_header() {
+            return false;
+        }
+        self.diff_selection.anchor = Some(line);
+        self.diff_selection.range = Some((line, line));
+        self.diff_selection.dragged = false;
+        self.focus = Focus::Diff;
+        true
+    }
+
+    /// Drag over a diff body line: extends the selection from the anchor to the
+    /// row's line (unchanged when the row maps to a header/off-screen). `true`
+    /// when the selected range changed. Any drag marks the selection dragged,
+    /// even when the row maps back to an endpoint.
+    pub fn extend_diff_selection(&mut self, row: u16) -> bool {
+        let Some(anchor) = self.diff_selection.anchor else {
+            return false;
+        };
+        self.diff_selection.dragged = true;
+        let Some(line) = self.line_at_screen_row(row) else {
+            return false;
+        };
+        let Some(diff) = self.diff() else {
+            return false;
+        };
+        if diff.lines[line].kind.is_header() {
+            return false;
+        }
+        let range = (anchor.min(line), anchor.max(line));
+        if self.diff_selection.range == Some(range) {
+            return false;
+        }
+        self.diff_selection.range = Some(range);
+        true
+    }
+
+    /// Cancel an in-progress drag without copying (e.g. the base picker
+    /// opened mid-drag and consumed the release).
+    pub fn cancel_diff_selection(&mut self) {
+        self.diff_selection = DiffSelection::default();
+    }
+
+    /// Mouse-up: ends the drag. A dragged selection is copied to the clipboard
+    /// (OSC52) and stays highlighted; a click without dragging clears it.
+    pub fn finish_diff_selection(&mut self) {
+        if !self.diff_selection.dragged {
+            self.diff_selection = DiffSelection::default();
+            return;
+        }
+        if let Some(text) = self.selection_text() {
+            let lines = text.lines().count();
+            match copy_osc52(&text) {
+                Ok(truncated) => {
+                    let suffix = if truncated { " (truncated)" } else { "" };
+                    self.flash = Some((format!("copied {lines} lines{suffix}"), Instant::now()));
+                }
+                Err(_) => self.flash = Some(("copy failed".to_string(), Instant::now())),
+            }
+        }
+        self.diff_selection.anchor = None;
+        self.diff_selection.dragged = false;
+    }
+
+    /// The active selection range intersected with the live diff: `None` when
+    /// no selection is active, the diff is empty/gone, or the range no longer
+    /// overlaps it (e.g. the diff shrank after a swap).
+    fn clamped_selection_range(&self) -> Option<(usize, usize)> {
+        let (min, max) = self.diff_selection.range?;
+        let diff = self.diff()?;
+        let max = max.min(diff.lines.len().checked_sub(1)?);
+        (min <= max).then_some((min, max))
+    }
+
+    /// The selected lines' content, joined by '\n' with a trailing newline;
+    /// `None` when no selection is active or it holds no body lines.
+    /// `raw_text` carries no diff markers (gix consumes them), so lines join
+    /// as-is; section-header rows are never highlighted, so they are skipped.
+    pub fn selection_text(&self) -> Option<String> {
+        let (min, max) = self.clamped_selection_range()?;
+        let diff = self.diff()?;
+        let mut out = String::new();
+        for line in diff.lines[min..=max].iter().filter(|l| !l.kind.is_header()) {
+            out.push_str(&line.raw_text);
+            out.push('\n');
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Footer click at screen `column`. `right` selects the source pill's
+    /// right-click action (commit/tag picker) instead of its left-click one.
+    /// Returns `true` when a pill zone was hit.
+    pub fn click_footer(&mut self, column: u16, right: bool) -> bool {
+        let Some(&(zone, _)) = self
+            .mouse
+            .footer_zones
+            .iter()
+            .find(|(_, r)| column >= r.x && column < r.x.saturating_add(r.width))
+        else {
+            return false;
+        };
+        match zone {
+            FooterZone::Source if right => self.open_commit_picker(),
+            FooterZone::Source => self.open_branch_picker(),
+            FooterZone::Mode => self.toggle_mode(),
+        }
+        true
+    }
+
+    /// Base-picker click at screen `column, row` — every click while the
+    /// picker is open is consumed: inside the entry list selects AND confirms
+    /// that entry; on the border/title it does nothing; outside the popup it
+    /// closes the picker. Returns `true` when consumed.
+    pub fn click_picker(&mut self, column: u16, row: u16) -> bool {
+        if self.base_picker.is_none() {
+            return false;
+        }
+        let Some(g) = self.mouse.picker else {
+            // No recorded popup geometry (tiny terminal or not yet drawn):
+            // dismiss rather than swallow the click forever.
+            self.close_picker();
+            return true;
+        };
+        let in_rect = |r: Rect| {
+            column >= r.x
+                && column < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        };
+        if in_rect(g.inner) {
+            let entry = g.first_row + (row - g.inner.y) as usize;
+            let in_bounds = self
+                .base_picker
+                .as_ref()
+                .is_some_and(|p| entry < p.entries.len());
+            if in_bounds {
+                if let Some(picker) = self.base_picker.as_mut() {
+                    picker.selection = entry;
+                }
+                self.select_picked_base();
+            }
+        } else if !in_rect(g.popup) {
+            self.close_picker();
+        }
+        true
+    }
+
+    /// Wheel inside the base picker: move the selection one entry.
+    pub fn picker_scroll(&mut self, up: bool) {
+        let Some(picker) = self.base_picker.as_mut() else {
+            return;
+        };
+        let Some(last) = picker.entries.len().checked_sub(1) else {
+            return;
+        };
+        picker.selection = if up {
+            picker.selection.saturating_sub(1)
+        } else {
+            picker.selection.saturating_add(1).min(last)
+        };
+    }
+
     // ── Convenience accessors for snapshot data ─────────────────────────
 
     pub fn diff(&self) -> Option<&Diff> {
@@ -794,6 +1084,7 @@ impl App {
         self.context_lines = 3;
         self.diff_scroll = 0;
         self.active_chunk = None;
+        self.diff_selection = DiffSelection::default();
     }
 
     /// Update `selected_path` from the current flat selection, then send a
@@ -1374,6 +1665,15 @@ impl App {
 
     pub fn hunk_at_screen_row(&self, row: u16) -> Option<usize> {
         let diff = self.diff()?;
+        let line_idx = self.line_at_screen_row(row)?;
+        (diff.lines[line_idx].kind.is_header()).then_some(diff.lines[line_idx].section)
+    }
+
+    /// The diff line at a diff-pane screen row, if it maps to a line at all.
+    /// Covers sticky header rows and the visible flow rows; returns `None` for
+    /// the locked header, off-screen rows, and when no diff is loaded.
+    pub fn line_at_screen_row(&self, row: u16) -> Option<usize> {
+        let diff = self.diff()?;
         let header_h = self.last_header_height as usize;
         if (row as usize) < header_h {
             return None;
@@ -1383,19 +1683,16 @@ impl App {
         let hunk = self.sticky_hunk;
         let sticky_rows = usize::from(file.is_some()) + usize::from(hunk.is_some());
 
-        // A click on a pinned sticky row maps to that header's section.
+        // A row on a pinned sticky row maps to that header's line.
         if body_row < sticky_rows {
             let idx = if body_row == 0 { file.or(hunk) } else { hunk };
-            return idx.and_then(|i| diff.lines.get(i).map(|l| l.section));
+            return idx.filter(|&i| i < diff.lines.len());
         }
 
-        let start = self.diff_scroll;
-        let line_idx = self
-            .visible_line_indices()
-            .get(start + body_row - sticky_rows)
-            .copied()?;
-        let line = diff.lines.get(line_idx)?;
-        (line.kind.is_header()).then_some(line.section)
+        self.visible_line_indices()
+            .get(self.diff_scroll + body_row - sticky_rows)
+            .copied()
+            .filter(|&i| i < diff.lines.len())
     }
 
     pub fn open_hunk_at_cursor(&mut self) {
@@ -1477,6 +1774,8 @@ impl App {
         // no longer refer to the same hunks.
         self.collapsed_hunks.clear();
         self.active_chunk = None;
+        // The reflowed diff invalidates the old selection's line indices.
+        self.diff_selection = DiffSelection::default();
         self.request_diff();
         self.clamp_diff_scroll();
     }
@@ -1549,10 +1848,31 @@ fn relocate_selection(flat: &[usize], tree: &Tree, old_path: &Option<String>) ->
     0
 }
 
+/// Copy `text` to the primary selection (the middle-click buffer) via the
+/// OSC52 escape sequence (works over SSH; kitty/wezterm/xterm honor the `p`
+/// selection). We use OSC52 rather than a clipboard crate so the copy reaches
+/// the local terminal from a remote host. Truncates very large payloads
+/// rather than overflowing terminal limits.
+///
+/// Returns `Ok(true)` when the payload was truncated at the 16 KiB cap,
+/// `Ok(false)` on a full copy, and `Err` when the write to the terminal failed.
+fn copy_osc52(text: &str) -> std::io::Result<bool> {
+    const MAX: usize = 16 * 1024;
+    let mut end = text.len().min(MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = end < text.len();
+    let payload = STANDARD.encode(&text.as_bytes()[..end]);
+    let mut out = std::io::stdout().lock();
+    write!(out, "\x1b]52;p;{payload}\x07").and_then(|()| out.flush())?;
+    Ok(truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{Diff, FileHeader, FileStatus, HunkMeta};
+    use crate::diff::{Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LineKind};
     use crate::test_support::*;
 
     #[test]
@@ -2448,5 +2768,564 @@ mod tests {
         assert_eq!(app.tree_scroll, 2, "last row revealed: 6 + 1 - 5");
         app.tree_last();
         assert_eq!(app.selection, 6);
+    }
+
+    #[test]
+    fn click_footer_mode_zone_cycles_and_sends_setrev() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(4);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.mouse.footer_zones = vec![(FooterZone::Mode, Rect::new(10, 0, 8, 1))];
+        assert_eq!(app.mode, Mode::Branch(Origin::Default));
+
+        assert!(app.click_footer(12, false));
+        assert_eq!(app.mode, Mode::Uncommitted);
+        match rx.try_recv().unwrap() {
+            Request::SetRev { rev } => assert_eq!(rev, "HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_footer_source_left_opens_branch_picker() {
+        let (tx, _rx) = crossbeam_channel::bounded::<Request>(4);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.mouse.footer_zones = vec![(FooterZone::Source, Rect::new(0, 0, 8, 1))];
+        assert!(app.click_footer(3, false));
+        assert_eq!(
+            app.base_picker.as_ref().map(|p| p.title.as_str()),
+            Some(" compare against a branch ")
+        );
+    }
+
+    #[test]
+    fn click_footer_source_right_opens_commit_picker() {
+        let (tx, _rx) = crossbeam_channel::bounded::<Request>(4);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.mouse.footer_zones = vec![(FooterZone::Source, Rect::new(0, 0, 8, 1))];
+        assert!(app.click_footer(3, true));
+        assert_eq!(
+            app.base_picker.as_ref().map(|p| p.title.as_str()),
+            Some(" compare against a commit or tag ")
+        );
+    }
+
+    #[test]
+    fn click_footer_miss_returns_false() {
+        let mut app = sample_app();
+        app.mouse.footer_zones = vec![(FooterZone::Mode, Rect::new(10, 0, 8, 1))];
+        assert!(!app.click_footer(100, false));
+        assert!(!app.click_footer(9, false), "just before the zone");
+        assert_eq!(app.mode, Mode::Branch(Origin::Default));
+    }
+
+    #[test]
+    fn click_picker_row_selects_confirms_and_closes() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.open_picker_with(
+            " compare against a branch ",
+            vec![
+                PickerEntry {
+                    rev: "develop".to_string(),
+                    label: "develop".to_string(),
+                },
+                PickerEntry {
+                    rev: "feature".to_string(),
+                    label: "feature".to_string(),
+                },
+            ],
+        );
+        app.mouse.picker = Some(PickerGeometry {
+            popup: Rect::new(0, 0, 20, 6),
+            inner: Rect::new(1, 1, 18, 4),
+            first_row: 0,
+        });
+
+        // inner.y = 1, so row 2 is entry 1 (`feature`).
+        assert!(app.click_picker(3, 2));
+        assert!(app.base_picker.is_none());
+        match rx.try_recv().unwrap() {
+            Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_picker_outside_closes_without_request() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.open_picker_with(
+            " t ",
+            vec![PickerEntry {
+                rev: "main".to_string(),
+                label: "main".to_string(),
+            }],
+        );
+        app.mouse.picker = Some(PickerGeometry {
+            popup: Rect::new(5, 5, 10, 4),
+            inner: Rect::new(6, 6, 8, 2),
+            first_row: 0,
+        });
+
+        assert!(app.click_picker(0, 0));
+        assert!(app.base_picker.is_none());
+        assert!(rx.try_recv().is_err(), "outside click sends no request");
+    }
+
+    #[test]
+    fn click_picker_border_is_consumed_but_inert() {
+        let mut app = sample_app();
+        app.open_picker_with(
+            " t ",
+            vec![PickerEntry {
+                rev: "main".to_string(),
+                label: "main".to_string(),
+            }],
+        );
+        app.mouse.picker = Some(PickerGeometry {
+            popup: Rect::new(5, 5, 10, 4),
+            inner: Rect::new(6, 6, 8, 2),
+            first_row: 0,
+        });
+
+        // Popup corner sits on the border, outside `inner`.
+        assert!(app.click_picker(5, 5));
+        assert!(app.base_picker.is_some());
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0);
+    }
+
+    #[test]
+    fn picker_scroll_moves_and_clamps() {
+        let mut app = sample_app();
+        app.open_picker_with(
+            " t ",
+            vec![
+                PickerEntry {
+                    rev: "a".to_string(),
+                    label: "a".to_string(),
+                },
+                PickerEntry {
+                    rev: "b".to_string(),
+                    label: "b".to_string(),
+                },
+            ],
+        );
+        app.picker_scroll(false);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1);
+        app.picker_scroll(false);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1, "last");
+        app.picker_scroll(true);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0);
+        app.picker_scroll(true);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0, "first");
+
+        // No picker open: a wheel is a no-op and must not re-open one.
+        app.base_picker = None;
+        app.picker_scroll(false);
+        assert!(app.base_picker.is_none());
+    }
+
+    #[test]
+    fn click_tree_row_selects_and_expands_directory_in_one_click() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(vec![
+                ('M', "src/a.rs".to_string()),
+                ('M', "b.rs".to_string()),
+            ])),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv(); // initial Diff for the selected dir path
+        app.mouse.tree_list = Some(Rect::new(0, 1, 20, 10));
+        // Select the file first (row 2 → b.rs) so the dir row is not selected.
+        assert!(app.click_tree_row(2));
+        let _ = rx.try_recv(); // b.rs diff request
+        let dir_idx = app.flat[0];
+        assert_eq!(app.tree.nodes[dir_idx].kind, tree::Kind::Dir);
+        assert!(!app.tree.nodes[dir_idx].expanded);
+
+        // One click on the dir row (row 1 → flat[0]): selects it, loads its
+        // aggregate diff, and expands it.
+        assert!(app.click_tree_row(1));
+        assert_eq!(app.selection, 0);
+        assert!(
+            app.tree.nodes[dir_idx].expanded,
+            "one click expands the dir"
+        );
+        assert!(app.expanded_dirs.contains("src"));
+        match rx.try_recv().unwrap() {
+            Request::Diff { path, .. } => assert_eq!(path, "src"),
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_tree_row_selects_file_and_requests_diff() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(vec![
+                ('M', "a.rs".to_string()),
+                ('M', "b.rs".to_string()),
+            ])),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv(); // initial Diff for a.rs
+        app.mouse.tree_list = Some(Rect::new(0, 1, 20, 10));
+
+        // row 2 → idx = tree_scroll(0) + (2 - 1) = 1 → b.rs.
+        assert!(app.click_tree_row(2));
+        assert_eq!(app.selection, 1);
+        assert_eq!(app.selected_path.as_deref(), Some("b.rs"));
+        assert_eq!(app.focus, Focus::Tree);
+        match rx.try_recv().unwrap() {
+            Request::Diff { path, .. } => assert_eq!(path, "b.rs"),
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_tree_row_toggles_selected_directory() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(vec![('M', "src/a.rs".to_string())])),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv(); // initial Diff for the selected dir path
+        app.mouse.tree_list = Some(Rect::new(0, 1, 20, 10));
+        let dir_idx = app.flat[app.selection];
+        assert_eq!(app.tree.nodes[dir_idx].kind, tree::Kind::Dir);
+        assert!(!app.tree.nodes[dir_idx].expanded);
+
+        assert!(app.click_tree_row(1)); // idx == selection → toggle
+        assert!(app.tree.nodes[dir_idx].expanded);
+        assert!(app.expanded_dirs.contains("src"));
+        assert_eq!(app.selection, 0, "selection stays on the toggled dir");
+        assert!(
+            rx.try_recv().is_err(),
+            "toggling a dir sends no diff request"
+        );
+    }
+
+    #[test]
+    fn click_tree_row_beyond_last_entry_returns_false() {
+        let mut app = sample_app();
+        app.mouse.tree_list = Some(Rect::new(0, 1, 20, 10));
+
+        // Two entries (a.rs, b.rs): row 3 → idx 2, past the end.
+        assert!(!app.click_tree_row(3));
+        assert_eq!(app.selection, 0);
+        // A row above the list is not an entry either.
+        assert!(!app.click_tree_row(0));
+        // Without recorded geometry the click is never routed.
+        app.mouse.tree_list = None;
+        assert!(!app.click_tree_row(1));
+    }
+
+    /// An `App` whose selected diff is `lines` (hunk 0), with the row-mapping
+    /// fields pre-set so `line_at_screen_row(1)` is the hunk header and row
+    /// `1 + n` is `lines[n]` (no sticky rows, no scroll).
+    fn selectable_app(lines: Vec<DiffLine>) -> App {
+        let mut app = sample_app();
+        app.selected_path = Some("x.rs".into());
+        app.snapshot = snapshot_with_diff(single_diff(header_full(None, None), lines));
+        app.focus = Focus::Diff;
+        app.last_header_height = 1;
+        app.sticky_file = None;
+        app.sticky_hunk = None;
+        app.diff_scroll = 0;
+        app
+    }
+
+    /// A body line with the given kind and raw text, in hunk 0.
+    fn marked(kind: LineKind, raw: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            raw_text: raw.into(),
+            section: 0,
+            word_runs: None,
+        }
+    }
+
+    #[test]
+    fn diff_selection_orders_range_up_and_down() {
+        let mut app = selectable_app(vec![
+            hunk_header(0),
+            marked(LineKind::Added, "one"),
+            marked(LineKind::Context, "two"),
+            marked(LineKind::Removed, "three"),
+        ]);
+
+        // Dragging downward: anchor 1, extend to 3.
+        assert!(app.begin_diff_selection(2));
+        assert_eq!(app.diff_selection.anchor, Some(1));
+        assert!(app.extend_diff_selection(4));
+        assert_eq!(app.diff_selection.range, Some((1, 3)));
+
+        // Dragging upward from a later anchor: anchor 2, extend to 1.
+        assert!(app.begin_diff_selection(3));
+        assert!(app.extend_diff_selection(2));
+        assert_eq!(app.diff_selection.range, Some((1, 2)));
+    }
+
+    #[test]
+    fn begin_diff_selection_rejects_header_row() {
+        let mut app = selectable_app(vec![hunk_header(0), marked(LineKind::Context, "x")]);
+        assert!(
+            !app.begin_diff_selection(1),
+            "hunk header is not selectable"
+        );
+        assert!(app.diff_selection.range.is_none());
+    }
+
+    #[test]
+    fn extend_over_header_keeps_range() {
+        let mut app = selectable_app(vec![
+            hunk_header(0),
+            marked(LineKind::Context, "one"),
+            hunk_header(1),
+            marked(LineKind::Context, "two"),
+        ]);
+        assert!(app.begin_diff_selection(2));
+        assert_eq!(app.diff_selection.range, Some((1, 1)));
+
+        // Row 1 is the hunk header and row 100 is off-screen: both unchanged.
+        assert!(!app.extend_diff_selection(1));
+        assert_eq!(app.diff_selection.range, Some((1, 1)));
+        assert!(!app.extend_diff_selection(100));
+        assert_eq!(app.diff_selection.range, Some((1, 1)));
+        assert!(app.diff_selection.dragged, "any drag marks it dragged");
+    }
+
+    #[test]
+    fn finish_after_drag_keeps_range_and_flashes() {
+        let mut app = selectable_app(vec![
+            hunk_header(0),
+            marked(LineKind::Added, "one"),
+            marked(LineKind::Context, "two"),
+            marked(LineKind::Removed, "three"),
+        ]);
+        assert!(app.begin_diff_selection(2));
+        assert!(app.extend_diff_selection(4));
+        app.finish_diff_selection();
+
+        assert_eq!(app.diff_selection.range, Some((1, 3)), "highlight survives");
+        assert_eq!(app.diff_selection.anchor, None);
+        assert!(!app.diff_selection.dragged);
+        let (msg, _) = app.flash.clone().expect("flash set");
+        assert_eq!(msg, "copied 3 lines");
+    }
+
+    #[test]
+    fn finish_flashes_count_of_copied_body_lines() {
+        // Range spans a header and a line past the diff end; the flash must
+        // count only the body lines actually copied.
+        let mut app = selectable_app(vec![
+            hunk_header(0),
+            marked(LineKind::Added, "one"),
+            hunk_header(1),
+            marked(LineKind::Context, "two"),
+        ]);
+        app.diff_selection.range = Some((1, 99));
+        app.diff_selection.anchor = Some(1);
+        app.diff_selection.dragged = true;
+        app.finish_diff_selection();
+        let (msg, _) = app.flash.clone().expect("flash set");
+        assert_eq!(msg, "copied 2 lines");
+    }
+
+    #[test]
+    fn finish_out_of_range_selection_copies_nothing() {
+        let mut app = selectable_app(vec![hunk_header(0), marked(LineKind::Context, "one")]);
+        app.diff_selection.range = Some((50, 60));
+        app.diff_selection.anchor = Some(50);
+        app.diff_selection.dragged = true;
+        app.finish_diff_selection();
+        assert!(app.flash.is_none(), "no false copied flash");
+    }
+
+    #[test]
+    fn finish_without_drag_clears_selection() {
+        let mut app = selectable_app(vec![hunk_header(0), marked(LineKind::Context, "one")]);
+        assert!(app.begin_diff_selection(2));
+        app.finish_diff_selection();
+        assert!(app.diff_selection.range.is_none());
+        assert!(app.diff_selection.anchor.is_none());
+        assert!(app.flash.is_none(), "a plain click does not copy");
+    }
+
+    #[test]
+    fn apply_snapshot_content_change_clears_diff_selection() {
+        let mut app = app_with_diff(sample_diff(4));
+        app.diff_selection.range = Some((1, 2));
+        app.diff_selection.anchor = Some(1);
+        // A fresh diff Arc is a content change even when the path is unchanged.
+        let mut snap = snapshot_with_diff(sample_diff(4));
+        Arc::get_mut(&mut snap).unwrap().tree = app.snapshot.tree.clone();
+        app.apply_snapshot(snap);
+        assert!(app.diff_selection.range.is_none());
+        assert!(app.diff_selection.anchor.is_none());
+    }
+
+    #[test]
+    fn toggle_mode_clears_diff_selection() {
+        let (tx, _rx) = crossbeam_channel::bounded::<Request>(4);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.diff_selection.range = Some((0, 2));
+        app.diff_selection.anchor = Some(0);
+        app.toggle_mode();
+        assert!(app.diff_selection.range.is_none());
+        assert!(app.diff_selection.anchor.is_none());
+    }
+
+    #[test]
+    fn change_context_clears_diff_selection() {
+        let mut app = sample_app();
+        app.diff_selection.range = Some((0, 2));
+        app.diff_selection.anchor = Some(0);
+        app.change_context(1);
+        assert!(app.diff_selection.range.is_none());
+        assert!(app.diff_selection.anchor.is_none());
+    }
+
+    #[test]
+    fn click_picker_without_geometry_closes() {
+        let mut app = sample_app();
+        app.open_picker_with(
+            " t ",
+            vec![PickerEntry {
+                rev: "main".to_string(),
+                label: "main".to_string(),
+            }],
+        );
+        assert!(app.mouse.picker.is_none());
+        assert!(app.click_picker(0, 0));
+        assert!(
+            app.base_picker.is_none(),
+            "an unrenderable picker is still dismissable"
+        );
+    }
+
+    #[test]
+    fn selection_text_joins_raw_lines() {
+        let mut app = selectable_app(vec![
+            hunk_header(0),
+            marked(LineKind::Added, "added"),
+            marked(LineKind::Context, "context keeps leading chars"),
+            marked(LineKind::Removed, "+ leading plus survives copy"),
+        ]);
+        assert!(app.begin_diff_selection(2));
+        assert!(app.extend_diff_selection(4));
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some("added\ncontext keeps leading chars\n+ leading plus survives copy\n")
+        );
+    }
+
+    #[test]
+    fn selection_text_skips_headers_within_range() {
+        let mut app = selectable_app(vec![
+            hunk_header(0),
+            marked(LineKind::Added, "one"),
+            hunk_header(1),
+            marked(LineKind::Context, "two"),
+        ]);
+        app.diff_selection.range = Some((1, 3));
+        assert_eq!(app.selection_text().as_deref(), Some("one\ntwo\n"));
+    }
+
+    #[test]
+    fn selection_text_clamps_range_to_live_diff() {
+        let mut app = selectable_app(vec![
+            hunk_header(0),
+            marked(LineKind::Context, "one"),
+            marked(LineKind::Context, "two"),
+        ]);
+        app.diff_selection.range = Some((1, 99));
+        assert_eq!(app.selection_text().as_deref(), Some("one\ntwo\n"));
+    }
+
+    #[test]
+    fn selection_text_out_of_range_is_none() {
+        let mut app = selectable_app(vec![hunk_header(0), marked(LineKind::Context, "one")]);
+        app.diff_selection.range = Some((50, 60));
+        assert!(app.selection_text().is_none());
+    }
+
+    #[test]
+    fn selection_text_header_only_range_is_none() {
+        let mut app = selectable_app(vec![hunk_header(0), hunk_header(1)]);
+        app.diff_selection.range = Some((0, 1));
+        assert!(app.selection_text().is_none());
+    }
+
+    #[test]
+    fn copy_tree_path_flashes_the_relative_path() {
+        let mut app = sample_app();
+        app.mouse.tree_list = Some(Rect::new(40, 1, 39, 10));
+        // row 2 → idx = 0 + (2 - 1) = 1 → b.rs.
+        assert!(app.copy_tree_path(2));
+        let (msg, _) = app.flash.clone().expect("flash set");
+        assert!(msg.contains("b.rs"), "flash names the path: {msg}");
+        // Past the last entry and above the list: no copy.
+        assert!(!app.copy_tree_path(3));
+        assert!(!app.copy_tree_path(0));
+    }
+
+    #[test]
+    fn selection_clears_when_tree_selection_changes() {
+        let mut app = sample_app();
+        app.diff_selection.range = Some((1, 3));
+        app.diff_selection.anchor = Some(1);
+        app.move_down(1);
+        assert!(
+            app.diff_selection.range.is_none(),
+            "switching files drops the diff selection"
+        );
+        assert!(app.diff_selection.anchor.is_none());
     }
 }

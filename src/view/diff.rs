@@ -203,7 +203,17 @@ fn emit_visible_rows(
                 .and_then(|opt| opt.as_deref())
                 .unwrap_or(&[]);
             let spans = diff_body_line(tokens, line, base_bg, app.word_diff_on);
-            let l = elide(spans, app.diff_col, area.width, None);
+            let mut l = elide(spans, app.diff_col, area.width, None);
+            // Highlight the linewise mouse selection by reversing its cells.
+            if app
+                .diff_selection
+                .range
+                .is_some_and(|(min, max)| line_idx >= min && line_idx <= max)
+            {
+                for span in &mut l.spans {
+                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                }
+            }
             f.buffer_mut().set_line(area.x, y, &l, area.width);
             y += 1;
         }
@@ -1543,6 +1553,36 @@ mod tests {
                 size: 512,
             }),
             "LFS object · 512 B"
+        );
+    }
+
+    #[test]
+    fn mouse_selection_reverses_selected_lines() {
+        let mut app = sample_app();
+        app.selected_path = Some("x.rs".into());
+        app.snapshot = snapshot_with_diff(single_diff(
+            header_full(None, None),
+            vec![hunk_header(0), ctx_line(0, 0), ctx_line(1, 0)],
+        ));
+        app.diff_selection.range = Some((1, 1));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Row 1 is the unselected hunk header; row 2 is the selected body line.
+        assert!(
+            buf.cell((0, 2))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED),
+            "selected line is reversed"
+        );
+        assert!(
+            !buf.cell((0, 1))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED),
+            "unselected header is not reversed"
         );
     }
 }
