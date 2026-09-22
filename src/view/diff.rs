@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, HeaderPositions};
 use crate::diff::{
     Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LineKind, SectionKind, WordRun,
 };
@@ -53,6 +53,7 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let visible = app.visible_line_indices();
+    let headers = app.header_positions();
     // Clamp in two passes: the sticky count depends on the scroll position,
     // which the first clamp may have moved.
     let sticky_rows = app.sticky_row_count();
@@ -61,14 +62,14 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
         app.diff_scroll = max_scroll;
     }
     let (file_sticky, hunk_sticky, flow_height) =
-        sticky_headers(&visible, &diff.lines, app.diff_scroll, body_height);
+        sticky_headers(&visible, &headers, app.diff_scroll, body_height);
     let actual_rows = usize::from(file_sticky.is_some()) + usize::from(hunk_sticky.is_some());
     let (file_sticky, hunk_sticky, flow_height) = if actual_rows != sticky_rows {
         let max_scroll = max_scroll_for(visible.len(), body_height as usize, actual_rows);
         if app.diff_scroll > max_scroll {
             app.diff_scroll = max_scroll;
         }
-        sticky_headers(&visible, &diff.lines, app.diff_scroll, body_height)
+        sticky_headers(&visible, &headers, app.diff_scroll, body_height)
     } else {
         (file_sticky, hunk_sticky, flow_height)
     };
@@ -157,42 +158,27 @@ fn draw_locked_header_row(f: &mut Frame, app: &App, area: Rect, y: u16, spans: V
     }
 }
 
-/// Position (within `visible`) of the last sticky header of `kind` that
-/// scrolls off above the body top, searching `visible[from..start]`. `None`
-/// when no such header scrolled away.
-fn last_sticky_pos(
-    visible: &[usize],
-    lines: &[DiffLine],
-    kind: LineKind,
-    start: usize,
-    from: usize,
-) -> Option<usize> {
-    (from..start)
-        .rev()
-        .find(|&p| lines[visible[p]].kind == kind)
-}
-
 /// Compute the sticky file/hunk header layout for the body. Returns the two
 /// sticky indices plus the flow height left below them. The caller writes
 /// `app.sticky_file`/`app.sticky_hunk` (the pinned sticky lines, for click-row
 /// mapping).
 ///
+/// `headers` holds the precomputed visible-list positions of the section
+/// headers, so the lookups are O(log n) rather than scanning back from `start`.
 /// The hunk sticky is confined to the pinned file's own lines, so scrolling
 /// into a new file replaces the previous file's hunk rather than pinning it
 /// under the new header. Rows are capped by `body_height`, preferring the file
 /// sticky over the hunk sticky.
 fn sticky_headers(
     visible: &[usize],
-    lines: &[DiffLine],
+    headers: &HeaderPositions,
     start: usize,
     body_height: u16,
 ) -> (Option<usize>, Option<usize>, u16) {
     let start = start.min(visible.len());
-    let file_pos = last_sticky_pos(visible, lines, LineKind::FileHeader, start, 0);
+    let (file_pos, hunk_pos) = headers.sticky_pair(start);
     let file_sticky = file_pos.map(|p| visible[p]);
-    let hunk_from = file_pos.map_or(0, |p| p + 1);
-    let hunk_sticky =
-        last_sticky_pos(visible, lines, LineKind::HunkHeader, start, hunk_from).map(|p| visible[p]);
+    let hunk_sticky = hunk_pos.map(|p| visible[p]);
 
     // Cap pinned rows: at most one file sticky, and the hunk sticky only when
     // a row remains for it.
@@ -1381,14 +1367,77 @@ mod tests {
             ctx_line(1, 3),
         ];
         let visible: Vec<usize> = (0..lines.len()).collect();
+        let positions = header_positions(&lines);
         // Top scrolled just past b.rs's header: a.rs's hunk must not pin under
         // b.rs's header.
-        let (file, hunk, _) = sticky_headers(&visible, &lines, 4, 5);
+        let (file, hunk, _) = sticky_headers(&visible, &positions, 4, 5);
         assert_eq!(file, Some(3));
         assert_eq!(hunk, None);
         // One line further, b.rs's own hunk becomes sticky.
-        let (file, hunk, _) = sticky_headers(&visible, &lines, 5, 5);
+        let (file, hunk, _) = sticky_headers(&visible, &positions, 5, 5);
         assert_eq!(file, Some(3));
         assert_eq!(hunk, Some(4));
+    }
+
+    /// Precomputed header positions for an identity `visible` mapping.
+    fn header_positions(lines: &[DiffLine]) -> HeaderPositions {
+        let mut positions = HeaderPositions::default();
+        for (pos, line) in lines.iter().enumerate() {
+            match line.kind {
+                LineKind::FileHeader => positions.file.push(pos),
+                LineKind::HunkHeader => positions.hunk.push(pos),
+                _ => {}
+            }
+        }
+        positions
+    }
+
+    #[test]
+    fn sticky_pair_confines_hunk_to_pinned_file() {
+        let lines = vec![
+            DiffLine {
+                kind: LineKind::FileHeader,
+                raw_text: "a.rs".into(),
+                section: 0,
+                word_runs: None,
+            },
+            hunk_header(1),
+            ctx_line(0, 1),
+            DiffLine {
+                kind: LineKind::FileHeader,
+                raw_text: "b.rs".into(),
+                section: 2,
+                word_runs: None,
+            },
+            hunk_header(3),
+            ctx_line(1, 3),
+        ];
+        let positions = header_positions(&lines);
+        assert_eq!(positions.sticky_pair(0), (None, None));
+        // At b.rs's header row, a.rs (file + hunk) still pins.
+        assert_eq!(positions.sticky_pair(3), (Some(0), Some(1)));
+        // One row past it, b.rs pins but a.rs's hunk does not carry over.
+        assert_eq!(positions.sticky_pair(4), (Some(3), None));
+        assert_eq!(positions.sticky_pair(5), (Some(3), Some(4)));
+    }
+
+    #[test]
+    fn sticky_headers_large_scroll() {
+        // A tall single-hunk file: scroll deep into the body; the hunk header
+        // (position 0) stays pinned and no file header exists.
+        let lines: Vec<DiffLine> = std::iter::once(hunk_header(0))
+            .chain((0..500).map(|i| ctx_line(i, 0)))
+            .collect();
+        let visible: Vec<usize> = (0..lines.len()).collect();
+        let positions = header_positions(&lines);
+
+        let (file, hunk, flow) = sticky_headers(&visible, &positions, 400, 20);
+        assert_eq!(file, None);
+        assert_eq!(hunk, Some(0));
+        assert_eq!(flow, 19);
+
+        // At the very top the header is still in flow, not pinned.
+        let (_, hunk, _) = sticky_headers(&visible, &positions, 0, 20);
+        assert_eq!(hunk, None);
     }
 }

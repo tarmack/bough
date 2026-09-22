@@ -29,6 +29,10 @@ pub struct TreeNode {
     pub added: usize,
     pub deleted: usize,
     pub file_count: usize,
+    /// Files beneath this node per status letter, indexed by [`STATUS_ORDER`].
+    /// Only the root's is consumed by the UI (the tree header); directories
+    /// aggregate so the root's total is complete.
+    pub status_counts: [usize; 6],
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +57,7 @@ impl Tree {
             added: 0,
             deleted: 0,
             file_count: 0,
+            status_counts: [0; 6],
         }];
         let root = 0;
 
@@ -152,6 +157,7 @@ fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
             added: 0,
             deleted: 0,
             file_count: 0,
+            status_counts: [0; 6],
         });
         nodes[cur].children.push(new_idx);
         cur = new_idx;
@@ -161,20 +167,30 @@ fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
 fn sum_stats(nodes: &mut Vec<TreeNode>, idx: usize) -> (usize, usize) {
     if nodes[idx].kind == Kind::File {
         nodes[idx].file_count = 1;
+        let mut counts = [0usize; 6];
+        if let Some(i) = nodes[idx].status.chars().next().and_then(status_index) {
+            counts[i] = 1;
+        }
+        nodes[idx].status_counts = counts;
         return (nodes[idx].added, nodes[idx].deleted);
     }
     let children = nodes[idx].children.clone();
     let (mut added, mut deleted) = (0usize, 0usize);
     let mut files = 0usize;
+    let mut counts = [0usize; 6];
     for child in children {
         let (a, d) = sum_stats(nodes, child);
         added += a;
         deleted += d;
         files += nodes[child].file_count;
+        for (slot, &c) in counts.iter_mut().zip(nodes[child].status_counts.iter()) {
+            *slot += c;
+        }
     }
     nodes[idx].added = added;
     nodes[idx].deleted = deleted;
     nodes[idx].file_count = files;
+    nodes[idx].status_counts = counts;
     (added, deleted)
 }
 
@@ -231,13 +247,17 @@ fn aggregate(nodes: &mut Vec<TreeNode>, idx: usize) -> String {
         }
     }
 
-    present.sort_by_key(|&c| status_order(c));
+    present.sort_by_key(|&c| dir_status_rank(c));
     let status: String = present.into_iter().collect();
     nodes[idx].status = status.clone();
     status
 }
 
-fn status_order(c: char) -> u8 {
+/// Sort rank for a status letter inside a directory's aggregate status string:
+/// A, M, D, R, C, T. Display ordering only. It deliberately differs from
+/// [`STATUS_ORDER`] (M, A, D, R, C, T), which indexes
+/// [`TreeNode::status_counts`]; do not unify the two.
+fn dir_status_rank(c: char) -> u8 {
     match c {
         'A' => 0,
         'M' => 1,
@@ -247,6 +267,16 @@ fn status_order(c: char) -> u8 {
         'T' => 5,
         _ => 6,
     }
+}
+
+/// Status letters in the order the tree header lists them; indexes
+/// [`TreeNode::status_counts`]. Distinct from [`dir_status_rank`], whose
+/// A-first order sorts a directory's aggregate status string.
+pub const STATUS_ORDER: [char; 6] = ['M', 'A', 'D', 'R', 'C', 'T'];
+
+/// Index of `c` in [`STATUS_ORDER`], or `None` for an unknown letter.
+fn status_index(c: char) -> Option<usize> {
+    STATUS_ORDER.iter().position(|&s| s == c)
 }
 
 #[cfg(test)]
@@ -335,5 +365,30 @@ mod tests {
         let file_idx = tree.nodes[tree.root].children[0];
         assert_eq!(tree.nodes[file_idx].kind, Kind::File);
         assert_eq!(tree.nodes[file_idx].status, "A");
+    }
+
+    #[test]
+    fn annotate_stats_aggregates_status_counts() {
+        let mut tree = Tree::build(vec![
+            ('M', "src/a.rs".to_string()),
+            ('A', "src/b.rs".to_string()),
+            ('D', "README.md".to_string()),
+        ]);
+        let mut stats = HashMap::new();
+        stats.insert("src/a.rs".to_string(), (1, 2));
+        stats.insert("src/b.rs".to_string(), (3, 0));
+        tree.annotate_stats(&stats);
+
+        let root = &tree.nodes[tree.root];
+        assert_eq!(root.file_count, 3);
+        // Indexed by STATUS_ORDER (M, A, D, R, C, T).
+        assert_eq!(root.status_counts, [1, 1, 1, 0, 0, 0]);
+        assert_eq!(root.added, 4);
+        assert_eq!(root.deleted, 2);
+
+        // A directory aggregates its own subtree the same way.
+        let src = &tree.nodes[tree.nodes[tree.root].children[0]];
+        assert_eq!(src.file_count, 2);
+        assert_eq!(src.status_counts, [1, 1, 0, 0, 0, 0]);
     }
 }

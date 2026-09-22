@@ -52,13 +52,15 @@ pub fn sample_app() -> App {
 /// A `Snapshot` with the given tree, no selected diff, default fields.
 pub fn sample_snapshot(tree: Tree) -> ArcSnapshot {
     Arc::new(Snapshot {
+        seq: 0,
+        busy: false,
         empty: false,
         selected_diff: None,
-        selected_highlight: Vec::new(),
+        selected_highlight: Arc::new(Vec::new()),
         error: None,
         branch_state: crate::git::BranchState::default(),
         uncommitted_stats: None,
-        tree,
+        tree: Arc::new(tree),
     })
 }
 
@@ -70,13 +72,15 @@ pub fn snapshot_with_diff(diff: Diff) -> ArcSnapshot {
         .collect();
     let tree = Tree::build(vec![('M', diff.header.path.clone())]);
     Arc::new(Snapshot {
+        seq: 0,
+        busy: false,
         empty: false,
-        selected_diff: Some(diff),
-        selected_highlight: hl,
+        selected_diff: Some(Arc::new(diff)),
+        selected_highlight: Arc::new(hl),
         error: None,
         branch_state: crate::git::BranchState::default(),
         uncommitted_stats: None,
-        tree,
+        tree: Arc::new(tree),
     })
 }
 

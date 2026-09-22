@@ -30,14 +30,6 @@ pub(crate) fn local_branches_in(repo: &gix::Repository) -> Vec<String> {
 
 /// The `n` most recent commits from `HEAD`, newest first: full oid hex plus
 /// the commit subject (first message line).
-pub fn recent_commits(n: usize) -> Vec<(String, String)> {
-    match open_repo() {
-        Ok(repo) => recent_commits_in(&repo, n),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// [`recent_commits`] against an already-open repository.
 pub(crate) fn recent_commits_in(repo: &gix::Repository, n: usize) -> Vec<(String, String)> {
     let Ok(head_id) = repo.head_id() else {
         return Vec::new();
@@ -63,14 +55,6 @@ pub(crate) fn recent_commits_in(repo: &gix::Repository, n: usize) -> Vec<(String
 }
 
 /// All tag names, sorted alphabetically.
-pub fn tags() -> Vec<String> {
-    match open_repo() {
-        Ok(repo) => tags_in(&repo),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// [`tags`] against an already-open repository.
 pub(crate) fn tags_in(repo: &gix::Repository) -> Vec<String> {
     let Ok(platform) = repo.references() else {
         return Vec::new();

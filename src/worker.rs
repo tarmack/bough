@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{select, Receiver, Sender};
+use crossbeam_channel::{select, Receiver, Sender, TryRecvError};
 
 use crate::diff::Diff;
 use crate::git;
@@ -35,7 +35,9 @@ const LARGE_DIFF_THRESHOLD: usize = 2000;
 /// Above this git wall time the floor raises to the ceiling.
 const SLOW_GIT_THRESHOLD: Duration = Duration::from_millis(200);
 /// Maximum number of `(path, ctx)` diffs kept in the worker's LRU.
-const CACHE_CAP: usize = 8;
+const CACHE_CAP: usize = 32;
+/// Child diffs built per emitted chunk while streaming a directory aggregate.
+const DIR_CHUNK: usize = 25;
 /// Hard cap on how many bytes of a preview image are read from disk.
 const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 /// Hard cap on decoded preview pixels, mirrored on the `ImageReader`.
@@ -88,6 +90,7 @@ impl Worker {
         empty: bool,
         repo_root: PathBuf,
         initial_theme: String,
+        initial_branch: git::BranchState,
     ) -> Result<Worker, WorkerError> {
         let watcher = match Watcher::start(repo_root.clone()) {
             Ok(w) => w,
@@ -95,7 +98,14 @@ impl Worker {
                 // No watcher: surface via the first snapshot's error and run
                 // request-only. poll_mode stays false (watcher is off, not
                 // degraded to a workdir poll).
-                return spawn_no_watcher(rev, empty, repo_root, initial_theme, e.to_string());
+                return spawn_no_watcher(
+                    rev,
+                    empty,
+                    repo_root,
+                    initial_theme,
+                    initial_branch,
+                    e.to_string(),
+                );
             }
         };
         let poll_mode = watcher_poll_mode(&watcher);
@@ -117,6 +127,7 @@ impl Worker {
                     empty,
                     highlighter,
                     repo_root,
+                    initial_branch,
                     watcher,
                     shutdown_t,
                     LoopChannels {
@@ -167,6 +178,7 @@ fn spawn_no_watcher(
     empty: bool,
     repo_root: PathBuf,
     theme: String,
+    initial_branch: git::BranchState,
     watch_err: String,
 ) -> Result<Worker, WorkerError> {
     let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
@@ -182,7 +194,8 @@ fn spawn_no_watcher(
             let highlighter = Highlighter::new(&theme).ok();
             // Emit one initial snapshot carrying the watcher error so the UI
             // status line surfaces it, then serve Diff requests only.
-            let mut state = WorkerState::new(rev.clone(), empty, highlighter, repo_root);
+            let mut state =
+                WorkerState::new(rev.clone(), empty, highlighter, repo_root, initial_branch);
             state.last_error = Some(first_error);
             state.send_initial(&snapshot_tx);
 
@@ -224,8 +237,8 @@ fn spawn_no_watcher(
 /// `None` otherwise. The UI only ever asks for the visible region, so `hl`
 /// stays sparse and each request colors exactly the new viewport.
 struct CachedDiff {
-    diff: Diff,
-    hl: HighlightLines,
+    diff: Arc<Diff>,
+    hl: Arc<HighlightLines>,
     /// Global line -> (file index, body offset of that file), `None` for
     /// headers.
     body_idx: Vec<Option<(usize, usize)>>,
@@ -254,7 +267,7 @@ struct FileCache {
 }
 
 /// Build sparse highlight + per-file body/checkpoint bookkeeping for `diff`.
-fn new_cached_diff(diff: &Diff, highlighter: Option<&Highlighter>) -> CachedDiff {
+fn new_cached_diff(diff: Arc<Diff>, highlighter: Option<&Highlighter>) -> CachedDiff {
     let mut body_idx = vec![None; diff.lines.len()];
     let mut files: Vec<FileCache> = diff
         .files
@@ -280,9 +293,10 @@ fn new_cached_diff(diff: &Diff, highlighter: Option<&Highlighter>) -> CachedDiff
             }
         }
     }
+    let lines = diff.lines.len();
     CachedDiff {
-        diff: diff.clone(),
-        hl: vec![None; diff.lines.len()],
+        diff,
+        hl: Arc::new(vec![None; lines]),
         body_idx,
         files,
     }
@@ -298,7 +312,11 @@ struct WorkerState {
     selected_path: Option<String>,
     ctx: u32,
     latest_request_seq: Seq,
-    last_tree: Option<Tree>,
+    last_tree: Option<Arc<Tree>>,
+    /// Last diff/highlight sent, retained across a two-phase recompute so the
+    /// busy phase can re-send it without a deep clone.
+    last_diff: Option<Arc<Diff>>,
+    last_highlight: Arc<HighlightLines>,
     last_error: Option<String>,
     cache: LruCache<(String, u32), CachedDiff>,
     /// When the floor was last raised; `None` when floor is at the baseline.
@@ -318,13 +336,22 @@ struct WorkerState {
     /// view (its own totals already are uncommitted-only) or when the extra
     /// scan failed.
     uncommitted_stats: Option<(usize, usize)>,
+    /// Cached git exclude chain, used to skip a recompute when every changed
+    /// path is ignored. `None` when the repository/excludes are unavailable,
+    /// which always falls back to recomputing.
+    ignore: Option<IgnoreMatcher>,
 }
 
 impl WorkerState {
-    fn new(rev: String, empty: bool, highlighter: Option<Highlighter>, repo_root: PathBuf) -> Self {
-        // Compute once up front so the first worker snapshot already shows
-        // real branch state; later recomputes refresh it.
-        let initial_branch = git::branch_state(&rev);
+    /// `initial_branch` is resolved by the caller (main) so the startup
+    /// rev-walk runs once; later recomputes refresh it in place.
+    fn new(
+        rev: String,
+        empty: bool,
+        highlighter: Option<Highlighter>,
+        repo_root: PathBuf,
+        initial_branch: git::BranchState,
+    ) -> Self {
         WorkerState {
             rev,
             empty,
@@ -334,6 +361,8 @@ impl WorkerState {
             ctx: 3,
             latest_request_seq: 0,
             last_tree: None,
+            last_diff: None,
+            last_highlight: Arc::new(Vec::new()),
             last_error: None,
             cache: LruCache::new(CACHE_CAP),
             floor_raised_at: None,
@@ -342,25 +371,37 @@ impl WorkerState {
             last_changes: HashMap::new(),
             preview_active: false,
             uncommitted_stats: None,
+            ignore: IgnoreMatcher::open(),
         }
     }
 
     /// Send an initial empty-ish snapshot so the UI's first frame isn't blank
     /// while the first recompute is debouncing.
     fn send_initial(&mut self, tx: &Sender<ArcSnapshot>) {
-        send_snapshot(self, tx, None, Vec::new(), self.last_error.clone());
+        let tree = self.last_tree.clone().unwrap_or_else(empty_tree);
+        let snap = self.snapshot(
+            tree,
+            None,
+            Arc::new(Vec::new()),
+            self.last_error.clone(),
+            false,
+        );
+        let _ = tx.send(Arc::new(snap));
     }
 
     /// Assemble a `Snapshot` from the current worker state plus the caller's
-    /// diff/highlight/error specifics.
+    /// tree/diff/highlight/error specifics.
     fn snapshot(
         &mut self,
-        tree: Tree,
-        selected_diff: Option<Diff>,
-        selected_highlight: HighlightLines,
+        tree: Arc<Tree>,
+        selected_diff: Option<Arc<Diff>>,
+        selected_highlight: Arc<HighlightLines>,
         error: Option<String>,
+        busy: bool,
     ) -> Snapshot {
         Snapshot {
+            seq: self.latest_request_seq,
+            busy,
             empty: self.empty,
             tree,
             selected_diff,
@@ -370,6 +411,82 @@ impl WorkerState {
             uncommitted_stats: self.uncommitted_stats,
         }
     }
+}
+
+/// Cached git exclude chain: decides whether a changed path is git-ignored so
+/// an all-ignored watcher burst can skip its recompute. The `Stack` owns its
+/// parsed pattern state, so the chain is built once (in [`IgnoreMatcher::open`])
+/// and reused across fires.
+struct IgnoreMatcher {
+    repo: gix::Repository,
+    stack: gix::worktree::Stack,
+}
+
+impl IgnoreMatcher {
+    /// Build from the repository at the process working directory. `None` when
+    /// the repository or its index/excludes are unavailable.
+    fn open() -> Option<Self> {
+        Self::from_repo(git::open_repo().ok()?)
+    }
+
+    /// Build the exclude chain for `repo`. `None` on any failure; the caller
+    /// then always recomputes.
+    fn from_repo(repo: gix::Repository) -> Option<Self> {
+        let index = repo.index_or_empty().ok()?;
+        let stack = repo
+            .excludes(
+                &index,
+                None,
+                gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+            )
+            .ok()?
+            .detach();
+        Some(IgnoreMatcher { repo, stack })
+    }
+
+    /// True only when `rel` is confidently git-ignored. Any lookup error is
+    /// treated as not-ignored so the caller recomputes rather than skipping.
+    fn is_ignored(&mut self, rel: &Path) -> bool {
+        match self.stack.at_path(rel, None, &self.repo.objects) {
+            Ok(platform) => platform.is_excluded(),
+            Err(_) => false,
+        }
+    }
+
+    /// True only when `rel` is confidently git-ignored *and* untracked. An
+    /// exclude lookup never consults the index, so a tracked file matching an
+    /// ignore pattern (force-added, or a pattern added after tracking) must
+    /// still trigger a recompute. Any index lookup failure is treated as
+    /// not-skippable.
+    fn is_ignored_untracked(&mut self, rel: &Path) -> bool {
+        self.is_ignored(rel) && matches!(self.is_tracked(rel), Some(false))
+    }
+
+    /// `Some(true)` when `rel` has an index entry, `Some(false)` when the index
+    /// is readable and has none, `None` when the index can't be read.
+    fn is_tracked(&self, rel: &Path) -> Option<bool> {
+        let index = self.repo.index_or_empty().ok()?;
+        let path = gix::path::into_bstr(rel);
+        Some(index.entry_by_path(path.as_ref()).is_some())
+    }
+}
+
+/// True when `changed` is non-empty and every path satisfies `is_ignored`. The
+/// decision core of [`skip_ignored`], split out so it is testable with an
+/// injected matcher.
+fn all_ignored<F: FnMut(&Path) -> bool>(changed: &[PathBuf], mut is_ignored: F) -> bool {
+    !changed.is_empty() && changed.iter().all(|p| is_ignored(p))
+}
+
+/// True when a debounced workdir recompute can be skipped because every changed
+/// path is both git-ignored and untracked. Conservative: an empty path list, an
+/// unavailable matcher, or any path that is not confidently ignored-untracked
+/// returns `false`.
+fn skip_ignored(state: &mut WorkerState, changed: &[PathBuf]) -> bool {
+    let Some(matcher) = state.ignore.as_mut() else {
+        return false;
+    };
+    all_ignored(changed, |p| matcher.is_ignored_untracked(p))
 }
 
 /// The channels the worker loop reads from and writes to: watcher events,
@@ -382,11 +499,13 @@ struct LoopChannels {
 }
 
 /// Main loop with watcher events + requests + debounce timer.
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     rev: String,
     empty: bool,
     highlighter: Option<Highlighter>,
     repo_root: PathBuf,
+    initial_branch: git::BranchState,
     watcher: Watcher,
     shutdown: Arc<AtomicBool>,
     channels: LoopChannels,
@@ -398,12 +517,12 @@ fn run_loop(
         image_tx,
     } = channels;
     let _watcher = watcher; // keep alive for the life of the loop
-    let mut state = WorkerState::new(rev, empty, highlighter, repo_root);
+    let mut state = WorkerState::new(rev, empty, highlighter, repo_root, initial_branch);
     state.send_initial(&snapshot_tx);
     // First real snapshot comes from the initial recompute, so startup never
     // blocks the main thread on the git scan (whose cost scales with the total
     // diff size).
-    recompute(&mut state, &snapshot_tx, &image_tx);
+    recompute(&mut state, &snapshot_tx, &image_tx, &shutdown, true);
 
     let mut last_event: Option<Instant> = None;
     let mut last_recompute: Option<Instant> = None;
@@ -411,6 +530,15 @@ fn run_loop(
     // never-ready one so `select!` blocks on requests/timeout instead of
     // spinning on the permanently-ready disconnected arm.
     let mut event_closed = false;
+    // True when a workdir change (not just ref churn) arrived since the last
+    // recompute, so the uncommitted-only scan is worth redoing.
+    let mut saw_workdir = false;
+    // Repo-relative paths from workdir events since the last recompute, used
+    // to skip a recompute when every one is git-ignored. Deduped at fire time.
+    let mut changed_paths: Vec<PathBuf> = Vec::new();
+    // True when a ref moved in the current debounce window; a ref change must
+    // always recompute, even alongside only-ignored workdir paths.
+    let mut saw_refs = false;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -427,8 +555,15 @@ fn run_loop(
 
         select! {
             recv(event_rx) -> ev => match ev {
-                Ok(_we) => {
+                Ok(we) => {
                     last_event = Some(Instant::now());
+                    match we {
+                        WorkerEvent::WorkdirChanged(paths) => {
+                            saw_workdir = true;
+                            changed_paths.extend(paths);
+                        }
+                        WorkerEvent::RefsChanged => saw_refs = true,
+                    }
                 }
                 Err(_) => {
                     // Watcher closed; stop watching the never-ready channel.
@@ -437,7 +572,17 @@ fn run_loop(
             },
             recv(request_rx) -> req => match req {
                 Ok(r) => {
-                    if handle_request(r, &mut state, &snapshot_tx, &image_tx, &shutdown) {
+                    // Fold any queued requests so a burst (rapid `j`) runs at
+                    // most the latest of each kind.
+                    let survivors = coalesce(r, &request_rx, &shutdown);
+                    let mut quit = false;
+                    for survivor in survivors {
+                        if handle_request(survivor, &mut state, &snapshot_tx, &image_tx, &shutdown) {
+                            quit = true;
+                            break;
+                        }
+                    }
+                    if quit {
                         break;
                     }
                 }
@@ -463,10 +608,141 @@ fn run_loop(
                 // Hard ceiling: too soon since the last recompute. Reschedule.
                 continue;
             }
-            recompute(&mut state, &snapshot_tx, &image_tx);
-            last_recompute = Some(Instant::now());
+            changed_paths.sort();
+            changed_paths.dedup();
+            // A burst that only touched git-ignored paths cannot change the
+            // scan result, so skip the recompute entirely — unless a ref moved
+            // in the same window.
+            if saw_refs || !skip_ignored(&mut state, &changed_paths) {
+                recompute(
+                    &mut state,
+                    &snapshot_tx,
+                    &image_tx,
+                    &shutdown,
+                    refresh_uncommitted_for(saw_workdir, saw_refs),
+                );
+                last_recompute = Some(Instant::now());
+            }
+            // A `.gitignore` edit invalidates the cached exclude chain; rebuild
+            // it so a path newly ignored or unignored is judged correctly next.
+            if changed_paths
+                .iter()
+                .any(|p| p.ends_with(Path::new(".gitignore")))
+            {
+                state.ignore = IgnoreMatcher::open();
+            }
             last_event = None;
+            saw_workdir = false;
+            saw_refs = false;
+            changed_paths.clear();
         }
+    }
+}
+
+/// Fold a burst of queued requests: the latest `SetRev` dominates everything
+/// queued before it; the latest `Diff` survives, a `Highlight` survives only
+/// when it targets that Diff (or no Diff is queued), and the latest `LoadImage`
+/// survives. A surviving `Diff`/`Highlight`/`LoadImage` is executed after the
+/// `SetRev` and in ascending request-seq order. An empty result means
+/// everything was superseded.
+fn coalesce(first: Request, rx: &Receiver<Request>, shutdown: &AtomicBool) -> Vec<Request> {
+    if matches!(first, Request::Shutdown) {
+        return vec![Request::Shutdown];
+    }
+    let mut folded = Folded::default();
+    folded.absorb(first);
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return vec![Request::Shutdown];
+        }
+        match rx.try_recv() {
+            Ok(Request::Shutdown) => return vec![Request::Shutdown],
+            Ok(r) => folded.absorb(r),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+    folded.into_requests()
+}
+
+/// Accumulator for [`coalesce`]: retains the latest request of each kind,
+/// dropping any that a newer rev switch supersedes.
+#[derive(Default)]
+struct Folded {
+    set_rev: Option<String>,
+    diff: Option<Request>,
+    highlight: Option<Request>,
+    image: Option<Request>,
+}
+
+impl Folded {
+    fn absorb(&mut self, r: Request) {
+        match r {
+            // A rev switch discards everything queued before it, but requests
+            // queued after it survive (a new selection alongside a base switch
+            // must still be served once the recompute lands).
+            Request::SetRev { rev } => {
+                self.set_rev = Some(rev);
+                self.diff = None;
+                self.highlight = None;
+                self.image = None;
+            }
+            Request::Diff { .. } => self.diff = Some(r),
+            Request::Highlight { .. } => self.highlight = Some(r),
+            Request::LoadImage { .. } => self.image = Some(r),
+            // `coalesce` intercepts `Shutdown` before it ever reaches the fold.
+            Request::Shutdown => unreachable!("coalesce handles Shutdown"),
+        }
+    }
+
+    fn into_requests(self) -> Vec<Request> {
+        let diff_path = match &self.diff {
+            Some(Request::Diff { path, .. }) => Some(path.clone()),
+            _ => None,
+        };
+        let highlight = match self.highlight {
+            Some(h) => {
+                let keep = match diff_path {
+                    Some(p) => matches!(&h, Request::Highlight { path, .. } if *path == p),
+                    None => true,
+                };
+                keep.then_some(h)
+            }
+            None => None,
+        };
+        let mut survivors = Vec::new();
+        if let Some(d) = self.diff {
+            survivors.push(d);
+        }
+        if let Some(h) = highlight {
+            survivors.push(h);
+        }
+        if let Some(i) = self.image {
+            survivors.push(i);
+        }
+        // `handle_request` gates every kind on the shared `latest_request_seq`,
+        // so a higher-seq survivor emitted first would stale-drop a lower-seq
+        // one. Emit in ascending seq instead.
+        survivors.sort_by_key(request_seq);
+        match self.set_rev {
+            Some(rev) => {
+                let mut out = Vec::with_capacity(survivors.len() + 1);
+                out.push(Request::SetRev { rev });
+                out.extend(survivors);
+                out
+            }
+            None => survivors,
+        }
+    }
+}
+
+/// Request sequence number used to order coalesced survivors. Rev switches and
+/// shutdown carry no seq and never appear among the ordered survivors.
+fn request_seq(r: &Request) -> Seq {
+    match r {
+        Request::Diff { seq, .. }
+        | Request::Highlight { seq, .. }
+        | Request::LoadImage { seq, .. } => *seq,
+        Request::SetRev { .. } | Request::Shutdown => 0,
     }
 }
 
@@ -512,6 +788,13 @@ fn should_fire(last_event: Instant, now: Instant, floor: Duration) -> bool {
     now.duration_since(last_event) >= floor
 }
 
+/// Whether a debounced recompute must redo the uncommitted-only scan. A commit
+/// moves HEAD (refs-only) and changes `all_changes("HEAD")`, so a ref move
+/// refreshes just like a workdir edit.
+fn refresh_uncommitted_for(saw_workdir: bool, saw_refs: bool) -> bool {
+    saw_workdir || saw_refs
+}
+
 /// True when an incoming `Request::Diff` seq is stale (older than the latest
 /// we've already accepted). Equal seq is not stale (the UI may resend).
 fn is_stale(latest: Seq, incoming: Seq) -> bool {
@@ -539,7 +822,7 @@ fn handle_request(
                 // longer apply once the base changes, so drop them.
                 state.cache = LruCache::new(CACHE_CAP);
                 state.last_error = None;
-                recompute(state, tx, image_tx);
+                recompute(state, tx, image_tx, shutdown, true);
             }
             false
         }
@@ -550,7 +833,7 @@ fn handle_request(
             state.latest_request_seq = seq;
             state.selected_path = Some(path.clone());
             state.ctx = ctx;
-            serve_diff(state, &path, ctx, tx);
+            serve_diff(state, &path, ctx, tx, shutdown);
             false
         }
         Request::Highlight {
@@ -678,7 +961,13 @@ type LineStats = HashMap<String, (usize, usize)>;
 /// Scan the working tree into `(status, path)` entries plus per-path
 /// `(added, deleted)` stats. Empty repos read the untracked listing; otherwise
 /// the full change set is read and cached for per-file diff reuse.
-fn scan_entries(state: &mut WorkerState) -> Result<(Vec<Entry>, LineStats), String> {
+fn scan_entries(
+    state: &mut WorkerState,
+    shutdown: &AtomicBool,
+) -> Result<(Vec<Entry>, LineStats), String> {
+    if shutdown.load(Ordering::Relaxed) {
+        return Err("shutdown".into());
+    }
     if state.empty {
         let entries = git::initial_listing().map_err(|e| e.to_string())?;
         let paths: Vec<String> = entries.iter().map(|(_, p)| p.clone()).collect();
@@ -707,19 +996,54 @@ fn scan_entries(state: &mut WorkerState) -> Result<(Vec<Entry>, LineStats), Stri
 ///
 /// Runs one scan of the working tree and derives the entries, per-file stats,
 /// and per-file metadata (for the diff header) from it, so nothing is rescanned
-/// on file selection.
-fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>, image_tx: &Sender<PreviewImage>) {
+/// on file selection. `refresh_uncommitted` controls whether the extra
+/// uncommitted-only scan runs: workdir edits, ref movement (a commit changes
+/// `all_changes("HEAD")`), and rev switches all need it.
+fn recompute(
+    state: &mut WorkerState,
+    tx: &Sender<ArcSnapshot>,
+    image_tx: &Sender<PreviewImage>,
+    shutdown: &AtomicBool,
+    refresh_uncommitted: bool,
+) {
     let t0 = Instant::now();
-
-    let (entries, stats) = match scan_entries(state) {
+    let (entries, stats) = match scan_entries(state, shutdown) {
         Ok(x) => x,
         Err(err) => {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
             state.last_error = Some(err);
             send_error_snapshot(state, tx);
             return;
         }
     };
+    recompute_from_scan(
+        state,
+        tx,
+        image_tx,
+        shutdown,
+        refresh_uncommitted,
+        entries,
+        stats,
+        t0,
+    );
+}
 
+/// The post-scan half of [`recompute`]: evict, refresh branch stats, build the
+/// tree, then stream the two phases (busy tree, settled diff). Split out so the
+/// two-phase sequencing is testable without a live repository.
+#[allow(clippy::too_many_arguments)]
+fn recompute_from_scan(
+    state: &mut WorkerState,
+    tx: &Sender<ArcSnapshot>,
+    image_tx: &Sender<PreviewImage>,
+    shutdown: &AtomicBool,
+    refresh_uncommitted: bool,
+    entries: Vec<Entry>,
+    stats: LineStats,
+    t0: Instant,
+) {
     // A watcher recompute may have changed files whose old diffs are cached;
     // evict just those so the pane shows fresh content without discarding
     // highlight progress for every other file.
@@ -732,15 +1056,17 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>, image_tx: &Sende
     // work: a second, uncommitted-only scan. The uncommitted view's own
     // totals already are uncommitted-only, so skip it there. A failure just
     // hides the split from the footer.
-    state.uncommitted_stats = if state.rev.contains("...") {
-        git::all_changes("HEAD").ok().map(|changes| {
-            changes
-                .iter()
-                .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted))
-        })
-    } else {
-        None
-    };
+    if refresh_uncommitted {
+        state.uncommitted_stats = if state.rev.contains("...") {
+            git::all_changes("HEAD").ok().map(|changes| {
+                changes
+                    .iter()
+                    .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted))
+            })
+        } else {
+            None
+        };
+    }
 
     // Adaptive floor: slow git or huge diff raises the floor for 10s.
     if state.last_git_wall > SLOW_GIT_THRESHOLD || entries.len() > LARGE_DIFF_THRESHOLD {
@@ -749,17 +1075,39 @@ fn recompute(state: &mut WorkerState, tx: &Sender<ArcSnapshot>, image_tx: &Sende
 
     let mut tree = Tree::build(entries);
     tree.annotate_stats(&stats);
-    state.last_tree = Some(clone_tree(&tree));
+    let tree = Arc::new(tree);
+    state.last_tree = Some(tree.clone());
 
-    let (selected_diff, selected_highlight) = {
-        let rev = state.rev.clone();
-        let ctx = state.ctx;
-        build_selected_diff(state, &tree, &rev, ctx)
-    };
+    if shutdown.load(Ordering::Relaxed) {
+        return;
+    }
 
+    // Phase 1: busy snapshot carrying the fresh tree and the previous diff
+    // (no flicker; the UI skips diff side effects on a shared Arc).
     state.last_error = None;
-    let snap = state.snapshot(tree, selected_diff, selected_highlight, None);
-    let _ = tx.send(Arc::new(snap));
+    let prev_diff = state.last_diff.clone();
+    let prev_hl = state.last_highlight.clone();
+    send_snapshot(state, tx, tree.clone(), prev_diff, prev_hl, None, true);
+
+    if shutdown.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // Phase 2: build (or fill) the selected diff, then send the settled
+    // snapshot with `busy = false`.
+    let rev = state.rev.clone();
+    let ctx = state.ctx;
+    let (diff, hl) = build_selected_diff(state, &tree, &rev, ctx, tx, shutdown);
+
+    if shutdown.load(Ordering::Relaxed) {
+        return;
+    }
+    state.last_diff = diff.clone();
+    state.last_highlight = hl.clone();
+    // A `build_selected_diff` failure set `state.last_error`; surface it on the
+    // settled snapshot rather than dropping it behind a hard-coded `None`.
+    let error = state.last_error.clone();
+    send_snapshot(state, tx, tree, diff, hl, error, false);
 
     // Refresh an image preview when the selected image changed on disk: its
     // binary diff is content-identical, so nothing else in the snapshot
@@ -790,26 +1138,33 @@ fn evict_changed(state: &mut WorkerState) {
     });
 }
 
-/// Send a snapshot that carries `error` but preserves the last known tree.
-fn send_error_snapshot(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
-    send_snapshot(state, tx, None, Vec::new(), state.last_error.clone());
+/// An empty tree, used when no scan has produced one yet.
+fn empty_tree() -> Arc<Tree> {
+    Arc::new(Tree::build(Vec::new()))
 }
 
-/// Assemble and send a snapshot from the current worker state plus the
-/// caller's diff/highlight/error specifics. Builds from the last known tree
-/// (an empty one if none) so the UI keeps showing the previous state.
+/// Send a snapshot that carries `error` but preserves the last known tree/diff.
+fn send_error_snapshot(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
+    let tree = state.last_tree.clone().unwrap_or_else(empty_tree);
+    let diff = state.last_diff.clone();
+    let hl = state.last_highlight.clone();
+    let error = state.last_error.clone();
+    send_snapshot(state, tx, tree, diff, hl, error, false);
+}
+
+/// Assemble and send a snapshot from the caller's tree/diff/highlight/error
+/// specifics. All payloads are `Arc`s, so sends share rather than deep-clone.
+#[allow(clippy::too_many_arguments)]
 fn send_snapshot(
     state: &mut WorkerState,
     tx: &Sender<ArcSnapshot>,
-    diff: Option<Diff>,
-    highlight: HighlightLines,
+    tree: Arc<Tree>,
+    diff: Option<Arc<Diff>>,
+    highlight: Arc<HighlightLines>,
     error: Option<String>,
+    busy: bool,
 ) {
-    let tree = state
-        .last_tree
-        .clone()
-        .unwrap_or_else(|| Tree::build(Vec::new()));
-    let snap = state.snapshot(tree, diff, highlight, error);
+    let snap = state.snapshot(tree, diff, highlight, error, busy);
     let _ = tx.send(Arc::new(snap));
 }
 
@@ -817,36 +1172,41 @@ fn send_snapshot(
 /// Returns `(diff, highlight)`. On any error, `(None, vec![])`.
 fn build_selected_diff(
     state: &mut WorkerState,
-    tree: &Tree,
+    tree: &Arc<Tree>,
     rev: &str,
     ctx: u32,
-) -> (Option<Diff>, HighlightLines) {
+    tx: &Sender<ArcSnapshot>,
+    shutdown: &AtomicBool,
+) -> (Option<Arc<Diff>>, Arc<HighlightLines>) {
     let Some(path) = state.selected_path.clone() else {
-        return (None, Vec::new());
+        return (None, Arc::new(Vec::new()));
     };
     let in_tree = tree.nodes.iter().any(|n| n.path == path);
     if !in_tree {
-        return (None, Vec::new());
+        return (None, Arc::new(Vec::new()));
     }
-    build_diff_for(&path, state, rev, ctx)
+    build_diff_for(&path, state, rev, ctx, tree, tx, shutdown)
 }
 
 /// Parse one file's diff. Uses the LRU cache when hit; on miss parses fresh
 /// and caches it un-highlighted (highlighting is filled progressively via
-/// [`fill_highlight`] as the UI scrolls). Mutates `state.cache`.
+/// [`fill_highlight_range`] as the UI scrolls). Mutates `state.cache`.
 fn build_diff_for(
     path: &str,
     state: &mut WorkerState,
     rev: &str,
     ctx: u32,
-) -> (Option<Diff>, HighlightLines) {
+    tree: &Arc<Tree>,
+    tx: &Sender<ArcSnapshot>,
+    shutdown: &AtomicBool,
+) -> (Option<Arc<Diff>>, Arc<HighlightLines>) {
     let key = (path.to_string(), ctx);
     if let Some(e) = state.cache.get(&key) {
         return (Some(e.diff.clone()), e.hl.clone());
     }
 
     let diff = if is_directory(state, path) {
-        build_directory_diff(path, state, rev, ctx)
+        build_directory_diff(path, state, rev, ctx, tree, tx, shutdown)
     } else {
         build_single_file_diff(path, state, rev, ctx)
     };
@@ -855,15 +1215,18 @@ fn build_diff_for(
         Ok(diff) => {
             // No highlighting yet: every line is `None` until the UI nudges the
             // worker to fill the viewport. The diff itself renders instantly.
-            let cached = new_cached_diff(&diff, state.highlighter.as_ref());
+            let diff = Arc::new(diff);
+            let cached = new_cached_diff(diff.clone(), state.highlighter.as_ref());
             let hl = cached.hl.clone();
             state.cache.put(key, cached);
             state.last_error = None;
             (Some(diff), hl)
         }
         Err(e) => {
-            state.last_error = Some(e.to_string());
-            (None, Vec::new())
+            if !shutdown.load(Ordering::Relaxed) {
+                state.last_error = Some(e.to_string());
+            }
+            (None, Arc::new(Vec::new()))
         }
     }
 }
@@ -900,56 +1263,108 @@ fn build_single_file_diff(
 
 /// Build the multi-file diff for a selected directory: every changed file
 /// beneath it (including new files), in path order, combined under a summary
-/// header.
+/// header. Emits a busy snapshot every [`DIR_CHUNK`] children so the pane fills
+/// progressively; the caller sends the settled final snapshot.
 fn build_directory_diff(
     path: &str,
-    state: &WorkerState,
+    state: &mut WorkerState,
     rev: &str,
     ctx: u32,
+    tree: &Arc<Tree>,
+    tx: &Sender<ArcSnapshot>,
+    shutdown: &AtomicBool,
 ) -> Result<Diff, git::GitError> {
     let prefix = format!("{path}/");
-    let mut entries: Vec<(&String, &git::ChangeInfo)> = state
+    // Owned copies so `state` stays free for the streaming sends below.
+    let mut entries: Vec<(String, git::ChangeInfo)> = state
         .last_changes
         .iter()
         .filter(|(p, _)| p.starts_with(&prefix))
+        .map(|(p, ci)| (p.clone(), ci.clone()))
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Open the repo once up front instead of re-discovering it per file.
     let repo = git::open_repo().map_err(|e| git::GitError::message(e.to_string()))?;
 
-    let mut diffs = Vec::with_capacity(entries.len());
+    // Children are `Arc`ed so each streamed chunk borrows them instead of
+    // deep-cloning every diff built so far.
+    let mut diffs: Vec<Arc<Diff>> = Vec::with_capacity(entries.len());
     for (p, ci) in entries {
-        diffs.push(git::diff_file_in(
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(git::GitError::message("shutdown"));
+        }
+        diffs.push(Arc::new(git::diff_file_in(
             &repo,
             rev,
-            p,
-            &ci.clone().into_meta(),
+            &p,
+            &ci.into_meta(),
             ctx,
-        )?);
+        )?));
+        if diffs.len().is_multiple_of(DIR_CHUNK) {
+            stream_directory_chunk(state, tree, path, &diffs, tx);
+        }
     }
-    Ok(Diff::from_directory(path, diffs))
+    Ok(Diff::from_directory(path, &diffs))
+}
+
+/// Send a busy snapshot carrying the directory diff built so far. No-op when
+/// the selection has moved on; the partial chunk is for the live view only.
+fn stream_directory_chunk(
+    state: &mut WorkerState,
+    tree: &Arc<Tree>,
+    path: &str,
+    diffs: &[Arc<Diff>],
+    tx: &Sender<ArcSnapshot>,
+) {
+    if state.selected_path.as_deref() != Some(path) {
+        return;
+    }
+    let partial = Diff::from_directory(path, diffs);
+    let hl = Arc::new(vec![None; partial.lines.len()]);
+    let error = state.last_error.clone();
+    send_snapshot(
+        state,
+        tx,
+        tree.clone(),
+        Some(Arc::new(partial)),
+        hl,
+        error,
+        true,
+    );
 }
 
 /// Serve a `Request::Diff`: fetch the (cached or freshly-built) diff and send
 /// a snapshot immediately, un-highlighted on first visit. Highlighting then
 /// fills in via `Request::Highlight` nudges from the UI, so a larger file's
-/// diff appears right away and colors in as it scrolls.
-fn serve_diff(state: &mut WorkerState, path: &str, ctx: u32, tx: &Sender<ArcSnapshot>) {
+/// diff appears right away and colors in as it scrolls. Directory aggregates
+/// stream busy chunks from [`build_directory_diff`] before this settled send.
+fn serve_diff(
+    state: &mut WorkerState,
+    path: &str,
+    ctx: u32,
+    tx: &Sender<ArcSnapshot>,
+    shutdown: &AtomicBool,
+) {
     let rev = state.rev.clone();
-    let (diff, hl) = build_diff_for(path, state, &rev, ctx);
+    let tree = state.last_tree.clone().unwrap_or_else(empty_tree);
+    let (diff, hl) = build_diff_for(path, state, &rev, ctx, &tree, tx, shutdown);
     send_diff_snapshot(state, diff, hl, tx);
 }
 
-/// Assemble and send a snapshot whose only changed field vs the last full
-/// recompute is the selected diff (plus error).
+/// Assemble and send a settled snapshot whose only changed field vs the last
+/// full recompute is the selected diff (plus error).
 fn send_diff_snapshot(
     state: &mut WorkerState,
-    diff: Option<Diff>,
-    hl: HighlightLines,
+    diff: Option<Arc<Diff>>,
+    hl: Arc<HighlightLines>,
     tx: &Sender<ArcSnapshot>,
 ) {
-    send_snapshot(state, tx, diff, hl, state.last_error.clone());
+    state.last_diff = diff.clone();
+    state.last_highlight = hl.clone();
+    let tree = state.last_tree.clone().unwrap_or_else(empty_tree);
+    let error = state.last_error.clone();
+    send_snapshot(state, tx, tree, diff, hl, error, false);
 }
 
 /// Ensure a checkpoint exists at `(body / CKPT_STRIDE) * CKPT_STRIDE`, then
@@ -1010,6 +1425,9 @@ fn fill_highlight_range(
         let WorkerState {
             cache, highlighter, ..
         } = &mut *state;
+        // Fill-only: a miss means nothing is cached for the current selection
+        // (e.g. a directory aggregate still streaming). Never build a diff
+        // here, or every streamed chunk would restart the whole build.
         let Some(entry) = cache.get(&key) else {
             return;
         };
@@ -1025,6 +1443,8 @@ fn fill_highlight_range(
             body_idx,
             files,
         } = entry;
+        // Copy-on-write: a previously-sent snapshot may still hold this Arc.
+        let hl = Arc::make_mut(hl);
         let mut cur_file: Option<usize> = None;
         let mut cur_resume: Option<ResumeState> = None;
 
@@ -1054,14 +1474,6 @@ fn fill_highlight_range(
         None => return,
     };
     send_diff_snapshot(state, Some(diff), hl, tx);
-}
-
-/// Deep-clone a `Tree` (its nodes hold owned `Vec`s and `String`s).
-fn clone_tree(t: &Tree) -> Tree {
-    Tree {
-        nodes: t.nodes.clone(),
-        root: t.root,
-    }
 }
 
 /// Hand-rolled LRU keyed by `(path, ctx)`. `get` promotes the hit to the back;
@@ -1155,13 +1567,21 @@ mod tests {
     #[test]
     fn evict_changed_drops_only_changed_paths() {
         let diff = sample_diff(4);
-        let mut state = WorkerState::new("main...HEAD".into(), false, None, PathBuf::from("."));
-        state
-            .cache
-            .put(("a.rs".into(), 3u32), new_cached_diff(&diff, None));
-        state
-            .cache
-            .put(("b.rs".into(), 3u32), new_cached_diff(&diff, None));
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        state.cache.put(
+            ("a.rs".into(), 3u32),
+            new_cached_diff(Arc::new(diff.clone()), None),
+        );
+        state.cache.put(
+            ("b.rs".into(), 3u32),
+            new_cached_diff(Arc::new(diff.clone()), None),
+        );
         state
             .last_changes
             .insert("a.rs".into(), change_info("a.rs"));
@@ -1175,13 +1595,21 @@ mod tests {
     #[test]
     fn evict_changed_drops_directory_keys_for_child_paths() {
         let diff = sample_diff(4);
-        let mut state = WorkerState::new("main...HEAD".into(), false, None, PathBuf::from("."));
-        state
-            .cache
-            .put(("src".into(), 3u32), new_cached_diff(&diff, None));
-        state
-            .cache
-            .put(("doc".into(), 3u32), new_cached_diff(&diff, None));
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        state.cache.put(
+            ("src".into(), 3u32),
+            new_cached_diff(Arc::new(diff.clone()), None),
+        );
+        state.cache.put(
+            ("doc".into(), 3u32),
+            new_cached_diff(Arc::new(diff.clone()), None),
+        );
         state
             .last_changes
             .insert("src/a.rs".into(), change_info("src/a.rs"));
@@ -1195,10 +1623,17 @@ mod tests {
     #[test]
     fn evict_changed_clears_cache_in_empty_repo_mode() {
         let diff = sample_diff(4);
-        let mut state = WorkerState::new("HEAD".into(), true, None, PathBuf::from("."));
-        state
-            .cache
-            .put(("a.rs".into(), 3u32), new_cached_diff(&diff, None));
+        let mut state = WorkerState::new(
+            "HEAD".into(),
+            true,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        state.cache.put(
+            ("a.rs".into(), 3u32),
+            new_cached_diff(Arc::new(diff.clone()), None),
+        );
 
         evict_changed(&mut state);
 
@@ -1266,11 +1701,12 @@ mod tests {
             false,
             Highlighter::new("Monokai Extended").ok(),
             PathBuf::from("."),
+            git::BranchState::default(),
         );
         let key = ("x.rs".to_string(), 3u32);
         state.cache.put(
             key.clone(),
-            new_cached_diff(&diff, state.highlighter.as_ref()),
+            new_cached_diff(Arc::new(diff.clone()), state.highlighter.as_ref()),
         );
         state.selected_path = Some("x.rs".into());
         state.ctx = 3;
@@ -1284,11 +1720,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_state_new_populates_branch() {
-        // This repo is a git repo, so the first worker state must already
-        // carry a branch name (the footer depends on it before any recompute).
-        let state = WorkerState::new("main...HEAD".into(), false, None, PathBuf::from("."));
-        assert!(state.last_branch.name.is_some());
+    fn worker_state_uses_passed_branch() {
+        // main resolves branch state once at startup and passes it in; the
+        // worker must not redo the rev-walk for its first snapshot.
+        let branch = git::BranchState {
+            name: Some("main".into()),
+            ..Default::default()
+        };
+        let state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            branch,
+        );
+        assert_eq!(state.last_branch.name.as_deref(), Some("main"));
     }
 
     #[test]
@@ -1306,5 +1752,448 @@ mod tests {
         assert_eq!(pv.path, "a/b.png");
         assert_eq!((pv.width, pv.height), (4, 3));
         assert_eq!(&pv.png[..4], b"\x89PNG");
+    }
+
+    /// Enqueue `requests`, receive the first, and fold the rest (as the loop
+    /// does) with no shutdown pending.
+    fn coalesced(requests: Vec<Request>) -> Vec<Request> {
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        for r in requests {
+            tx.send(r).unwrap();
+        }
+        let first = rx.recv().unwrap();
+        let shutdown = AtomicBool::new(false);
+        coalesce(first, &rx, &shutdown)
+    }
+
+    fn diff_req(path: &str, seq: Seq) -> Request {
+        Request::Diff {
+            path: path.into(),
+            ctx: 3,
+            seq,
+        }
+    }
+
+    fn hl_req(path: &str, seq: Seq) -> Request {
+        Request::Highlight {
+            path: path.into(),
+            ctx: 3,
+            from: 0,
+            to: 5,
+            seq,
+        }
+    }
+
+    #[test]
+    fn coalesce_keeps_only_latest_diff() {
+        let out = coalesced(vec![diff_req("a", 1), diff_req("b", 2), diff_req("c", 3)]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Request::Diff { path, .. } if path == "c"));
+    }
+
+    #[test]
+    fn coalesce_setrev_drops_requests_before_it() {
+        let out = coalesced(vec![
+            diff_req("a", 1),
+            Request::SetRev {
+                rev: "x...HEAD".into(),
+            },
+        ]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Request::SetRev { rev } if rev == "x...HEAD"));
+    }
+
+    #[test]
+    fn coalesce_keeps_diff_after_setrev() {
+        // A selection queued alongside a base switch must survive the fold and
+        // be served after the recompute (SetRev first, then the Diff).
+        let out = coalesced(vec![
+            diff_req("a", 1),
+            Request::SetRev {
+                rev: "x...HEAD".into(),
+            },
+            diff_req("b", 2),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], Request::SetRev { rev } if rev == "x...HEAD"));
+        assert!(matches!(&out[1], Request::Diff { path, seq, .. } if path == "b" && *seq == 2));
+    }
+
+    #[test]
+    fn coalesce_orders_survivors_by_seq() {
+        // A lower-seq LoadImage must be emitted before a higher-seq Highlight,
+        // or the Highlight advances `latest_request_seq` and stales the image.
+        let out = coalesced(vec![
+            diff_req("a", 1),
+            Request::LoadImage {
+                path: "a".into(),
+                seq: 2,
+            },
+            hl_req("a", 3),
+        ]);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(&out[0], Request::Diff { seq: 1, .. }));
+        assert!(matches!(&out[1], Request::LoadImage { seq: 2, .. }));
+        assert!(matches!(&out[2], Request::Highlight { seq: 3, .. }));
+    }
+
+    #[test]
+    fn coalesce_low_seq_load_image_is_not_stale_dropped() {
+        let out = coalesced(vec![
+            Request::LoadImage {
+                path: "a".into(),
+                seq: 2,
+            },
+            hl_req("a", 3),
+        ]);
+        let (snap_tx, _snap_rx) = crossbeam_channel::bounded::<ArcSnapshot>(4);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        state.selected_path = Some("a".into());
+        state.ctx = 3;
+        let shutdown = AtomicBool::new(false);
+        for survivor in out {
+            handle_request(survivor, &mut state, &snap_tx, &image_tx, &shutdown);
+        }
+        // Executed in seq order, so the image request was accepted (its
+        // `preview_active` side effect ran) rather than stale-dropped.
+        assert!(state.preview_active);
+        assert_eq!(state.latest_request_seq, 3);
+    }
+
+    #[test]
+    fn coalesce_drops_highlight_for_other_path() {
+        let out = coalesced(vec![diff_req("a", 1), hl_req("b", 2)]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Request::Diff { path, .. } if path == "a"));
+    }
+
+    #[test]
+    fn coalesce_keeps_highlight_for_surviving_diff() {
+        let out = coalesced(vec![diff_req("a", 1), hl_req("a", 2)]);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], Request::Diff { .. }));
+        assert!(matches!(&out[1], Request::Highlight { .. }));
+    }
+
+    #[test]
+    fn coalesce_keeps_latest_load_image() {
+        let out = coalesced(vec![
+            diff_req("a", 1),
+            Request::LoadImage {
+                path: "a".into(),
+                seq: 2,
+            },
+            Request::LoadImage {
+                path: "b".into(),
+                seq: 3,
+            },
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], Request::Diff { .. }));
+        assert!(matches!(&out[1], Request::LoadImage { path, .. } if path == "b"));
+    }
+
+    #[test]
+    fn coalesce_shutdown_flag_returns_shutdown() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        tx.send(diff_req("a", 1)).unwrap();
+        let first = rx.recv().unwrap();
+        let shutdown = AtomicBool::new(true);
+        let out = coalesce(first, &rx, &shutdown);
+        assert!(matches!(out.as_slice(), [Request::Shutdown]));
+    }
+
+    #[test]
+    fn recompute_emits_busy_then_settled() {
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(8);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        let shutdown = AtomicBool::new(false);
+        let entries = vec![('M', "a.rs".to_string())];
+
+        recompute_from_scan(
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+            false,
+            entries,
+            HashMap::new(),
+            Instant::now(),
+        );
+
+        let first = rx.recv().unwrap();
+        assert!(first.busy, "phase 1 must be busy");
+        let second = rx.recv().unwrap();
+        assert!(!second.busy, "phase 2 must be settled");
+    }
+
+    #[test]
+    fn settled_snapshot_carries_diff_error() {
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(8);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "no-such-rev".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        // A selected file with cached metadata, so the diff build attempts to
+        // resolve the bogus revision and fails.
+        state.selected_path = Some("a.rs".into());
+        state
+            .last_changes
+            .insert("a.rs".into(), change_info("a.rs"));
+        let shutdown = AtomicBool::new(false);
+        let entries = vec![('M', "a.rs".to_string())];
+
+        recompute_from_scan(
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+            false,
+            entries,
+            HashMap::new(),
+            Instant::now(),
+        );
+
+        let busy = rx.recv().unwrap();
+        assert!(busy.busy, "phase 1 must be busy");
+        let settled = rx.recv().unwrap();
+        assert!(!settled.busy, "phase 2 must be settled");
+        assert!(
+            settled.error.is_some(),
+            "the settled snapshot must surface the diff build error"
+        );
+    }
+
+    #[test]
+    fn refresh_uncommitted_predicate_includes_refs() {
+        assert!(!refresh_uncommitted_for(false, false));
+        assert!(refresh_uncommitted_for(true, false));
+        // A refs-only window (e.g. a commit moved HEAD) must refresh too.
+        assert!(refresh_uncommitted_for(false, true));
+        assert!(refresh_uncommitted_for(true, true));
+    }
+
+    #[test]
+    fn directory_chunk_snapshot_is_busy() {
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(4);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        state.selected_path = Some("src".into());
+        let tree = Arc::new(Tree::build(vec![('M', "src/a.rs".to_string())]));
+        state.last_tree = Some(tree.clone());
+
+        stream_directory_chunk(
+            &mut state,
+            &tree,
+            "src",
+            &[Arc::new(sample_diff(3)), Arc::new(sample_diff(3))],
+            &tx,
+        );
+
+        let snap = rx.recv().unwrap();
+        assert!(snap.busy);
+        assert_eq!(snap.selected_diff.as_ref().unwrap().files.len(), 2);
+    }
+
+    #[test]
+    fn directory_aggregate_borrows_child_arcs() {
+        // A streaming/master list keeps children behind `Arc`; building an
+        // aggregate must not deep-clone or retain owned copies of them, so the
+        // same children can back every chunk of a growing directory diff.
+        let children = vec![Arc::new(sample_diff(3)), Arc::new(sample_diff(3))];
+        let aggregate = Diff::from_directory("src", &children);
+        let again = Diff::from_directory("src", &children);
+
+        assert_eq!(aggregate.files.len(), 2);
+        assert_eq!(again.files.len(), 2);
+        assert_eq!(
+            aggregate, again,
+            "repeated chunks must yield identical content"
+        );
+        for child in &children {
+            assert_eq!(
+                Arc::strong_count(child),
+                1,
+                "the aggregate must borrow, not retain, its child diffs"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_snapshot_shares_diff_arc() {
+        let (snap_tx, snap_rx) = crossbeam_channel::bounded::<ArcSnapshot>(8);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        let key = ("x.rs".to_string(), 3u32);
+        state.cache.put(
+            key.clone(),
+            new_cached_diff(Arc::new(sample_diff(40)), None),
+        );
+        state.selected_path = Some("x.rs".into());
+        state.ctx = 3;
+
+        fill_highlight_range(&mut state, "x.rs", 3, 0, 10, &snap_tx);
+        fill_highlight_range(&mut state, "x.rs", 3, 10, 20, &snap_tx);
+
+        let a = snap_rx.recv().unwrap();
+        let b = snap_rx.recv().unwrap();
+        assert!(!a.busy && !b.busy);
+        assert!(Arc::ptr_eq(
+            a.selected_diff.as_ref().unwrap(),
+            b.selected_diff.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(&a.selected_highlight, &b.selected_highlight));
+    }
+
+    #[test]
+    fn highlight_cache_miss_does_not_build_or_send() {
+        let (snap_tx, snap_rx) = crossbeam_channel::bounded::<ArcSnapshot>(4);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        // The selection is current, but nothing is cached for it yet (e.g. a
+        // directory aggregate mid-stream). A highlight nudge must degrade to a
+        // no-op, never restart a build.
+        state.selected_path = Some("x.rs".into());
+        state.ctx = 3;
+        let shutdown = AtomicBool::new(false);
+
+        let quit = handle_request(
+            hl_req("x.rs", 1),
+            &mut state,
+            &snap_tx,
+            &image_tx,
+            &shutdown,
+        );
+
+        assert!(!quit);
+        assert!(
+            snap_rx.try_recv().is_err(),
+            "a cache-miss highlight must not send a snapshot"
+        );
+        assert!(state.last_diff.is_none(), "no build was triggered");
+    }
+
+    #[test]
+    fn lru_cap32_evicts_least_recently_used() {
+        let mut c: LruCache<u32, u32> = LruCache::new(CACHE_CAP);
+        for i in 0..CACHE_CAP as u32 {
+            c.put(i, i);
+        }
+        // Touch 0 so it is no longer the least recently used.
+        assert!(c.get(&0).is_some());
+        c.put(99, 99);
+        assert!(c.get(&1).is_none(), "least recently used evicted");
+        assert!(c.get(&0).is_some(), "recently used kept");
+    }
+
+    #[test]
+    fn shutdown_aborts_scan() {
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        let shutdown = AtomicBool::new(true);
+        assert!(scan_entries(&mut state, &shutdown).is_err());
+    }
+
+    #[test]
+    fn all_ignored_empty_list_never_skips() {
+        assert!(!all_ignored(&[], |_| true));
+    }
+
+    #[test]
+    fn all_ignored_all_paths_ignored_skips() {
+        let paths = vec![PathBuf::from("target/a"), PathBuf::from("target/b")];
+        assert!(all_ignored(&paths, |p| p.starts_with("target")));
+    }
+
+    #[test]
+    fn all_ignored_mixed_list_recomputes() {
+        let paths = vec![PathBuf::from("target/a"), PathBuf::from("src/b")];
+        assert!(!all_ignored(&paths, |p| p.starts_with("target")));
+    }
+
+    #[test]
+    fn ignore_matcher_uses_repo_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/foo"), "x\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut matcher = IgnoreMatcher::from_repo(repo).unwrap();
+
+        assert!(matcher.is_ignored(Path::new("target/debug/foo")));
+        assert!(!matcher.is_ignored(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn ignore_gate_does_not_skip_tracked_ignored_path() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "Cargo.lock\n").unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "x\n").unwrap();
+        // Force-add a file that an ignore pattern also matches.
+        crate::git::test_util::run_git(dir.path(), &["add", "-f", "Cargo.lock"]);
+
+        let repo = gix::open(dir.path()).unwrap();
+        let mut matcher = IgnoreMatcher::from_repo(repo).unwrap();
+
+        // The exclude pattern matches, but the path is tracked, so the gate must
+        // not skip its recompute.
+        assert!(matcher.is_ignored(Path::new("Cargo.lock")));
+        assert!(!matcher.is_ignored_untracked(Path::new("Cargo.lock")));
+    }
+
+    #[test]
+    fn ignore_gate_skips_ignored_untracked_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/foo"), "x\n").unwrap();
+
+        let mut matcher = IgnoreMatcher::from_repo(repo).unwrap();
+
+        assert!(matcher.is_ignored_untracked(Path::new("target/foo")));
     }
 }

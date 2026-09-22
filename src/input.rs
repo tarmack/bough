@@ -5,9 +5,10 @@
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -21,28 +22,185 @@ use crate::snapshot::{ArcSnapshot, Snapshot};
 use crate::theme::Focus;
 use crate::view;
 
+/// Poll timeout while the worker is busy: also the spinner-tick cadence, so the
+/// "scanning…" affordances are refreshed as state settles.
+const BUSY_POLL: Duration = Duration::from_millis(100);
+/// Poll timeout while idle: long enough to keep the loop quiet, short enough to
+/// pick up worker snapshots that arrive without a terminal event.
+const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// Redraw gating for the event loop: the frame is drawn only when something
+/// marked it dirty, plus a periodic tick while the worker is busy so the UI
+/// stays alive through long scans.
+struct Redraw {
+    dirty: bool,
+    last_tick: Instant,
+}
+
+impl Redraw {
+    fn new() -> Self {
+        Redraw {
+            dirty: true,
+            last_tick: Instant::now(),
+        }
+    }
+
+    /// Mark the frame dirty (an event or state change happened).
+    fn mark(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Force a redraw on the spinner tick while `busy`.
+    fn tick(&mut self, busy: bool) {
+        if busy && self.last_tick.elapsed() >= BUSY_POLL {
+            self.dirty = true;
+            self.last_tick = Instant::now();
+        }
+    }
+
+    /// Take the dirty flag, clearing it: `true` means draw this iteration.
+    fn take(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+}
+
 /// Drain the snapshot channel, keeping only the latest `ArcSnapshot`, and
-/// apply it to `app`. Called between key events so the UI stays fresh.
-fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App, worker_dead: &mut bool) {
+/// apply it to `app`. Returns `true` when the app state changed (a snapshot was
+/// applied, or the worker was found dead), so the caller can redraw.
+fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App, worker_dead: &mut bool) -> bool {
     let mut latest: Option<ArcSnapshot> = None;
     while let Ok(snap) = rx.try_recv() {
         latest = Some(snap);
     }
+    let mut changed = false;
     if let Some(snap) = latest {
         app.apply_snapshot(snap);
+        changed = true;
     }
     if !*worker_dead && matches!(rx.try_recv(), Err(TryRecvError::Disconnected)) {
         *worker_dead = true;
         app.snapshot = Arc::new(Snapshot {
+            seq: app.snapshot.seq,
+            busy: false,
             empty: app.snapshot.empty,
             tree: app.snapshot.tree.clone(),
             selected_diff: None,
-            selected_highlight: Vec::new(),
+            selected_highlight: Arc::new(Vec::new()),
             error: Some("worker stopped: live updates disabled".into()),
             branch_state: app.snapshot.branch_state.clone(),
             uncommitted_stats: app.snapshot.uncommitted_stats,
         });
+        changed = true;
     }
+    changed
+}
+
+/// How one wait for terminal input resolved.
+#[derive(Debug)]
+enum Wake {
+    /// An event arrived from the reader thread.
+    Event(Event),
+    /// No event before the timeout; the loop should re-check liveness.
+    Idle,
+    /// The input reader ended (read error) or vanished: leave the loop.
+    Closed,
+}
+
+/// Map a reader-channel receive into a [`Wake`]. Pure, so the loop's exit
+/// decisions stay unit-testable without a live terminal.
+fn classify_wake(result: Result<io::Result<Event>, RecvTimeoutError>) -> Wake {
+    match result {
+        Ok(Ok(event)) => Wake::Event(event),
+        // Only terminal-fatal read errors end the loop; a transient one is
+        // retried on the next iteration.
+        Ok(Err(e)) if is_fatal_read_error(&e) => Wake::Closed,
+        Ok(Err(_)) => Wake::Idle,
+        Err(RecvTimeoutError::Timeout) => Wake::Idle,
+        // The reader thread is gone; nothing can arrive again.
+        Err(RecvTimeoutError::Disconnected) => Wake::Closed,
+    }
+}
+
+/// True for read errors that mean the terminal is permanently gone: EOF, or a
+/// raw `ENXIO`/`EIO`/`ENODEV`. Transient errors (`EINTR`, `WouldBlock`, any
+/// unknown kind) are not fatal — the `terminal_gone()` probe still catches a
+/// genuinely dead tty.
+fn is_fatal_read_error(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        return true;
+    }
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENXIO | libc::EIO | libc::ENODEV)
+    )
+}
+
+/// Spawn the terminal-input reader. Crossterm's event source owns a single
+/// global handle and, once the pty is closed, spins inside `event::read`
+/// without ever returning an error; a dedicated thread keeps that spin off the
+/// run loop, which detects the dead terminal via [`terminal_gone`] instead.
+fn spawn_reader() -> io::Result<Receiver<io::Result<Event>>> {
+    let (tx, rx) = crossbeam_channel::unbounded::<io::Result<Event>>();
+    thread::Builder::new()
+        .name("bough-input".into())
+        .spawn(move || loop {
+            match event::read() {
+                Ok(event) => {
+                    if tx.send(Ok(event)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Transient errors are retried; only fatal ones end the
+                    // reader, so the channel never disconnects spuriously.
+                    if is_fatal_read_error(&e) {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(rx)
+}
+
+/// True when the terminal is no longer reachable. A closed pty makes crossterm's
+/// reader spin rather than surface an error, and its window-size ioctl keeps
+/// returning a stale size, so the loop probes the write path instead: a
+/// save/restore cursor pair changes no state but fails once the far end is gone.
+fn terminal_gone() -> bool {
+    use std::io::Write;
+    let mut out = io::stdout().lock();
+    out.write_all(b"\x1b7\x1b8")
+        .and_then(|_| out.flush())
+        .is_err()
+}
+
+/// Apply one terminal event. Returns `true` when the app should quit.
+fn handle_event(event: Event, app: &mut App, redraw: &mut Redraw) -> bool {
+    match event {
+        Event::Key(key) => {
+            if key.kind != KeyEventKind::Release {
+                redraw.mark();
+                return handle_key(key, app);
+            }
+        }
+        Event::Mouse(m) => {
+            app.fold_key = false;
+            app.g_key = false;
+            handle_mouse(m, app);
+            redraw.mark();
+        }
+        Event::Resize(..) => {
+            app.fold_key = false;
+            app.g_key = false;
+            redraw.mark();
+        }
+        Event::FocusGained | Event::FocusLost => {
+            redraw.mark();
+        }
+        _ => {}
+    }
+    false
 }
 
 /// Run the interactive loop until the user quits.
@@ -52,35 +210,37 @@ pub fn run(
     snapshot_rx: &Receiver<ArcSnapshot>,
     image_rx: &Receiver<PreviewImage>,
 ) -> io::Result<()> {
+    let events = spawn_reader()?;
     let mut worker_dead = false;
+    let mut redraw = Redraw::new();
     loop {
-        terminal.draw(|f| view::ui(f, app))?;
-        let _ = preview::sync(&mut io::stdout(), &mut app.preview);
-        drain_snapshots(snapshot_rx, app, &mut worker_dead);
+        redraw.tick(app.is_busy());
+        if drain_snapshots(snapshot_rx, app, &mut worker_dead) {
+            redraw.mark();
+        }
         if let Some(img) = preview::drain_previews(image_rx) {
             app.preview.accept(img);
+            redraw.mark();
         }
         app.maybe_request_highlight();
-        if event::poll(Duration::from_millis(16))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Release {
-                        continue;
-                    }
-                    if handle_key(key, app) {
-                        break;
-                    }
+
+        if redraw.take() {
+            terminal.draw(|f| view::ui(f, app))?;
+            let _ = preview::sync(&mut io::stdout(), &mut app.preview);
+        }
+
+        let timeout = if app.is_busy() { BUSY_POLL } else { IDLE_POLL };
+        match classify_wake(events.recv_timeout(timeout)) {
+            Wake::Event(event) => {
+                if handle_event(event, app, &mut redraw) {
+                    break;
                 }
-                Event::Mouse(m) => {
-                    app.fold_key = false;
-                    app.g_key = false;
-                    handle_mouse(m, app);
+            }
+            Wake::Closed => break,
+            Wake::Idle => {
+                if terminal_gone() {
+                    break;
                 }
-                Event::Resize(..) => {
-                    app.fold_key = false;
-                    app.g_key = false;
-                }
-                _ => {}
             }
         }
     }
@@ -253,6 +413,22 @@ fn focus_key(key: KeyEvent, app: &mut App) -> bool {
                 app.move_up(1);
                 false
             }
+            KeyCode::PageDown => {
+                app.tree_page_down();
+                false
+            }
+            KeyCode::PageUp => {
+                app.tree_page_up();
+                false
+            }
+            KeyCode::Home => {
+                app.tree_first();
+                false
+            }
+            KeyCode::End => {
+                app.tree_last();
+                false
+            }
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
                 app.collapse();
                 false
@@ -311,6 +487,56 @@ mod tests {
     use crate::diff::{FileHeader, FileStatus, HunkMeta};
     use crate::test_support::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn classify_wake_fatal_read_error_exits() {
+        // ENXIO: the tty's far end is gone, and crossterm's EOF kind.
+        let enxio: io::Result<Event> = Err(io::Error::from_raw_os_error(libc::ENXIO));
+        assert!(matches!(classify_wake(Ok(enxio)), Wake::Closed));
+        let eof: io::Result<Event> = Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        assert!(matches!(classify_wake(Ok(eof)), Wake::Closed));
+    }
+
+    #[test]
+    fn classify_wake_transient_read_error_retries() {
+        // A transient read error must not spuriously quit the app; the loop
+        // re-checks liveness on the next iteration.
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Other,
+        ] {
+            let err: io::Result<Event> = Err(io::Error::from(kind));
+            assert!(
+                matches!(classify_wake(Ok(err)), Wake::Idle),
+                "{kind:?} must be treated as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_wake_disconnect_exits() {
+        assert!(matches!(
+            classify_wake(Err(RecvTimeoutError::Disconnected)),
+            Wake::Closed
+        ));
+    }
+
+    #[test]
+    fn classify_wake_timeout_is_idle() {
+        assert!(matches!(
+            classify_wake(Err(RecvTimeoutError::Timeout)),
+            Wake::Idle
+        ));
+    }
+
+    #[test]
+    fn classify_wake_event_passes_through() {
+        assert!(matches!(
+            classify_wake(Ok(Ok(Event::FocusGained))),
+            Wake::Event(_)
+        ));
+    }
 
     #[test]
     fn focus_tab_cycles() {
@@ -1139,5 +1365,99 @@ mod tests {
             &mut app
         ));
         assert!(app.base_picker.is_none());
+    }
+
+    #[test]
+    fn drain_snapshots_reports_state_change() {
+        let mut app = sample_app();
+        let (tx, rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
+        let mut dead = false;
+
+        // Nothing queued: no redraw warranted.
+        assert!(!drain_snapshots(&rx, &mut app, &mut dead));
+        assert!(!dead);
+
+        tx.send(snapshot_with_diff(sample_diff(2))).unwrap();
+        assert!(drain_snapshots(&rx, &mut app, &mut dead));
+        // Drained: a second pass changes nothing.
+        assert!(!drain_snapshots(&rx, &mut app, &mut dead));
+
+        // A closed channel marks the worker dead and warrants one more redraw.
+        drop(tx);
+        assert!(drain_snapshots(&rx, &mut app, &mut dead));
+        assert!(dead);
+        assert!(!drain_snapshots(&rx, &mut app, &mut dead));
+    }
+
+    #[test]
+    fn redraw_gates_idle_frames() {
+        let mut redraw = Redraw::new();
+        // The first frame always draws.
+        assert!(redraw.take());
+        // Idle: no draw until something marks the frame dirty.
+        assert!(!redraw.take());
+        redraw.mark();
+        assert!(redraw.take());
+        assert!(!redraw.take());
+    }
+
+    #[test]
+    fn redraw_ticks_only_while_busy() {
+        let mut redraw = Redraw::new();
+        let _ = redraw.take();
+        redraw.tick(false);
+        assert!(!redraw.take(), "idle never forces a tick");
+
+        redraw.last_tick = Instant::now() - BUSY_POLL;
+        redraw.tick(true);
+        assert!(redraw.take(), "busy forces a redraw on the tick");
+        // The tick resets, so an immediate check is not yet due.
+        redraw.tick(true);
+        assert!(!redraw.take());
+    }
+
+    #[test]
+    fn tree_page_keys_via_input() {
+        let tree = crate::tree::Tree::build(
+            (0..20)
+                .map(|i| ('M', format!("f{i:02}.rs")))
+                .collect::<Vec<_>>(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded::<crate::snapshot::Request>();
+        let mut app = App::new(
+            crate::test_support::sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        app.height = 6; // tree page = 5 rows
+        app.focus = Focus::Tree;
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.selection, 5);
+        assert_eq!(app.tree_scroll, 1);
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.selection, 19);
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.selection, 0);
+        assert_eq!(app.tree_scroll, 0);
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.selection, 0);
     }
 }

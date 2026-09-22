@@ -41,26 +41,20 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
             ),
             Style::default().fg(Color::White).bg(Color::DarkGray),
         ));
-        let order = ['M', 'A', 'D', 'R', 'C', 'T'];
-        let mut counts = std::collections::HashMap::new();
-        for node in &app.snapshot.tree.nodes {
-            if node.kind == tree::Kind::File {
-                if let Some(letter) = node.status.chars().next() {
-                    *counts.entry(letter).or_insert(0usize) += 1;
-                }
-            }
-        }
-        let parts: Vec<String> = order
-            .iter()
-            .filter_map(|l| counts.get(l).map(|n| format!("{n}{l}")))
-            .collect();
+        let order = tree::STATUS_ORDER;
         // One bar-colored cell between pills; the pills separate
         // themselves, so no `· ` marker.
-        for (i, part) in parts.iter().enumerate() {
-            if i > 0 {
+        let mut first = true;
+        for (idx, &letter) in order.iter().enumerate() {
+            let count = root.status_counts[idx];
+            if count == 0 {
+                continue;
+            }
+            if !first {
                 left.push(Span::styled(" ", bar_style()));
             }
-            let color = FileStatus::from_char(part.chars().last().unwrap())
+            first = false;
+            let color = FileStatus::from_char(letter)
                 .map(theme::status_color)
                 .unwrap_or(Color::White);
             left.push(Span::styled(
@@ -68,7 +62,7 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(color).bg(Color::DarkGray),
             ));
             left.push(Span::styled(
-                part.clone(),
+                format!("{count}{letter}"),
                 Style::default()
                     .fg(Color::Black)
                     .bg(color)
@@ -79,6 +73,13 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(color).bg(Color::DarkGray),
             ));
         }
+    } else if app.is_busy() {
+        // The list below shows `scanning changes…`; keep the header in the
+        // same state instead of claiming `no changes` before the scan settles.
+        left.push(Span::styled(
+            " scanning changes… ",
+            Style::default().fg(Color::Gray).bg(Color::DarkGray),
+        ));
     } else {
         left.push(Span::styled(
             " no changes ",
@@ -105,7 +106,12 @@ pub fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     // selection and scroll into range as a side effect of layout.
     let visible = area.height as usize;
     if app.flat.is_empty() {
-        let line = Line::styled("no changes", Style::default().fg(Color::DarkGray));
+        let text = if app.is_busy() {
+            "scanning changes…"
+        } else {
+            "no changes"
+        };
+        let line = Line::styled(text, Style::default().fg(Color::DarkGray));
         f.buffer_mut().set_line(area.x, area.y, &line, area.width);
         return;
     }
@@ -197,10 +203,30 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>
     }
 
     // Rounded-cap chip per segment, separated by a plain bar-colored cell so
-    // each reads as its own chip.
+    // each reads as its own chip. While the worker is busy, a `scanning…`
+    // chip leads the stats side so live recomputes are visible.
     let mut left: Vec<Span<'static>> = Vec::new();
-    for (i, (text, bg, fg)) in segments.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    if app.is_busy() {
+        left.push(Span::styled(
+            CAP_LEFT,
+            Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+        ));
+        left.push(Span::styled(
+            " scanning\u{2026} ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        left.push(Span::styled(
+            CAP_RIGHT,
+            Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+        ));
+        first = false;
+    }
+    for (text, bg, fg) in &segments {
+        if !first {
             left.push(Span::styled(" ", bar_style()));
         }
         left.push(Span::styled(
@@ -215,6 +241,7 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, message: Option<&str>
             CAP_RIGHT,
             Style::default().fg(*bg).bg(Color::DarkGray),
         ));
+        first = false;
     }
 
     // How much of the view is uncommitted mid-flight work (branch views
@@ -604,5 +631,87 @@ mod tests {
         // A real extension still selects the specific icon.
         assert_ne!(file_icon("a.rs"), generic);
         assert_ne!(file_icon("a.go"), generic);
+    }
+
+    /// An `App` over `tree` with its `busy` flag set explicitly.
+    fn app_with_busy(tree: crate::tree::Tree, busy: bool) -> App {
+        let mut snap = sample_snapshot(tree);
+        Arc::get_mut(&mut snap).unwrap().busy = busy;
+        App::new(
+            snap,
+            crossbeam_channel::bounded::<crate::snapshot::Request>(4).0,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        )
+    }
+
+    fn render(app: &mut App) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| super::super::ui(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn footer_shows_scanning_chip_when_busy() {
+        let mut app = app_with_busy(
+            crate::tree::Tree::build(vec![('M', "x.rs".to_string())]),
+            true,
+        );
+        let buf = render(&mut app);
+        let bar: String = (0..80)
+            .map(|x| buf.cell((x, 23)).unwrap().symbol().to_string())
+            .collect();
+        assert!(bar.contains("scanning…"), "bar: {bar}");
+        // The chip leads the stats side, before any `+N`/`-N` chip.
+        assert!(bar.find("scanning…").unwrap() < 6, "bar: {bar}");
+    }
+
+    #[test]
+    fn footer_omits_scanning_chip_when_settled() {
+        let mut app = app_with_busy(
+            crate::tree::Tree::build(vec![('M', "x.rs".to_string())]),
+            false,
+        );
+        let buf = render(&mut app);
+        let bar: String = (0..80)
+            .map(|x| buf.cell((x, 23)).unwrap().symbol().to_string())
+            .collect();
+        assert!(!bar.contains("scanning"), "bar: {bar}");
+    }
+
+    #[test]
+    fn empty_tree_busy_placeholder() {
+        let mut app = app_with_busy(crate::tree::Tree::build(Vec::new()), true);
+        let buf = render(&mut app);
+        // The list row (the header strip on row 0 also reads `no changes`).
+        let row: String = (54..80)
+            .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
+            .collect();
+        assert!(row.contains("scanning changes…"), "{row}");
+        assert!(!row.contains("no changes"), "{row}");
+        // The header strip agrees with the list: no `no changes` while busy.
+        let header: String = (54..80)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect();
+        assert!(header.contains("scanning changes…"), "{header}");
+        assert!(!header.contains("no changes"), "{header}");
+    }
+
+    #[test]
+    fn empty_tree_settled_placeholder() {
+        let mut app = app_with_busy(crate::tree::Tree::build(Vec::new()), false);
+        let buf = render(&mut app);
+        let row: String = (54..80)
+            .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
+            .collect();
+        assert!(row.contains("no changes"), "{row}");
+        assert!(!row.contains("scanning"), "{row}");
+        // Settled empty header keeps its original `no changes` text.
+        let header: String = (54..80)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect();
+        assert!(header.contains("no changes"), "{header}");
+        assert!(!header.contains("scanning"), "{header}");
     }
 }

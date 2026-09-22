@@ -7,6 +7,8 @@
 //! produced. The renderer draws lines without `+`/`-` prefix glyphs
 //! and with lighter-shade backgrounds on changed word runs.
 
+use std::sync::Arc;
+
 /// Classification of a single body line in a diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -180,12 +182,14 @@ impl Diff {
     /// diffs, in document order. Each `file_diffs` entry must be a single-file
     /// `Diff` (one file, hunk sections only); the result carries a `File`
     /// section plus a `FileHeader` body row per file under a summary header.
-    pub fn from_directory(path: &str, file_diffs: Vec<Diff>) -> Diff {
+    /// Children are borrowed behind `Arc`, so streaming a growing directory
+    /// aggregate never deep-clones the already-built child diffs.
+    pub fn from_directory(path: &str, file_diffs: &[Arc<Diff>]) -> Diff {
         let mut files = Vec::new();
         let mut sections = Vec::new();
         let mut lines = Vec::new();
 
-        for (file, d) in file_diffs.into_iter().enumerate() {
+        for (file, d) in file_diffs.iter().enumerate() {
             debug_assert_eq!(d.files.len(), 1, "from_directory expects single-file diffs");
             debug_assert!(
                 d.sections.iter().all(|s| s.kind == SectionKind::Hunk),
@@ -211,11 +215,11 @@ impl Diff {
             // hunk sections (originally 0..N) become file_section+1.. and every
             // line's `section` shifts by the same base.
             let base = sections.len();
-            for mut section in d.sections {
-                section.file = file;
-                sections.push(section);
+            for &section in &d.sections {
+                sections.push(Section { file, ..section });
             }
-            for mut line in d.lines {
+            for line in &d.lines {
+                let mut line = line.clone();
                 line.section += base;
                 lines.push(line);
             }
@@ -599,7 +603,10 @@ mod tests {
     fn from_directory_combines_files() {
         let diff = Diff::from_directory(
             "src",
-            vec![single_file("src/a.rs", 1, 1), single_file("src/b.rs", 1, 1)],
+            &[
+                Arc::new(single_file("src/a.rs", 1, 1)),
+                Arc::new(single_file("src/b.rs", 1, 1)),
+            ],
         );
 
         // Two files, each with its own File section and one Hunk section.

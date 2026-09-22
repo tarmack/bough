@@ -24,17 +24,24 @@ pub type Seq = u64;
 /// An immutable snapshot of the whole tree + currently-selected diff, built
 /// off the UI thread and swapped in atomically between frames.
 pub struct Snapshot {
+    /// Request sequence this snapshot answers (the latest request the worker
+    /// had accepted when it was built).
+    pub seq: Seq,
+    /// True when the worker still has in-flight or pending work for this state
+    /// ("more coming"). A settled snapshot (`busy == false`) always follows.
+    /// The tree/diff carried are the best known at send time.
+    pub busy: bool,
     /// Whether the repo has no commits yet (`empty` mode): every file is new.
     pub empty: bool,
     /// Changed-file tree. Directories are built collapsed; the UI re-applies
     /// its own `expanded_dirs` on swap.
-    pub tree: Tree,
+    pub tree: Arc<Tree>,
     /// Diff for the selected path, if any.
-    pub selected_diff: Option<Diff>,
+    pub selected_diff: Option<Arc<Diff>>,
     /// Per-body-line syntax tokens, parallel to `selected_diff.lines`.
     /// `None` = not yet highlighted (filled in as the viewport moves).
     /// `Some([])` = highlighted but uncolored (grammar miss / no highlighter).
-    pub selected_highlight: HighlightLines,
+    pub selected_highlight: Arc<HighlightLines>,
     /// Last git error text, surfaced in the status line. `None` when healthy.
     pub error: Option<String>,
     /// Current branch state (branch name, ahead/behind vs base, unpushed vs
@@ -88,7 +95,7 @@ mod tests {
         let snap = crate::test_support::snapshot_with_diff(diff.clone());
 
         assert!(!snap.empty);
-        assert_eq!(snap.selected_diff.as_ref(), Some(&diff));
+        assert_eq!(snap.selected_diff.as_deref(), Some(&diff));
         assert_eq!(snap.selected_diff.as_ref().unwrap().header.path, "x.rs");
         // Per-line highlight slots mirror the diff's lines.
         assert_eq!(snap.selected_highlight.len(), 2);

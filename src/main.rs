@@ -122,21 +122,26 @@ fn main() -> io::Result<()> {
     let default = git::default_branch();
     let revision = resolve_revision(cli.revision.clone(), default.clone());
 
+    // Resolve branch state once up front: the uncommitted-view decision and the
+    // worker's first snapshot both read it, so the startup rev-walks must not
+    // run twice. Later recomputes refresh it in place.
+    let branch_state = git::branch_state(&revision);
+
     // The initial snapshot is empty: the worker owns the full changed-file scan
     // and sends the real tree/diff on its own thread, so the UI starts without
-    // blocking on git work whose cost grows with the size of the diff.
-    let initial_snapshot: ArcSnapshot = Arc::new(Snapshot {
-        empty,
-        selected_diff: None,
-        selected_highlight: Vec::new(),
-        error: None,
-        branch_state: crate::git::BranchState::default(),
-        uncommitted_stats: None,
-        tree: Tree::build(Vec::new()),
-    });
+    // blocking on git work whose cost grows with the size of the diff. It
+    // carries the resolved branch state so the first frame can show it.
+    let initial_snapshot = initial_snapshot(empty, branch_state.clone());
 
     let repo_root = std::env::current_dir()?;
-    let worker = Worker::spawn(revision.clone(), empty, repo_root, cli.theme).unwrap_or_else(|e| {
+    let worker = Worker::spawn(
+        revision.clone(),
+        empty,
+        repo_root,
+        cli.theme,
+        branch_state.clone(),
+    )
+    .unwrap_or_else(|e| {
         eprintln!("bough: worker spawn failed: {e}");
         std::process::exit(1);
     });
@@ -153,7 +158,7 @@ fn main() -> io::Result<()> {
     // view — start there instead of showing a branch view with no branch
     // work in it. The worker keeps the named revision: its content is the
     // same, and the label stays honest.
-    if starts_uncommitted(&revision, git::branch_state(&revision).ahead) {
+    if starts_uncommitted(&revision, branch_state.ahead) {
         app.mode = crate::app::Mode::Uncommitted;
     }
 
@@ -181,9 +186,31 @@ fn main() -> io::Result<()> {
     let restore = TerminalGuard::restore();
     drop(worker);
     match (result, restore) {
-        (Ok(()), Err(e)) => Err(e),
+        // A clean run still exits 0 when restore fails: the terminal is
+        // usually already gone (EOF), and `Drop` retries best-effort anyway.
+        (Ok(()), Err(e)) => {
+            eprintln!("bough: terminal restore failed: {e}");
+            Ok(())
+        }
         (r, _) => r,
     }
+}
+
+/// The pre-scan snapshot the UI opens with: no tree or diff yet, but the
+/// already-resolved branch state so the first frame can show branch info before
+/// the worker's first snapshot lands.
+fn initial_snapshot(empty: bool, branch_state: crate::git::BranchState) -> ArcSnapshot {
+    Arc::new(Snapshot {
+        seq: 0,
+        busy: false,
+        empty,
+        selected_diff: None,
+        selected_highlight: Arc::new(Vec::new()),
+        error: None,
+        branch_state,
+        uncommitted_stats: None,
+        tree: Arc::new(Tree::build(Vec::new())),
+    })
 }
 
 fn resolve_revision(arg: Option<String>, default: Option<String>) -> String {
@@ -235,5 +262,19 @@ mod tests {
         // Real branch work, or an unknown ahead count, stays a branch view.
         assert!(!starts_uncommitted("main...HEAD", Some(3)));
         assert!(!starts_uncommitted("v1.2...HEAD", None));
+    }
+
+    #[test]
+    fn initial_snapshot_carries_resolved_branch_state() {
+        let state = crate::git::BranchState {
+            name: Some("feature/x".into()),
+            base: Some("main".into()),
+            ahead: Some(2),
+            ..Default::default()
+        };
+        let snap = initial_snapshot(false, state);
+        assert_eq!(snap.branch_state.name.as_deref(), Some("feature/x"));
+        assert_eq!(snap.branch_state.base.as_deref(), Some("main"));
+        assert_eq!(snap.branch_state.ahead, Some(2));
     }
 }
