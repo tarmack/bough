@@ -27,11 +27,13 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
 
     let root = &app.snapshot.tree.nodes[app.snapshot.tree.root];
 
-    // Left: the file count and per-status breakdown — the shape of the
-    // change, in the tree's own status colors. Each status becomes a
-    // compact rounded pill (status-color fill, bold black text) in the diff
-    // pane's language; the count keeps its plain White-on-DarkGray span.
+    // Left: the changed-file count. Right: the per-status breakdown — the
+    // shape of the change, in the tree's own status colors. Each status
+    // becomes a compact rounded pill (status-color fill, bold black text) in
+    // the diff pane's language; the count keeps its plain White-on-DarkGray
+    // span.
     let mut left: Vec<Span<'static>> = Vec::new();
+    let mut right: Vec<Span<'static>> = Vec::new();
     if root.file_count > 0 {
         left.push(Span::styled(
             format!(
@@ -51,24 +53,24 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
                 continue;
             }
             if !first {
-                left.push(Span::styled(" ", bar_style()));
+                right.push(Span::styled(" ", bar_style()));
             }
             first = false;
             let color = FileStatus::from_char(letter)
                 .map(theme::status_color)
                 .unwrap_or(Color::White);
-            left.push(Span::styled(
+            right.push(Span::styled(
                 CAP_LEFT,
                 Style::default().fg(color).bg(Color::DarkGray),
             ));
-            left.push(Span::styled(
+            right.push(Span::styled(
                 format!("{count}{letter}"),
                 Style::default()
                     .fg(Color::Black)
                     .bg(color)
                     .add_modifier(Modifier::BOLD),
             ));
-            left.push(Span::styled(
+            right.push(Span::styled(
                 CAP_RIGHT,
                 Style::default().fg(color).bg(Color::DarkGray),
             ));
@@ -87,6 +89,11 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     let left = Line::from(left);
+    let right = if right.is_empty() {
+        None
+    } else {
+        Some(Line::from(right))
+    };
 
     // The strip starts one column in, leaving room for a rounded opening
     // cap, and runs flush to the screen's right edge with no trailing cap.
@@ -97,7 +104,7 @@ pub fn render_tree_header(f: &mut Frame, app: &App, area: Rect) {
     )]);
     f.buffer_mut().set_line(area.x, area.y, &opening, 1);
     let strip_w = area.width.saturating_sub(1);
-    draw_aligned(f, area.x + 1, area.y, strip_w, &left, None);
+    draw_aligned(f, area.x + 1, area.y, strip_w, &left, right.as_ref());
 }
 
 /// Render the file tree with the selection highlighted.
@@ -357,7 +364,9 @@ const CAP_RIGHT: &str = crate::theme::CAP_RIGHT;
 fn draw_aligned(f: &mut Frame, x: u16, y: u16, width: u16, left: &Line, right: Option<&Line>) {
     match right {
         Some(r) => {
-            let rw = r.width() as u16;
+            // Clamp so an over-wide right line clips inside the pane instead
+            // of spilling past it.
+            let rw = (r.width() as u16).min(width);
             let left_w = width.saturating_sub(rw).saturating_sub(1);
             f.buffer_mut().set_line(x, y, left, left_w);
             f.buffer_mut()
