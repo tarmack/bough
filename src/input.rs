@@ -17,6 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{App, CONTEXT_STEP, HSCROLL_STEP};
+use crate::perf::{self, Counter};
 use crate::preview::{self, PreviewImage};
 use crate::snapshot::{ArcSnapshot, Snapshot};
 use crate::theme::Focus;
@@ -69,12 +70,18 @@ impl Redraw {
 /// applied, or the worker was found dead), so the caller can redraw.
 fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App, worker_dead: &mut bool) -> bool {
     let mut latest: Option<ArcSnapshot> = None;
+    let mut drained = 0usize;
     while let Ok(snap) = rx.try_recv() {
         latest = Some(snap);
+        drained += 1;
     }
     let mut changed = false;
     if let Some(snap) = latest {
         app.apply_snapshot(snap);
+        perf::tally(Counter::SnapshotsApplied);
+        if drained > 1 {
+            crate::perf_evt!("snapshot drain n={drained}");
+        }
         changed = true;
     }
     if !*worker_dead && matches!(rx.try_recv(), Err(TryRecvError::Disconnected)) {
@@ -154,9 +161,11 @@ fn spawn_reader() -> io::Result<Receiver<io::Result<Event>>> {
                     // Transient errors are retried; only fatal ones end the
                     // reader, so the channel never disconnects spuriously.
                     if is_fatal_read_error(&e) {
+                        crate::perf_evt!("input read fatal error kind={:?}", e.kind());
                         let _ = tx.send(Err(e));
                         break;
                     }
+                    perf::tally(Counter::ReadRetries);
                 }
             }
         })?;
@@ -180,6 +189,7 @@ fn handle_event(event: Event, app: &mut App, redraw: &mut Redraw) -> bool {
     match event {
         Event::Key(key) => {
             if key.kind != KeyEventKind::Release {
+                perf::tally(Counter::KeyEvents);
                 redraw.mark();
                 return handle_key(key, app);
             }
@@ -213,7 +223,12 @@ pub fn run(
     let events = spawn_reader()?;
     let mut worker_dead = false;
     let mut redraw = Redraw::new();
+    let mut last_beat = Instant::now();
     loop {
+        if last_beat.elapsed() >= Duration::from_secs(1) {
+            perf::beat();
+            last_beat = Instant::now();
+        }
         redraw.tick(app.is_busy());
         if drain_snapshots(snapshot_rx, app, &mut worker_dead) {
             redraw.mark();
@@ -226,19 +241,29 @@ pub fn run(
 
         if redraw.take() {
             terminal.draw(|f| view::ui(f, app))?;
+            perf::tally(Counter::Draws);
             let _ = preview::sync(&mut io::stdout(), &mut app.preview);
+            perf::tally(Counter::PreviewSyncs);
         }
 
         let timeout = if app.is_busy() { BUSY_POLL } else { IDLE_POLL };
-        match classify_wake(events.recv_timeout(timeout)) {
+        let wake = classify_wake(events.recv_timeout(timeout));
+        perf::tally(Counter::PollWakes);
+        match wake {
             Wake::Event(event) => {
                 if handle_event(event, app, &mut redraw) {
+                    crate::perf_evt!("quit key");
                     break;
                 }
             }
-            Wake::Closed => break,
+            Wake::Closed => {
+                crate::perf_evt!("input closed");
+                break;
+            }
             Wake::Idle => {
+                perf::tally(Counter::TerminalProbes);
                 if terminal_gone() {
+                    crate::perf_evt!("terminal gone");
                     break;
                 }
             }
@@ -722,6 +747,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: vec![HunkMeta {
                     added: 2,
                     deleted: 0,
@@ -937,6 +963,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: vec![
                     HunkMeta {
                         added: 1,
@@ -1179,6 +1206,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: vec![HunkMeta {
                     added: 10,
                     deleted: 0,

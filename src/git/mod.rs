@@ -7,6 +7,7 @@
 
 mod diff;
 mod error;
+mod lfs;
 mod refs;
 mod status;
 

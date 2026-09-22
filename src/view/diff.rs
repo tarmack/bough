@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::app::{App, HeaderPositions};
 use crate::diff::{
-    Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LineKind, SectionKind, WordRun,
+    Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LfsInfo, LineKind, SectionKind, WordRun,
 };
 use crate::highlight::TokenOwned;
 use crate::text::{elide, max_scroll_for, render_centered};
@@ -104,12 +104,14 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Empty body: centered messages below the header.
     if diff.lines.is_empty() {
-        let msg = if diff.header.binary {
-            "binary file"
+        let msg = if let Some(lfs) = &diff.header.lfs {
+            lfs_note(lfs)
+        } else if diff.header.binary {
+            "binary file".to_string()
         } else if !multi && diff.header.status == FileStatus::Renamed {
-            "rename — no content changes"
+            "rename — no content changes".to_string()
         } else {
-            "no content changes"
+            "no content changes".to_string()
         };
         let body = Rect::new(
             area.x,
@@ -118,7 +120,7 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
             area.height.saturating_sub(header_height),
         );
         let style = Style::default().fg(Color::DarkGray);
-        render_centered(f, body, msg, style);
+        render_centered(f, body, &msg, style);
         return;
     }
 
@@ -358,6 +360,34 @@ fn stat_spans(added: usize, deleted: usize, binary: bool, bg: Option<Color>) -> 
         Span::styled(format!("+{added}"), add_style),
         Span::styled(format!(" -{deleted}"), del_style),
     ]
+}
+
+/// The muted one-line note for an LFS object: `LFS object · 12.4 MB · <oid>`,
+/// with the short oid omitted when it is unknown (an added file).
+fn lfs_note(info: &LfsInfo) -> String {
+    let mut note = format!("LFS object · {}", human_size(info.size));
+    if !info.oid.is_empty() {
+        let short: String = info.oid.chars().take(12).collect();
+        note.push_str(" · ");
+        note.push_str(&short);
+    }
+    note
+}
+
+/// A human-readable byte size (`12.4 MB`), binary units, one decimal above B.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Right-align a `right` block against a `left` block over `width` columns:
@@ -704,6 +734,7 @@ mod tests {
             mode_old: None,
             mode_new: None,
             binary: false,
+            lfs: None,
             hunks: vec![HunkMeta { added, deleted }],
         }
     }
@@ -723,6 +754,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: Vec::new(),
             },
             files: vec![fa.clone(), fb.clone()],
@@ -824,6 +856,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: vec![HunkMeta {
                     added: 1,
                     deleted: 1,
@@ -872,6 +905,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: vec![HunkMeta {
                     added: 2,
                     deleted: 2,
@@ -1264,6 +1298,7 @@ mod tests {
             mode_old: None,
             mode_new: None,
             binary: false,
+            lfs: None,
             hunks: vec![HunkMeta {
                 added: 1,
                 deleted: 0,
@@ -1439,5 +1474,57 @@ mod tests {
         // At the very top the header is still in flow, not pinned.
         let (_, hunk, _) = sticky_headers(&visible, &positions, 0, 20);
         assert_eq!(hunk, None);
+    }
+
+    #[test]
+    fn renders_lfs_note_for_pointer() {
+        let mut app = sample_app();
+        app.selected_path = Some("big.bin".into());
+        let header = FileHeader {
+            path: "big.bin".into(),
+            status: FileStatus::Modified,
+            added: 0,
+            deleted: 0,
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: true,
+            lfs: Some(LfsInfo {
+                oid: "4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393".into(),
+                size: 13_000_000,
+            }),
+            hunks: Vec::new(),
+        };
+        app.snapshot = snapshot_with_diff(Diff {
+            header: header.clone(),
+            files: vec![header],
+            sections: Vec::new(),
+            lines: Vec::new(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| crate::view::ui(f, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("LFS object"), "{text}");
+        assert!(text.contains("12.4 MB"), "{text}");
+        assert!(text.contains("4d7a214614ab"), "{text}");
+    }
+
+    #[test]
+    fn lfs_note_omits_unknown_oid() {
+        assert_eq!(
+            lfs_note(&LfsInfo {
+                oid: String::new(),
+                size: 512,
+            }),
+            "LFS object · 512 B"
+        );
     }
 }

@@ -11,12 +11,26 @@
 //! - **Backstop poll**: every 2s, stat `.git/HEAD`. If `notify` missed a ref
 //!   change (some filesystems are flaky), the poll catches it.
 //!
-//! When `notify` init fails (unsupported filesystem), the watcher degrades to
-//! a 1s workdir poll and surfaces `is_poll_mode()` so the UI can show a hint.
-//! The poll walks workdir metadata (path/mtime/size, `.git` skipped) and emits
-//! `WorkdirChanged` only when an entry appeared, disappeared, or changed, so an
-//! idle repository costs no recomputes. Workdir events carry their changed
-//! paths so the worker can drop a burst that only touched ignored files.
+//! When `notify` init or its recursive `watch()` fails (unsupported
+//! filesystem, watch-table exhaustion), the watcher degrades to a workdir poll
+//! and flips the shared `poll_mode_flag()` the UI reads, so the footer hints
+//! at degradation the moment it happens rather than at spawn time.
+//! The poll walks workdir metadata (path/mtime/size, `.git` skipped,
+//! git-ignored directories pruned) and emits `WorkdirChanged` only when an
+//! entry appeared, disappeared, or changed, so an idle repository costs no
+//! recomputes. Pruning is a self-contained, std-fs-only subset of gitignore:
+//! each directory's `.gitignore` is read as the walk enters it, and a directory
+//! is pruned only by patterns that contain no `!`, `*`, `?`, or `[`. Wildcards
+//! and negations are never used, so the walk cannot over-prune when a negation
+//! would re-include part of a subtree; it simply walks more. Poll mode is a
+//! degraded fallback, and this subset still catches the real-world bulk
+//! (`node_modules/`, `target`, `.venv/`, `dist/`). No gix or git access is
+//! involved, so a wedged repository can never stall the walk.
+//! The poll interval is adaptive: the walk's duration bounds the duty cycle, so
+//! a slow tree polls less often instead of pegging a core. Workdir events carry
+//! their changed paths so the worker can drop a burst that only touched ignored
+//! files. `Watcher::drop` waits a bounded time for the thread and then leaks it
+//! rather than blocking process exit on a wedged walk.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +42,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use notify::event::{AccessKind, AccessMode, EventKind};
 use notify::{recommended_watcher, RecursiveMode};
+
+use crate::perf::{self, Counter};
 
 /// Classification of what moved. A workdir event carries the repo-relative
 /// paths that changed so the worker can ignore-filter a recompute; refs are
@@ -59,15 +75,29 @@ impl std::error::Error for WatchError {}
 const BACKSTOP_INTERVAL: Duration = Duration::from_secs(2);
 /// Workdir poll interval in degraded (poll) mode.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Multiplier applied to the last walk's duration to bound the poll's duty
+/// cycle: a slow walk means a proportionally longer interval, never a
+/// constant-CPU 1s cadence.
+const POLL_ADAPTIVE_FACTOR: u32 = 2;
 /// Loop tick used so shutdown stays responsive between sleeps.
 const SHUTDOWN_TICK: Duration = Duration::from_millis(100);
+/// Shutdown-check cadence inside the poll walk: the walk aborts promptly on
+/// quit without stat-ing the flag for every entry.
+const WALK_SHUTDOWN_CHECK: usize = 1024;
+/// Bound on `Watcher::drop`'s wait for the watch thread to report completion
+/// before the thread is leaked instead of joined.
+const DROP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Owns the filesystem watcher thread. Dropping it signals shutdown and joins.
+/// Owns the filesystem watcher thread. Dropping it signals shutdown and waits
+/// a bounded time for the thread to finish.
 pub struct Watcher {
     rx: Receiver<WorkerEvent>,
     poll_mode: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    /// Completion signal from the watch thread, so `drop` can tell a finished
+    /// thread from one wedged in a syscall.
+    done_rx: Receiver<()>,
 }
 
 impl Watcher {
@@ -76,6 +106,7 @@ impl Watcher {
         let poll_mode = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded::<WorkerEvent>(128);
+        let (done_tx, done_rx) = bounded::<()>(1);
 
         let poll_mode_t = poll_mode.clone();
         let shutdown_t = shutdown.clone();
@@ -88,6 +119,9 @@ impl Watcher {
                     shutdown: shutdown_t,
                 };
                 run_loop(io, poll_mode_t);
+                // Report completion on every exit path so `Watcher::drop` can
+                // distinguish a finished thread from a wedged one.
+                let _ = done_tx.send(());
             })
             .map_err(|e| WatchError {
                 message: format!("failed to spawn watch thread: {e}"),
@@ -98,6 +132,7 @@ impl Watcher {
             poll_mode,
             shutdown,
             handle: Some(handle),
+            done_rx,
         })
     }
 
@@ -106,18 +141,35 @@ impl Watcher {
         &self.rx
     }
 
-    /// True when `notify` init failed and the watcher degraded to 1s polling.
-    pub fn is_poll_mode(&self) -> bool {
-        self.poll_mode.load(Ordering::Relaxed)
+    /// The shared degradation flag. The worker/UI clone this `Arc` and read it
+    /// every frame, so they see a mid-run degradation the moment it happens.
+    pub fn poll_mode_flag(&self) -> Arc<AtomicBool> {
+        self.poll_mode.clone()
     }
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        // Wait briefly for the thread to confirm it finished. A thread wedged in
+        // a pathological filesystem syscall must never block process exit: on
+        // timeout we leak the join handle and return. When `main` returns the
+        // process exits and the OS tears the thread down regardless.
+        if wait_done(&self.done_rx, DROP_TIMEOUT).is_ok() {
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
         }
+    }
+}
+
+/// Wait up to `timeout` for the watch thread's done signal. `Ok` when the
+/// thread reported completion (or its sender vanished); `Err` on timeout, when
+/// the caller must not join.
+fn wait_done(done_rx: &Receiver<()>, timeout: Duration) -> Result<(), ()> {
+    match done_rx.recv_timeout(timeout) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => Ok(()),
+        Err(RecvTimeoutError::Timeout) => Err(()),
     }
 }
 
@@ -137,21 +189,27 @@ fn run_loop(io: WatchIo, poll_mode: Arc<AtomicBool>) {
         let _ = raw_tx.send(res);
     }) {
         Ok(mut watcher) => {
-            if notify::Watcher::watch(&mut watcher, &io.repo_root, RecursiveMode::Recursive)
-                .is_err()
+            if let Err(e) =
+                notify::Watcher::watch(&mut watcher, &io.repo_root, RecursiveMode::Recursive)
             {
+                crate::perf_evt!("watch poll_mode watch err={e}");
                 poll_mode.store(true, Ordering::Relaxed);
+                // Just drop: closing the inotify fd frees every kernel watch
+                // it held. `unwatch` on a recursive root re-walks the whole
+                // tree to remove watches one by one and wedges on unreadable
+                // subtrees (observed on a 148k-file repo with a
+                // permission-denied dir) — the thread would never reach the
+                // poll loop.
                 drop(watcher);
                 run_poll_loop(&io);
                 return;
             }
             run_notify_loop(&io, watcher, raw_rx);
         }
-        Err(_err) => {
-            // `notify` silently failed on this platform; degrade to the 1s poll
-            // loop. The reason (`_err`) is intentionally not surfaced: there is
-            // no logging channel, so only the poll-mode flag the UI reads is
-            // set. Binding it here documents why it is dropped.
+        Err(e) => {
+            // `notify` could not even be constructed on this platform;
+            // degrade to the poll loop and record why.
+            crate::perf_evt!("watch poll_mode init err={e}");
             poll_mode.store(true, Ordering::Relaxed);
             run_poll_loop(&io);
         }
@@ -175,15 +233,25 @@ fn run_notify_loop(
     // change in a burst (only refs have a poll backstop, not the workdir).
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut refs_pending = false;
+    let mut last_beat = Instant::now();
 
     loop {
+        if last_beat.elapsed() >= Duration::from_secs(1) {
+            perf::beat();
+            last_beat = Instant::now();
+        }
         if io.shutdown.load(Ordering::Relaxed) {
             break;
         }
         if refs_pending {
             match io.out_tx.try_send(WorkerEvent::RefsChanged) {
-                Ok(()) => refs_pending = false,
-                Err(TrySendError::Full(_)) => {}
+                Ok(()) => {
+                    perf::tally(Counter::WatchRefs);
+                    refs_pending = false;
+                }
+                Err(TrySendError::Full(_)) => {
+                    crate::perf_evt!("watch backpressure kind=refs");
+                }
                 Err(TrySendError::Disconnected(_)) => return,
             }
         }
@@ -191,8 +259,9 @@ fn run_notify_loop(
             dedup_paths(&mut pending);
             let ev = WorkerEvent::WorkdirChanged(std::mem::take(&mut pending));
             match io.out_tx.try_send(ev) {
-                Ok(()) => {}
+                Ok(()) => perf::tally(Counter::WatchWorkdir),
                 Err(TrySendError::Full(ev)) => {
+                    crate::perf_evt!("watch backpressure kind=workdir");
                     if let WorkerEvent::WorkdirChanged(p) = ev {
                         pending = p;
                     }
@@ -202,7 +271,10 @@ fn run_notify_loop(
         }
         match raw_rx.recv_timeout(SHUTDOWN_TICK) {
             Ok(Ok(event)) => {
-                if !is_read_access(&event.kind) {
+                perf::tally(Counter::WatchRawEvents);
+                if is_read_access(&event.kind) {
+                    perf::tally(Counter::WatchReadFiltered);
+                } else {
                     absorb_event(&io.repo_root, &event.paths, &mut pending, &mut refs_pending);
                 }
             }
@@ -254,35 +326,53 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
     paths.dedup();
 }
 
-/// Degraded loop when `notify` is unavailable: walk the workdir every second
-/// and emit `WorkdirChanged` only for paths whose metadata signature changed,
-/// plus the same 2s backstop ref poll.
+/// Degraded loop when `notify` is unavailable: walk the workdir on an adaptive
+/// interval and emit `WorkdirChanged` only for paths whose metadata signature
+/// changed, plus the same 2s backstop ref poll. The walk prunes directories
+/// matched by a conservative, std-only subset of the active `.gitignore`
+/// layers, so it covers the tracked tree without any gix/git dependency.
 fn run_poll_loop(io: &WatchIo) {
     let head_path = io.repo_root.join(".git/HEAD");
     let mut last_head = stat_mtime(&head_path);
     let mut last_refs = Instant::now();
     // Baseline taken before the first interval so a change landing right after
     // startup is not folded into the baseline unseen.
-    let mut last_signature = walk_signature(&io.repo_root);
+    let mut last_signature = walk_signature(&io.repo_root, &io.shutdown);
     let mut last_workdir = Instant::now();
+    let mut interval = POLL_INTERVAL;
+    let mut last_beat = Instant::now();
 
     loop {
+        if last_beat.elapsed() >= Duration::from_secs(1) {
+            perf::beat();
+            last_beat = Instant::now();
+        }
         if io.shutdown.load(Ordering::Relaxed) {
             break;
         }
         thread::sleep(SHUTDOWN_TICK);
 
-        if last_workdir.elapsed() >= POLL_INTERVAL {
+        if last_workdir.elapsed() >= interval {
+            let started = Instant::now();
+            let signature = walk_signature(&io.repo_root, &io.shutdown);
+            interval = next_poll_interval(started.elapsed());
             last_workdir = Instant::now();
-            let signature = walk_signature(&io.repo_root);
             let changed = signature_diff(&last_signature, &signature);
             last_signature = signature;
             if !changed.is_empty() {
                 let _ = io.out_tx.send(WorkerEvent::WorkdirChanged(changed));
+                perf::tally(Counter::WatchWorkdir);
             }
         }
         poll_refs(&head_path, &mut last_head, &io.out_tx, &mut last_refs);
     }
+}
+
+/// Next poll interval: the last walk's duration must bound the poll's duty
+/// cycle, so the interval is at least [`POLL_INTERVAL`] and at least twice the
+/// walk. A slow tree polls less often instead of burning a core.
+fn next_poll_interval(walk: Duration) -> Duration {
+    POLL_INTERVAL.max(walk.saturating_mul(POLL_ADAPTIVE_FACTOR))
 }
 
 /// Metadata signature of the workdir: repo-relative path -> `(mtime, size)`.
@@ -290,38 +380,167 @@ fn run_poll_loop(io: &WatchIo) {
 /// links. `.git` is skipped entirely (ref movement is the backstop poll's job).
 type Signature = HashMap<PathBuf, (SystemTime, u64)>;
 
-/// Recursively collect the [`Signature`] of every file under `root`.
-fn walk_signature(root: &Path) -> Signature {
-    let mut signature = Signature::new();
-    collect_signature(root, root, &mut signature);
-    signature
+/// One parsed `.gitignore` file, reduced to the patterns that can prune a
+/// directory without risking an over-prune. `base` is the directory the file
+/// lives in, relative to the walk root (`""` for the root).
+struct IgnoreLayer {
+    base: PathBuf,
+    /// Bare names (`target`, `node_modules/`) matching a directory of that name
+    /// at any depth beneath `base`.
+    names: Vec<String>,
+    /// Anchored, layer-relative directory paths (`/build`, `tests/cache`)
+    /// matching a directory whose path under `base` is exactly this.
+    anchored: Vec<PathBuf>,
 }
 
-/// Descend `dir` (a subdirectory of `root`), inserting each regular entry.
-fn collect_signature(root: &Path, dir: &Path, out: &mut Signature) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// Recursively collect the [`Signature`] of every file under `root`, pruning
+/// directories ignored by the active layer stack. `shutdown` is polled every
+/// [`WALK_SHUTDOWN_CHECK`] entries so a quit aborts a long walk promptly.
+fn walk_signature(root: &Path, shutdown: &AtomicBool) -> Signature {
+    let mut span = perf::span("poll_walk");
+    let mut walk = PollWalk {
+        root,
+        shutdown,
+        out: Signature::new(),
+        layers: Vec::new(),
+        seen: 0,
     };
-    for entry in entries.flatten() {
-        // Prune any `.git` directory (root or nested, e.g. a submodule) so ref
-        // churn never leaks into the workdir signature.
-        if entry.file_name() == ".git" {
-            continue;
+    walk.collect(root);
+    span.detail(format_args!("entries={}", walk.out.len()));
+    walk.out
+}
+
+/// State threaded through a poll walk: the root, the shutdown flag, the
+/// accumulated signature, and the stack of `.gitignore` layers active on the
+/// directory currently being descended.
+struct PollWalk<'a> {
+    root: &'a Path,
+    shutdown: &'a AtomicBool,
+    out: Signature,
+    layers: Vec<IgnoreLayer>,
+    seen: usize,
+}
+
+impl PollWalk<'_> {
+    /// Descend `dir`, adding its `.gitignore` to the layer stack, pruning
+    /// directories matched by an active layer, and recording every file.
+    fn collect(&mut self, dir: &Path) {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return;
         }
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.is_dir() {
-            collect_signature(root, &path, out);
-        } else {
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            out.insert(rel.to_path_buf(), (mtime, meta.len()));
+        let pushed = self.push_gitignore(dir);
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                // Prune any `.git` directory (root or nested, e.g. a submodule)
+                // so ref churn never leaks into the workdir signature.
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                self.seen += 1;
+                if self.seen.is_multiple_of(WALK_SHUTDOWN_CHECK)
+                    && self.shutdown.load(Ordering::Relaxed)
+                {
+                    break;
+                }
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                let Ok(rel) = path.strip_prefix(self.root) else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    if is_pruned(rel, &self.layers) {
+                        continue;
+                    }
+                    self.collect(&path);
+                } else {
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    self.out.insert(rel.to_path_buf(), (mtime, meta.len()));
+                }
+            }
+        }
+        if pushed {
+            self.layers.pop();
         }
     }
+
+    /// Read `dir/.gitignore` and push its simple patterns as a layer. Returns
+    /// false when the file is absent or contributes no usable pattern.
+    fn push_gitignore(&mut self, dir: &Path) -> bool {
+        let Ok(rel) = dir.strip_prefix(self.root) else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) else {
+            return false;
+        };
+        let (names, anchored) = parse_gitignore(&text);
+        if names.is_empty() && anchored.is_empty() {
+            return false;
+        }
+        self.layers.push(IgnoreLayer {
+            base: rel.to_path_buf(),
+            names,
+            anchored,
+        });
+        true
+    }
+}
+
+/// Extract the conservative, wildcard-free patterns from a `.gitignore` body.
+/// Patterns containing `!`, `*`, `?`, or `[` are dropped outright: negations,
+/// wildcards, and character classes are never used to prune, so any subtree
+/// they might re-include is walked rather than wrongly skipped.
+fn parse_gitignore(text: &str) -> (Vec<String>, Vec<PathBuf>) {
+    let mut names = Vec::new();
+    let mut anchored = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.chars().any(|c| matches!(c, '!' | '*' | '?' | '[')) {
+            continue;
+        }
+        let pat = line.strip_suffix('/').unwrap_or(line);
+        if pat.is_empty() {
+            continue;
+        }
+        if pat.contains('/') {
+            // A slash (other than a trailing one) anchors the pattern to the
+            // layer's directory; a leading slash is decorative.
+            let anchored_pat = pat.strip_prefix('/').unwrap_or(pat);
+            if !anchored_pat.is_empty() {
+                anchored.push(PathBuf::from(anchored_pat));
+            }
+        } else {
+            names.push(pat.to_string());
+        }
+    }
+    (names, anchored)
+}
+
+/// True when `dir_rel` (root-relative) matches an active ignore layer. Bare
+/// names match the directory's own name at any depth; anchored paths match the
+/// directory's path under the layer exactly.
+fn is_pruned(dir_rel: &Path, layers: &[IgnoreLayer]) -> bool {
+    let name = dir_rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    for layer in layers {
+        let Ok(layer_rel) = dir_rel.strip_prefix(&layer.base) else {
+            continue;
+        };
+        if let Some(name) = &name {
+            if layer.names.iter().any(|n| n == name) {
+                return true;
+            }
+        }
+        if layer.anchored.iter().any(|p| p.as_path() == layer_rel) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Repo-relative paths whose signature entry appeared, disappeared, or changed.
@@ -354,6 +573,7 @@ fn poll_refs(
         if mtime_changed(*last_head, h) {
             *last_head = h;
             let _ = out_tx.send(WorkerEvent::RefsChanged);
+            perf::tally(Counter::WatchRefs);
         }
     }
 }
@@ -519,8 +739,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b.txt"), "two\n").unwrap();
 
-        let first = walk_signature(dir.path());
-        let second = walk_signature(dir.path());
+        let first = walk_signature(dir.path(), &AtomicBool::new(false));
+        let second = walk_signature(dir.path(), &AtomicBool::new(false));
 
         assert!(signature_diff(&first, &second).is_empty());
     }
@@ -530,24 +750,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let touched = dir.path().join("a.txt");
         std::fs::write(&touched, "one\n").unwrap();
-        let mut prev = walk_signature(dir.path());
+        let mut prev = walk_signature(dir.path(), &AtomicBool::new(false));
 
         // Create: the new path appears.
         std::fs::write(dir.path().join("b.txt"), "new\n").unwrap();
-        let next = walk_signature(dir.path());
+        let next = walk_signature(dir.path(), &AtomicBool::new(false));
         assert_eq!(signature_diff(&prev, &next), vec![PathBuf::from("b.txt")]);
         prev = next;
 
         // Modify (size differs, so the change is visible even at coarse mtime
         // resolution).
         std::fs::write(&touched, "one\ntwo\n").unwrap();
-        let next = walk_signature(dir.path());
+        let next = walk_signature(dir.path(), &AtomicBool::new(false));
         assert_eq!(signature_diff(&prev, &next), vec![PathBuf::from("a.txt")]);
         prev = next;
 
         // Delete: the vanished path is reported.
         std::fs::remove_file(&touched).unwrap();
-        let next = walk_signature(dir.path());
+        let next = walk_signature(dir.path(), &AtomicBool::new(false));
         assert_eq!(signature_diff(&prev, &next), vec![PathBuf::from("a.txt")]);
     }
 
@@ -558,7 +778,7 @@ mod tests {
         std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(dir.path().join("tracked.txt"), "x\n").unwrap();
 
-        let sig = walk_signature(dir.path());
+        let sig = walk_signature(dir.path(), &AtomicBool::new(false));
 
         assert!(sig.contains_key(Path::new("tracked.txt")));
         assert!(!sig.keys().any(|p| p.starts_with(".git")));
@@ -571,7 +791,7 @@ mod tests {
         std::fs::write(dir.path().join("sub/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(dir.path().join("sub/tracked.txt"), "x\n").unwrap();
 
-        let sig = walk_signature(dir.path());
+        let sig = walk_signature(dir.path(), &AtomicBool::new(false));
 
         assert!(sig.contains_key(Path::new("sub/tracked.txt")));
         assert!(
@@ -618,5 +838,183 @@ mod tests {
         let mut paths = vec![PathBuf::from("b"), PathBuf::from("a"), PathBuf::from("b")];
         dedup_paths(&mut paths);
         assert_eq!(paths, vec![PathBuf::from("a"), PathBuf::from("b")]);
+    }
+
+    /// A tempdir with a root `.gitignore` (`node_modules/`, `/build`), a nested
+    /// `.gitignore` (`cache/`) and files both under and outside those trees.
+    fn ignored_dir_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n/build\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/x")).unwrap();
+        std::fs::write(dir.path().join("node_modules/x/y"), "dep\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("build")).unwrap();
+        std::fs::write(dir.path().join("build/z"), "obj\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        // A `cache/` at the root is *not* ignored: only the nested `.gitignore`
+        // establishes that name, and only beneath `sub/`.
+        std::fs::create_dir_all(dir.path().join("cache")).unwrap();
+        std::fs::write(dir.path().join("cache/keep"), "keep\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/cache")).unwrap();
+        std::fs::write(dir.path().join("sub/cache/f"), "ignored\n").unwrap();
+        std::fs::write(dir.path().join("sub/.gitignore"), "cache/\n").unwrap();
+        std::fs::write(dir.path().join("sub/keep.rs"), "fn keep() {}\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_gitignore_drops_wildcards_and_negations() {
+        let (names, anchored) = parse_gitignore("!important\n*.log\nfoo?\nbar[0]\n");
+        assert!(names.is_empty(), "non-simple patterns must never be parsed");
+        assert!(anchored.is_empty());
+
+        let (names, anchored) = parse_gitignore("# comment\n\ntarget\nnode_modules/\n");
+        assert_eq!(
+            names,
+            vec!["target".to_string(), "node_modules".to_string()]
+        );
+        assert!(anchored.is_empty());
+    }
+
+    #[test]
+    fn parse_gitignore_anchors_patterns_with_a_slash() {
+        let (names, anchored) = parse_gitignore("/build\ntests/system/cache/\n");
+        assert!(names.is_empty());
+        assert_eq!(
+            anchored,
+            vec![PathBuf::from("build"), PathBuf::from("tests/system/cache")]
+        );
+    }
+
+    #[test]
+    fn bare_name_prunes_a_dir_at_any_depth() {
+        let layers = vec![IgnoreLayer {
+            base: PathBuf::new(),
+            names: vec!["node_modules".to_string()],
+            anchored: Vec::new(),
+        }];
+        assert!(is_pruned(Path::new("node_modules"), &layers));
+        assert!(is_pruned(Path::new("a/b/node_modules"), &layers));
+        assert!(!is_pruned(Path::new("a/b/src"), &layers));
+    }
+
+    #[test]
+    fn anchored_pattern_prunes_only_at_the_layer_root() {
+        let layers = vec![IgnoreLayer {
+            base: PathBuf::new(),
+            names: Vec::new(),
+            anchored: vec![PathBuf::from("build")],
+        }];
+        assert!(is_pruned(Path::new("build"), &layers));
+        assert!(!is_pruned(Path::new("sub/build"), &layers));
+    }
+
+    #[test]
+    fn nested_layer_prunes_only_under_it() {
+        let layers = vec![IgnoreLayer {
+            base: PathBuf::from("sub"),
+            names: vec!["cache".to_string()],
+            anchored: Vec::new(),
+        }];
+        assert!(is_pruned(Path::new("sub/cache"), &layers));
+        assert!(!is_pruned(Path::new("cache"), &layers));
+        assert!(!is_pruned(Path::new("other/cache"), &layers));
+    }
+
+    #[test]
+    fn dir_matching_nothing_is_walked() {
+        let layers = vec![IgnoreLayer {
+            base: PathBuf::new(),
+            names: vec!["target".to_string()],
+            anchored: vec![PathBuf::from("build")],
+        }];
+        assert!(!is_pruned(Path::new("src"), &layers));
+        assert!(!is_pruned(Path::new("src/targets"), &layers));
+    }
+
+    #[test]
+    fn walk_prunes_ignored_dirs() {
+        let dir = ignored_dir_repo();
+        let sig = walk_signature(dir.path(), &AtomicBool::new(false));
+
+        assert!(sig.contains_key(Path::new("src/main.rs")));
+        assert!(sig.contains_key(Path::new("sub/keep.rs")));
+        assert!(sig.contains_key(Path::new("cache/keep")));
+        assert!(
+            !sig.keys().any(|p| p.starts_with("node_modules")),
+            "an ignored directory must be pruned whole, not just its files"
+        );
+        assert!(
+            !sig.keys().any(|p| p.starts_with("build")),
+            "an anchored ignore pattern must prune its directory"
+        );
+        assert!(
+            !sig.keys().any(|p| p.starts_with("sub/cache")),
+            "a nested .gitignore must prune only under its own directory"
+        );
+    }
+
+    #[test]
+    fn walk_without_gitignore_does_not_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/x")).unwrap();
+        std::fs::write(dir.path().join("node_modules/x/y"), "dep\n").unwrap();
+
+        let sig = walk_signature(dir.path(), &AtomicBool::new(false));
+
+        assert!(sig.contains_key(Path::new("node_modules/x/y")));
+    }
+
+    #[test]
+    fn walk_aborts_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let shutdown = AtomicBool::new(true);
+
+        let sig = walk_signature(dir.path(), &shutdown);
+
+        assert!(sig.is_empty(), "a set shutdown flag must abort the walk");
+    }
+
+    #[test]
+    fn wait_done_times_out_on_an_empty_channel() {
+        let (_tx, rx) = bounded::<()>(1);
+        assert!(wait_done(&rx, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn wait_done_observes_completion() {
+        let (tx, rx) = bounded::<()>(1);
+        tx.send(()).unwrap();
+        assert!(wait_done(&rx, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn wait_done_treats_a_dropped_sender_as_done() {
+        let (tx, rx) = bounded::<()>(1);
+        drop(tx);
+        assert!(wait_done(&rx, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn next_poll_interval_bounds_duty_cycle_by_walk() {
+        // A 600ms walk must push the next poll out to at least 2x the walk.
+        assert_eq!(
+            next_poll_interval(Duration::from_millis(600)),
+            Duration::from_millis(1200)
+        );
+        // A fast walk leaves the floor interval unchanged.
+        assert_eq!(next_poll_interval(Duration::from_millis(10)), POLL_INTERVAL);
+    }
+
+    #[test]
+    fn poll_mode_flag_is_shared_with_the_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = Watcher::start(dir.path().to_path_buf()).unwrap();
+        let flag = watcher.poll_mode_flag();
+        // A store through one clone must be visible through another: the UI
+        // holds the same allocation the watcher flips on degradation.
+        flag.store(true, Ordering::Relaxed);
+        assert!(watcher.poll_mode_flag().load(Ordering::Relaxed));
     }
 }

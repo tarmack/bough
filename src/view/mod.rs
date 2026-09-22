@@ -15,6 +15,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
+use std::sync::atomic::Ordering;
 
 use crate::app::App;
 use crate::preview;
@@ -126,7 +127,7 @@ fn status_line(app: &App) -> Option<String> {
     if let Some(err) = app.diff_error() {
         return Some(format!("git: {err}"));
     }
-    if app.poll_mode {
+    if app.poll_mode.load(Ordering::Relaxed) {
         return Some("live update: poll mode".into());
     }
     None

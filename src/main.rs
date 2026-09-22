@@ -15,6 +15,7 @@ mod git;
 mod highlight;
 mod input;
 mod kitty;
+mod perf;
 mod preview;
 mod snapshot;
 #[cfg(test)]
@@ -89,6 +90,7 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> io::Result<()> {
+    perf::init();
     let cli = Cli::parse();
 
     if cli.theme == "list" {
@@ -134,6 +136,12 @@ fn main() -> io::Result<()> {
     let initial_snapshot = initial_snapshot(empty, branch_state.clone());
 
     let repo_root = std::env::current_dir()?;
+    crate::perf_evt!(
+        "startup repo={} revision={} empty={}",
+        repo_root.display(),
+        revision,
+        empty
+    );
     let worker = Worker::spawn(
         revision.clone(),
         empty,
@@ -146,6 +154,11 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     });
 
+    crate::perf_evt!(
+        "watcher poll_mode={} (early snapshot; degradation may flip it later)",
+        worker.poll_mode.load(std::sync::atomic::Ordering::Relaxed)
+    );
+
     let mut app = App::new(
         initial_snapshot,
         worker.request_tx.clone(),
@@ -153,6 +166,9 @@ fn main() -> io::Result<()> {
         revision.clone(),
         "HEAD".to_string(),
     );
+    // The footer must reflect a degradation the moment the watcher thread
+    // flips it, so the app reads the worker's real flag, not a spawn-time copy.
+    app.poll_mode = worker.poll_mode.clone();
     // A degenerate comparison (no committed work since the origin: standing
     // on the trunk, or a branch still at the trunk's tip) is the uncommitted
     // view — start there instead of showing a branch view with no branch
@@ -162,12 +178,20 @@ fn main() -> io::Result<()> {
         app.mode = crate::app::Mode::Uncommitted;
     }
 
-    enable_raw_mode()?;
+    // Any panic — on any thread — must leave the shell usable: restore the
+    // terminal before the message prints, then exit for real. A half-alive
+    // UI drawing to a restored terminal after a worker-thread panic is
+    // worse than a clean crash. Nothing in this codebase catches unwinds,
+    // so exiting from the hook is safe; the `Drop` guard remains the
+    // backstop for non-panic error returns, and every restore step is
+    // idempotent.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = TerminalGuard::restore();
         previous_hook(info);
+        std::process::exit(101);
     }));
+    enable_raw_mode()?;
     let _guard = TerminalGuard;
     let images = kitty::probe();
     app.set_preview_enabled(images);
@@ -175,6 +199,13 @@ fn main() -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // Debug-only deliberate crash, used to verify panic-time terminal
+    // restoration through a real terminal.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("BOUGH_CRASH_TEST").is_some() {
+        panic!("bough crash test");
+    }
 
     let result = input::run(
         &mut terminal,

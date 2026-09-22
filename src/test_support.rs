@@ -111,6 +111,7 @@ pub fn header_full(mode_old: Option<u32>, mode_new: Option<u32>) -> FileHeader {
         mode_old,
         mode_new,
         binary: false,
+        lfs: None,
         hunks: vec![HunkMeta {
             added: 1,
             deleted: 1,
@@ -150,6 +151,7 @@ pub fn fitting_hunk() -> Diff {
         mode_old: None,
         mode_new: None,
         binary: false,
+        lfs: None,
         hunks: (0..3)
             .map(|_| HunkMeta {
                 added: 1,

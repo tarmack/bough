@@ -127,6 +127,17 @@ impl FileStatus {
     }
 }
 
+/// Git-LFS object metadata for a file whose content is an LFS pointer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LfsInfo {
+    /// The referenced object's SHA-256 hex digest, without the `sha256:`
+    /// prefix. Empty when unknown (an added file with no stored pointer).
+    pub oid: String,
+    /// The object size in bytes: from the pointer's `size` line, or the
+    /// worktree file's size for an added file with no stored pointer.
+    pub size: u64,
+}
+
 /// Per-file metadata populated by the git engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileHeader {
@@ -146,6 +157,9 @@ pub struct FileHeader {
     pub mode_old: Option<u32>,
     pub mode_new: Option<u32>,
     pub binary: bool,
+    /// Set when the file is a Git-LFS object; the renderer shows a stub note
+    /// instead of a content diff.
+    pub lfs: Option<LfsInfo>,
     /// Per-hunk metadata, one entry per `@@` header, in file order.
     pub hunks: Vec<HunkMeta>,
 }
@@ -235,6 +249,7 @@ impl Diff {
             mode_old: None,
             mode_new: None,
             binary: files.iter().any(|f| f.binary),
+            lfs: None,
             hunks: Vec::new(),
         };
 
@@ -566,6 +581,7 @@ mod tests {
             mode_old: None,
             mode_new: None,
             binary: false,
+            lfs: None,
             hunks: vec![HunkMeta { added, deleted }],
         };
         Diff {
@@ -644,5 +660,41 @@ mod tests {
         assert_eq!(diff.header.added, 2);
         assert_eq!(diff.header.deleted, 2);
         assert!(diff.header.hunks.is_empty());
+    }
+
+    #[test]
+    fn from_directory_propagates_lfs_headers() {
+        let text = single_file("src/a.rs", 2, 1);
+        let lfs_header = FileHeader {
+            path: "src/b.bin".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            added: 0,
+            deleted: 0,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: true,
+            lfs: Some(LfsInfo {
+                oid: "abc".into(),
+                size: 42,
+            }),
+            hunks: Vec::new(),
+        };
+        let lfs = Diff {
+            header: lfs_header.clone(),
+            files: vec![lfs_header],
+            sections: Vec::new(),
+            lines: Vec::new(),
+        };
+
+        let diff = Diff::from_directory("src", &[Arc::new(text), Arc::new(lfs)]);
+        assert_eq!(diff.files.len(), 2);
+        assert!(diff.files[0].lfs.is_none());
+        assert_eq!(diff.files[1].lfs.as_ref().unwrap().size, 42);
+        // The LFS stub contributes no lines: aggregates sum only the text file.
+        assert_eq!(diff.header.added, 2);
+        assert_eq!(diff.header.deleted, 1);
+        assert!(diff.header.binary);
     }
 }

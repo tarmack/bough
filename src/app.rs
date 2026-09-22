@@ -9,12 +9,14 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 
 use crate::diff::{Diff, LineKind};
 use crate::highlight::TokenOwned;
+use crate::perf;
 use crate::preview;
 use crate::snapshot::{ArcSnapshot, Request, Seq};
 use crate::text::max_scroll_for;
@@ -186,8 +188,9 @@ pub struct App {
     /// end) sent for the selected file; `maybe_request_highlight` only sends
     /// when the visible range moves outside it.
     last_highlight_range: Option<(usize, usize)>,
-    /// True when the file watcher degraded to poll mode (for the status line).
-    pub poll_mode: bool,
+    /// Shared watcher degradation flag (for the status line). `main` swaps in
+    /// the worker's real `Arc`, so the footer reflects a mid-run degradation.
+    pub poll_mode: Arc<AtomicBool>,
     /// Current diff base: the default branch, a picked origin, or `HEAD`.
     pub mode: Mode,
     /// Revision for `Mode::Branch(Origin::Default)` (the startup revision).
@@ -255,7 +258,7 @@ impl App {
             request_tx,
             seq: 0,
             last_highlight_range: None,
-            poll_mode,
+            poll_mode: Arc::new(AtomicBool::new(poll_mode)),
             mode: Mode::Branch(Origin::Default),
             main_rev,
             uncommitted_rev,
@@ -289,10 +292,21 @@ impl App {
             _ => true,
         };
         let tree_changed = !Arc::ptr_eq(&self.snapshot.tree, &snap.tree);
+        let highlight_changed =
+            !Arc::ptr_eq(&self.snapshot.selected_highlight, &snap.selected_highlight);
         let old_section = content_changed
             .then(|| self.top_visible_section())
             .flatten();
         let old_path = self.selected_path.clone();
+
+        crate::perf_evt!(
+            "snapshot seq={} tree={} diff={} hl={} busy={}",
+            snap.seq,
+            tree_changed,
+            content_changed,
+            highlight_changed,
+            snap.busy
+        );
 
         self.snapshot = snap;
 
@@ -1113,9 +1127,18 @@ impl App {
         // `max_width` depends only on the diff, and the header positions only
         // on the diff + fold set.
         if !diff_same {
+            let mut span = perf::span("max_width");
             cache.max_width = self.compute_max_width();
+            let lines = self
+                .snapshot
+                .selected_diff
+                .as_ref()
+                .map_or(0, |d| d.lines.len());
+            span.detail(format_args!("lines={lines}"));
         }
+        let mut span = perf::span("visible_lines");
         let lines = self.compute_visible_lines();
+        span.detail(format_args!("flat={}", lines.len()));
         if !diff_same || !collapsed_same {
             cache.headers = Rc::new(self.compute_headers(&lines));
         }
@@ -1770,6 +1793,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: (0..2)
                     .map(|_| HunkMeta {
                         added: 1,
@@ -1823,6 +1847,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: (0..3)
                     .map(|_| HunkMeta {
                         added: 1,
@@ -1889,6 +1914,7 @@ mod tests {
                 mode_old: None,
                 mode_new: None,
                 binary: false,
+                lfs: None,
                 hunks: (0..2)
                     .map(|_| HunkMeta {
                         added: 1,
@@ -2019,6 +2045,7 @@ mod tests {
             mode_old: None,
             mode_new: None,
             binary: false,
+            lfs: None,
             hunks: vec![HunkMeta {
                 added: 1,
                 deleted: 0,
@@ -2108,6 +2135,7 @@ mod tests {
             mode_old: None,
             mode_new: None,
             binary: false,
+            lfs: None,
             hunks: vec![HunkMeta {
                 added: 1,
                 deleted: 0,

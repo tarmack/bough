@@ -17,6 +17,7 @@ use crossbeam_channel::{select, Receiver, Sender, TryRecvError};
 use crate::diff::Diff;
 use crate::git;
 use crate::highlight::{Highlighter, ResumeState};
+use crate::perf::{self, Counter};
 use crate::preview::PreviewImage;
 use crate::snapshot::{ArcSnapshot, HighlightLines, Request, Seq, Snapshot};
 use crate::tree::Tree;
@@ -28,6 +29,11 @@ const DEBOUNCE_FLOOR: Duration = Duration::from_millis(150);
 const DEBOUNCE_CEILING: Duration = Duration::from_millis(400);
 /// How long the raised floor stays in effect.
 const FLOOR_RAISED_FOR: Duration = Duration::from_secs(10);
+/// Factor applied to the last recompute's duration for the duty-cycle floor:
+/// under continuous churn the worker rescans at most ~1/3 of the time.
+const RECOMPUTE_FLOOR_FACTOR: u32 = 3;
+/// Cap on the duty-cycle floor: worst-case staleness stays under half a minute.
+const ADAPTIVE_FLOOR_MAX: Duration = Duration::from_secs(30);
 /// Never recompute more often than this, even with perfectly spaced events.
 const HARD_CEILING: Duration = Duration::from_millis(100);
 /// Above this many changed entries the floor raises to the ceiling.
@@ -108,7 +114,7 @@ impl Worker {
                 );
             }
         };
-        let poll_mode = watcher_poll_mode(&watcher);
+        let poll_mode = watcher.poll_mode_flag();
         let event_rx = watcher.receiver().clone();
 
         let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
@@ -162,14 +168,6 @@ impl Drop for Worker {
             let _ = h.join();
         }
     }
-}
-
-/// `poll_mode` lives on the `Watcher`; clone its `Arc` out so the UI can read
-/// it without holding the watcher.
-fn watcher_poll_mode(w: &Watcher) -> Arc<AtomicBool> {
-    // The Watcher does not expose its internal Arc; mirror via is_poll_mode at
-    // spawn time. The flag is stable for the life of the watcher.
-    Arc::new(AtomicBool::new(w.is_poll_mode()))
 }
 
 /// Degraded spawn path when the watcher failed to start.
@@ -323,6 +321,9 @@ struct WorkerState {
     floor_raised_at: Option<Instant>,
     /// Wall time of the last `git::changed_files` call, for adaptive floor.
     last_git_wall: Duration,
+    /// Wall time of the last completed recompute, driving the duty-cycle floor
+    /// while the raised window is active.
+    last_recompute: Duration,
     /// Cached branch state (ahead/behind vs base, unpushed vs upstream).
     last_branch: git::BranchState,
     /// Full per-file metadata from the last recompute, keyed by path. Lets a
@@ -340,6 +341,9 @@ struct WorkerState {
     /// path is ignored. `None` when the repository/excludes are unavailable,
     /// which always falls back to recomputing.
     ignore: Option<IgnoreMatcher>,
+    /// `busy` flag of the last snapshot sent, so instrumentation only logs a
+    /// `busy` transition rather than every snapshot.
+    last_sent_busy: bool,
 }
 
 impl WorkerState {
@@ -367,11 +371,13 @@ impl WorkerState {
             cache: LruCache::new(CACHE_CAP),
             floor_raised_at: None,
             last_git_wall: Duration::ZERO,
+            last_recompute: Duration::ZERO,
             last_branch: initial_branch,
             last_changes: HashMap::new(),
             preview_active: false,
             uncommitted_stats: None,
             ignore: IgnoreMatcher::open(),
+            last_sent_busy: false,
         }
     }
 
@@ -415,9 +421,9 @@ impl WorkerState {
 
 /// Cached git exclude chain: decides whether a changed path is git-ignored so
 /// an all-ignored watcher burst can skip its recompute. The `Stack` owns its
-/// parsed pattern state, so the chain is built once (in [`IgnoreMatcher::open`])
-/// and reused across fires.
-struct IgnoreMatcher {
+/// parsed pattern state, so the chain is built once (in [`IgnoreMatcher::open`]
+/// / [`IgnoreMatcher::open_at`]) and reused across fires.
+pub(crate) struct IgnoreMatcher {
     repo: gix::Repository,
     stack: gix::worktree::Stack,
 }
@@ -539,8 +545,13 @@ fn run_loop(
     // True when a ref moved in the current debounce window; a ref change must
     // always recompute, even alongside only-ignored workdir paths.
     let mut saw_refs = false;
+    let mut last_beat = Instant::now();
 
     loop {
+        if last_beat.elapsed() >= Duration::from_secs(1) {
+            perf::beat();
+            last_beat = Instant::now();
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -557,6 +568,12 @@ fn run_loop(
             recv(event_rx) -> ev => match ev {
                 Ok(we) => {
                     last_event = Some(Instant::now());
+                    match &we {
+                        WorkerEvent::WorkdirChanged(paths) => {
+                            crate::perf_evt!("watch ev=workdir paths={}", paths.len());
+                        }
+                        WorkerEvent::RefsChanged => crate::perf_evt!("watch ev=refs"),
+                    }
                     match we {
                         WorkerEvent::WorkdirChanged(paths) => {
                             saw_workdir = true;
@@ -567,11 +584,14 @@ fn run_loop(
                 }
                 Err(_) => {
                     // Watcher closed; stop watching the never-ready channel.
+                    crate::perf_evt!("watch closed");
                     event_closed = true;
                 }
             },
             recv(request_rx) -> req => match req {
                 Ok(r) => {
+                    perf::tally(Counter::RequestsSeen);
+                    crate::perf_evt!("request kind={} seq={}", request_kind(&r), request_seq(&r));
                     // Fold any queued requests so a burst (rapid `j`) runs at
                     // most the latest of each kind.
                     let survivors = coalesce(r, &request_rx, &shutdown);
@@ -596,11 +616,11 @@ fn run_loop(
         }
 
         let now = Instant::now();
-        if debounce_due
+        let quiet_due = debounce_due
             && last_event
                 .map(|le| should_fire(le, now, floor))
-                .unwrap_or(false)
-        {
+                .unwrap_or(false);
+        if quiet_due || churn_due(last_event, last_recompute, now, floor) {
             if last_recompute
                 .map(|lr| now.duration_since(lr) < HARD_CEILING)
                 .unwrap_or(false)
@@ -613,7 +633,11 @@ fn run_loop(
             // A burst that only touched git-ignored paths cannot change the
             // scan result, so skip the recompute entirely — unless a ref moved
             // in the same window.
-            if saw_refs || !skip_ignored(&mut state, &changed_paths) {
+            let skipped = !saw_refs && skip_ignored(&mut state, &changed_paths);
+            if skipped {
+                perf::tally(Counter::IgnoreSkips);
+                crate::perf_evt!("ignore skip paths={}", changed_paths.len());
+            } else {
                 recompute(
                     &mut state,
                     &snapshot_tx,
@@ -661,7 +685,13 @@ fn coalesce(first: Request, rx: &Receiver<Request>, shutdown: &AtomicBool) -> Ve
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
     }
-    folded.into_requests()
+    let absorbed = folded.absorbed;
+    let out = folded.into_requests();
+    if absorbed > out.len() {
+        perf::tally(Counter::RequestsCoalescedOut);
+        crate::perf_evt!("coalesce absorbed={absorbed} out={}", out.len());
+    }
+    out
 }
 
 /// Accumulator for [`coalesce`]: retains the latest request of each kind,
@@ -672,10 +702,13 @@ struct Folded {
     diff: Option<Request>,
     highlight: Option<Request>,
     image: Option<Request>,
+    /// Requests absorbed, including the first: the fold's input count.
+    absorbed: usize,
 }
 
 impl Folded {
     fn absorb(&mut self, r: Request) {
+        self.absorbed += 1;
         match r {
             // A rev switch discards everything queued before it, but requests
             // queued after it survive (a new selection alongside a base switch
@@ -746,13 +779,62 @@ fn request_seq(r: &Request) -> Seq {
     }
 }
 
-/// Compute the current debounce floor, raising it for 10s after a slow/huge
-/// recompute.
+/// Short kind label for instrumentation lines.
+fn request_kind(r: &Request) -> &'static str {
+    match r {
+        Request::Diff { .. } => "diff",
+        Request::Highlight { .. } => "highlight",
+        Request::LoadImage { .. } => "image",
+        Request::SetRev { .. } => "setrev",
+        Request::Shutdown => "shutdown",
+    }
+}
+
+/// Duty-cycle floor for watcher-triggered recomputes. Under continuous churn
+/// (an agent writing non-ignored files every few seconds) a pure quiet-period
+/// debounce fires back-to-back with no idle time, pegging a core on rescans.
+/// Holding the floor at a multiple of the last recompute's duration lets a
+/// rescan finish and sit idle before the next, so rescanning occupies at most
+/// ~1/3 of wall time. Capped so the view never goes stale longer than
+/// [`ADAPTIVE_FLOOR_MAX`]. A recompute fast enough that its duty-cycle value
+/// does not exceed `base` leaves the floor unchanged.
+fn adaptive_floor(base: Duration, last_recompute: Duration) -> Duration {
+    let duty = last_recompute
+        .saturating_mul(RECOMPUTE_FLOOR_FACTOR)
+        .min(ADAPTIVE_FLOOR_MAX);
+    base.max(duty)
+}
+
+/// Compute the current debounce floor. The base floor rises to
+/// [`DEBOUNCE_CEILING`] for [`FLOOR_RAISED_FOR`] after a slow git call or a
+/// huge diff; while that window is active the duty-cycle component from the
+/// last recompute's duration is layered on. With no recompute refreshing the
+/// window for ten seconds both decay back to [`DEBOUNCE_FLOOR`].
 fn current_floor(state: &WorkerState, now: Instant) -> Duration {
     match state.floor_raised_at {
-        Some(raised) if now.duration_since(raised) < FLOOR_RAISED_FOR => DEBOUNCE_CEILING,
+        Some(raised) if now.duration_since(raised) < FLOOR_RAISED_FOR => {
+            adaptive_floor(DEBOUNCE_CEILING, state.last_recompute)
+        }
         _ => DEBOUNCE_FLOOR,
     }
+}
+
+/// True when continuous churn has starved the quiet-period debounce: the raised
+/// floor is active and events keep arriving inside it, so the watcher would
+/// never reach a quiet window. Fire on elapsed time since the last recompute
+/// instead, bounding staleness by the floor. Only the watcher path consults
+/// this — user requests bypass the floor entirely.
+fn churn_due(
+    last_event: Option<Instant>,
+    last_recompute: Option<Instant>,
+    now: Instant,
+    floor: Duration,
+) -> bool {
+    floor >= DEBOUNCE_CEILING
+        && last_event.is_some()
+        && last_recompute
+            .map(|lr| now.duration_since(lr) >= floor)
+            .unwrap_or(false)
 }
 
 /// Next tick length so the debounce deadline wakes the loop.
@@ -968,6 +1050,7 @@ fn scan_entries(
     if shutdown.load(Ordering::Relaxed) {
         return Err("shutdown".into());
     }
+    perf::tally(Counter::Scans);
     if state.empty {
         let entries = git::initial_listing().map_err(|e| e.to_string())?;
         let paths: Vec<String> = entries.iter().map(|(_, p)| p.clone()).collect();
@@ -1007,17 +1090,23 @@ fn recompute(
     refresh_uncommitted: bool,
 ) {
     let t0 = Instant::now();
-    let (entries, stats) = match scan_entries(state, shutdown) {
-        Ok(x) => x,
-        Err(err) => {
-            if shutdown.load(Ordering::Relaxed) {
+    perf::tally(Counter::Recomputes);
+    let mut span = perf::span("recompute");
+    let (entries, stats) = {
+        let _scan = perf::span("git_scan");
+        match scan_entries(state, shutdown) {
+            Ok(x) => x,
+            Err(err) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                state.last_error = Some(err);
+                send_error_snapshot(state, tx);
                 return;
             }
-            state.last_error = Some(err);
-            send_error_snapshot(state, tx);
-            return;
         }
     };
+    span.detail(format_args!("entries={}", entries.len()));
     recompute_from_scan(
         state,
         tx,
@@ -1028,6 +1117,7 @@ fn recompute(
         stats,
         t0,
     );
+    state.last_recompute = t0.elapsed();
 }
 
 /// The post-scan half of [`recompute`]: evict, refresh branch stats, build the
@@ -1058,6 +1148,7 @@ fn recompute_from_scan(
     // hides the split from the footer.
     if refresh_uncommitted {
         state.uncommitted_stats = if state.rev.contains("...") {
+            let _scan = perf::span("uncommitted_scan");
             git::all_changes("HEAD").ok().map(|changes| {
                 changes
                     .iter()
@@ -1071,11 +1162,16 @@ fn recompute_from_scan(
     // Adaptive floor: slow git or huge diff raises the floor for 10s.
     if state.last_git_wall > SLOW_GIT_THRESHOLD || entries.len() > LARGE_DIFF_THRESHOLD {
         state.floor_raised_at = Some(Instant::now());
+        crate::perf_evt!("debounce floor raised entries={}", entries.len());
     }
 
-    let mut tree = Tree::build(entries);
-    tree.annotate_stats(&stats);
-    let tree = Arc::new(tree);
+    let tree = {
+        let mut build = perf::span("tree_build");
+        let mut tree = Tree::build(entries);
+        tree.annotate_stats(&stats);
+        build.detail(format_args!("nodes={}", tree.nodes.len()));
+        Arc::new(tree)
+    };
     state.last_tree = Some(tree.clone());
 
     if shutdown.load(Ordering::Relaxed) {
@@ -1165,6 +1261,11 @@ fn send_snapshot(
     busy: bool,
 ) {
     let snap = state.snapshot(tree, diff, highlight, error, busy);
+    if busy != state.last_sent_busy {
+        crate::perf_evt!("snapshot busy={busy} seq={}", snap.seq);
+        state.last_sent_busy = busy;
+    }
+    perf::tally(Counter::SnapshotsSent);
     let _ = tx.send(Arc::new(snap));
 }
 
@@ -1201,9 +1302,14 @@ fn build_diff_for(
     shutdown: &AtomicBool,
 ) -> (Option<Arc<Diff>>, Arc<HighlightLines>) {
     let key = (path.to_string(), ctx);
+    let mut span = perf::span("diff_build");
     if let Some(e) = state.cache.get(&key) {
+        perf::tally(Counter::CacheHits);
+        span.detail(format_args!("cache=hit path={path}"));
         return (Some(e.diff.clone()), e.hl.clone());
     }
+    perf::tally(Counter::CacheMisses);
+    span.detail(format_args!("cache=miss path={path}"));
 
     let diff = if is_directory(state, path) {
         build_directory_diff(path, state, rev, ctx, tree, tx, shutdown)
@@ -1213,6 +1319,7 @@ fn build_diff_for(
 
     match diff {
         Ok(diff) => {
+            perf::tally(Counter::DiffBuilds);
             // No highlighting yet: every line is `None` until the UI nudges the
             // worker to fill the viewport. The diff itself renders instantly.
             let diff = Arc::new(diff);
@@ -1275,6 +1382,7 @@ fn build_directory_diff(
     shutdown: &AtomicBool,
 ) -> Result<Diff, git::GitError> {
     let prefix = format!("{path}/");
+    let mut span = perf::span("dir_build");
     // Owned copies so `state` stays free for the streaming sends below.
     let mut entries: Vec<(String, git::ChangeInfo)> = state
         .last_changes
@@ -1283,9 +1391,12 @@ fn build_directory_diff(
         .map(|(p, ci)| (p.clone(), ci.clone()))
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    span.detail(format_args!("children={}", entries.len()));
 
-    // Open the repo once up front instead of re-discovering it per file.
+    // Open the repo, resolve the base tree, and build one diff platform and
+    // LFS matcher up front instead of per child.
     let repo = git::open_repo().map_err(|e| git::GitError::message(e.to_string()))?;
+    let mut context = git::DiffContext::new(&repo, rev)?;
 
     // Children are `Arc`ed so each streamed chunk borrows them instead of
     // deep-cloning every diff built so far.
@@ -1294,13 +1405,7 @@ fn build_directory_diff(
         if shutdown.load(Ordering::Relaxed) {
             return Err(git::GitError::message("shutdown"));
         }
-        diffs.push(Arc::new(git::diff_file_in(
-            &repo,
-            rev,
-            &p,
-            &ci.into_meta(),
-            ctx,
-        )?));
+        diffs.push(Arc::new(context.diff_file(&p, &ci.into_meta(), ctx)?));
         if diffs.len().is_multiple_of(DIR_CHUNK) {
             stream_directory_chunk(state, tree, path, &diffs, tx);
         }
@@ -1320,6 +1425,7 @@ fn stream_directory_chunk(
     if state.selected_path.as_deref() != Some(path) {
         return;
     }
+    perf::tally(Counter::DirChunks);
     let partial = Diff::from_directory(path, diffs);
     let hl = Arc::new(vec![None; partial.lines.len()]);
     let error = state.last_error.clone();
@@ -1421,6 +1527,7 @@ fn fill_highlight_range(
     tx: &Sender<ArcSnapshot>,
 ) {
     let key = (path.to_string(), ctx);
+    let mut span = perf::span("highlight_fill");
     {
         let WorkerState {
             cache, highlighter, ..
@@ -1436,6 +1543,7 @@ fn fill_highlight_range(
         if from >= to {
             return;
         }
+        span.detail(format_args!("range={from}..{to}"));
 
         let CachedDiff {
             diff,
@@ -1473,6 +1581,7 @@ fn fill_highlight_range(
         Some(e) => (e.diff.clone(), e.hl.clone()),
         None => return,
     };
+    perf::tally(Counter::HighlightFills);
     send_diff_snapshot(state, Some(diff), hl, tx);
 }
 
@@ -1675,6 +1784,113 @@ mod tests {
         let last = Instant::now() - Duration::from_millis(50);
         let now = Instant::now();
         assert!(!should_fire(last, now, Duration::from_millis(150)));
+    }
+
+    #[test]
+    fn adaptive_floor_triples_slow_recompute() {
+        assert_eq!(
+            adaptive_floor(DEBOUNCE_CEILING, Duration::from_millis(4000)),
+            Duration::from_millis(12_000)
+        );
+    }
+
+    #[test]
+    fn adaptive_floor_leaves_fast_recompute_unchanged() {
+        // 3 * 100ms does not exceed the raised base, so the floor is unchanged.
+        assert_eq!(
+            adaptive_floor(DEBOUNCE_CEILING, Duration::from_millis(100)),
+            DEBOUNCE_CEILING
+        );
+    }
+
+    #[test]
+    fn adaptive_floor_caps_at_max() {
+        // 60s * 3 would be 180s; the cap bounds staleness instead.
+        assert_eq!(
+            adaptive_floor(DEBOUNCE_CEILING, Duration::from_secs(60)),
+            ADAPTIVE_FLOOR_MAX
+        );
+    }
+
+    #[test]
+    fn current_floor_decays_to_baseline() {
+        let now = Instant::now();
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        state.last_recompute = Duration::from_secs(4);
+        // No raised window: the adaptive component does not apply.
+        assert_eq!(current_floor(&state, now), DEBOUNCE_FLOOR);
+
+        state.floor_raised_at = Some(now);
+        assert_eq!(current_floor(&state, now), Duration::from_millis(12_000));
+
+        // Once the quiet window lapses without a recompute, both decay.
+        state.floor_raised_at = Some(now - FLOOR_RAISED_FOR - Duration::from_secs(1));
+        assert_eq!(current_floor(&state, now), DEBOUNCE_FLOOR);
+    }
+
+    #[test]
+    fn churn_due_only_when_raised_floor_and_events_pending() {
+        let now = Instant::now();
+        let recent = now - Duration::from_millis(100);
+        let stale = now - Duration::from_secs(13);
+        // Baseline floor: the quiet-period debounce handles it, never overdue.
+        assert!(!churn_due(Some(stale), Some(stale), now, DEBOUNCE_FLOOR));
+        // Raised floor but no pending events since the last fire.
+        assert!(!churn_due(None, Some(stale), now, DEBOUNCE_CEILING));
+        // Raised floor, events pending, but a recompute happened recently.
+        assert!(!churn_due(
+            Some(recent),
+            Some(recent),
+            now,
+            DEBOUNCE_CEILING
+        ));
+        // Raised floor, events pending, floor elapsed since the last recompute.
+        assert!(churn_due(Some(recent), Some(stale), now, DEBOUNCE_CEILING));
+    }
+
+    #[test]
+    fn set_rev_request_is_not_gated_by_adaptive_floor() {
+        // The adaptive floor is a watcher-path concern only: a user's rev
+        // switch must recompute immediately regardless of how high the floor
+        // is. Force the tallest adaptive floor, then assert `handle_request`
+        // still runs a recompute synchronously (the bogus rev fails its scan,
+        // so the only observable is a snapshot already queued on return).
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(8);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "no-such-base...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("."),
+            git::BranchState::default(),
+        );
+        state.last_recompute = Duration::from_secs(60);
+        state.floor_raised_at = Some(Instant::now());
+        let shutdown = AtomicBool::new(false);
+        assert_eq!(current_floor(&state, Instant::now()), ADAPTIVE_FLOOR_MAX);
+
+        let quit = handle_request(
+            Request::SetRev {
+                rev: "also-no-such-base...HEAD".into(),
+            },
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+        );
+
+        assert!(!quit);
+        assert_eq!(state.rev, "also-no-such-base...HEAD");
+        assert!(
+            rx.try_recv().is_ok(),
+            "SetRev must recompute without waiting on the adaptive floor"
+        );
     }
 
     #[test]
