@@ -3,7 +3,7 @@
 //! Only compiled under `#[cfg(test)]` (declared in `main.rs`). Import with
 //! `use crate::test_support::*;` from any test module.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::bounded;
 
@@ -13,6 +13,14 @@ use crate::diff::{
 };
 use crate::snapshot::{ArcSnapshot, Request, Snapshot};
 use crate::tree::Tree;
+
+/// Crate-wide lock serializing tests that touch the process-global git repo
+/// root. Rule: ANY test that mutates the global root (via `set_repo_root` /
+/// its `root_lock()` helpers) or reads it through real git openers (real
+/// `open_repo()` calls, real picker openers) must hold this lock for the
+/// whole test. Without this, parallel test threads can observe each other's
+/// temporary roots and see a repo that vanishes mid-test.
+pub static GIT_ROOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Build a single-file [`Diff`] from its header and body lines. Hunk
 /// sections are derived from the header's `hunks`; each line's `section` is

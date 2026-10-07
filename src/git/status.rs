@@ -154,7 +154,7 @@ struct CommittedChange {
 
 /// A path whose index content differs from HEAD (a staged change). The old side
 /// is HEAD's blob, the new side the index blob.
-struct StagedChange {
+pub(crate) struct StagedChange {
     status: FileStatus,
     old_id: Option<gix::ObjectId>,
     new_id: Option<gix::ObjectId>,
@@ -164,7 +164,7 @@ struct StagedChange {
 }
 
 /// A path whose worktree content differs from the index (an unstaged change).
-struct UnstagedChange {
+pub(crate) struct UnstagedChange {
     status: FileStatus,
     old_id: Option<gix::ObjectId>,
     old_path: Option<String>,
@@ -616,7 +616,7 @@ fn committed_changes(
 /// comparison stops early (e.g. path validation rejects a tracked name), the
 /// entries already produced are kept — a failure degrades per-path rather than
 /// blanking the whole listing.
-fn staged_changes(
+pub(crate) fn staged_changes(
     repo: &gix::Repository,
     head_tree: &gix::ObjectId,
 ) -> HashMap<String, StagedChange> {
@@ -732,7 +732,7 @@ fn index_type_changed(previous: gix::index::entry::Mode, current: gix::index::en
 /// The unstaged set (index → worktree, using the on-disk index so unchanged
 /// files stat-skip and are never hashed) plus the untracked files. One failed
 /// item is skipped rather than blanking the scan.
-fn unstaged_changes(
+pub(crate) fn unstaged_changes(
     repo: &gix::Repository,
 ) -> Result<(HashMap<String, UnstagedChange>, Vec<String>), GitError> {
     let platform = repo

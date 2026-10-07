@@ -103,7 +103,11 @@ impl Worker {
         initial_theme: String,
         initial_branch: git::BranchState,
     ) -> Result<Worker, WorkerError> {
-        let watcher = match Watcher::start(repo_root.clone()) {
+        // One process-lifetime poll-mode flag: the UI clones it once at spawn
+        // and reads it every frame, so re-arming the watcher on a worktree
+        // switch must reuse this Arc, never mint a new one the UI can't see.
+        let poll_flag = Arc::new(AtomicBool::new(false));
+        let watcher = match Watcher::start_with_flag(repo_root.clone(), poll_flag.clone()) {
             Ok(w) => w,
             Err(e) => {
                 // No watcher: surface via the first snapshot's error and run
@@ -116,17 +120,16 @@ impl Worker {
                     initial_theme,
                     initial_branch,
                     e.to_string(),
+                    poll_flag,
                 );
             }
         };
-        let poll_mode = watcher.poll_mode_flag();
-        let event_rx = watcher.receiver().clone();
-
         let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
         let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
         let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_t = shutdown.clone();
+        let poll_flag_t = poll_flag.clone();
 
         let theme = initial_theme;
         let handle = thread::Builder::new()
@@ -139,10 +142,10 @@ impl Worker {
                     highlighter,
                     repo_root,
                     initial_branch,
+                    poll_flag_t,
                     watcher,
                     shutdown_t,
                     LoopChannels {
-                        event_rx,
                         request_rx,
                         snapshot_tx,
                         image_tx,
@@ -157,7 +160,7 @@ impl Worker {
             request_tx,
             snapshot_rx,
             image_rx,
-            poll_mode,
+            poll_mode: poll_flag,
             shutdown,
             handle: Some(handle),
         })
@@ -183,12 +186,14 @@ fn spawn_no_watcher(
     theme: String,
     initial_branch: git::BranchState,
     watch_err: String,
+    poll_flag: Arc<AtomicBool>,
 ) -> Result<Worker, WorkerError> {
     let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
     let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
     let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_t = shutdown.clone();
+    let poll_flag_t = poll_flag.clone();
 
     let first_error = watch_err.clone();
     let handle = thread::Builder::new()
@@ -202,15 +207,46 @@ fn spawn_no_watcher(
             state.last_error = Some(first_error);
             state.send_initial(&snapshot_tx);
 
+            // Request-only until a worktree switch successfully arms a
+            // watcher; the never-ready receiver keeps the select arm silent
+            // until then.
+            let mut watch = WatchHandle {
+                watcher: None,
+                event_rx: crossbeam_channel::never(),
+                poll_flag: poll_flag_t,
+                switched: false,
+            };
+            let mut last_event: Option<Instant> = None;
+            // Set when the watcher channel closes; the receiver is swapped for
+            // a never-ready one so `select!` blocks on requests/timeout instead
+            // of spinning on the permanently-ready disconnected arm.
+            let mut event_closed = false;
+
             loop {
                 if shutdown_t.load(Ordering::Relaxed) {
                     break;
                 }
                 crossbeam_channel::select! {
+                    recv(watch.event_rx) -> ev => {
+                        if ev.is_ok() {
+                            last_event = Some(Instant::now());
+                        } else {
+                            // Watcher closed; stop selecting the
+                            // permanently-ready disconnected arm.
+                            event_closed = true;
+                        }
+                    }
                     recv(request_rx) -> msg => {
                         match msg {
                             Ok(req) => {
-                                if handle_request(req, &mut state, &snapshot_tx, &image_tx, &shutdown_t) {
+                                if handle_request(
+                                    req,
+                                    &mut state,
+                                    &snapshot_tx,
+                                    &image_tx,
+                                    &shutdown_t,
+                                    &mut watch,
+                                ) {
                                     break;
                                 }
                             }
@@ -218,6 +254,20 @@ fn spawn_no_watcher(
                         }
                     }
                     default(HARD_CEILING) => {}
+                }
+                if event_closed {
+                    watch.event_rx = crossbeam_channel::never();
+                    event_closed = false;
+                }
+                // Minimal debounce for the re-armed watcher path: batch the
+                // burst for one floor, then recompute. The main loop's
+                // adaptive/ignore gating is an optimisation, not a
+                // correctness need, and this path is a degraded fallback.
+                if let Some(le) = last_event {
+                    if le.elapsed() >= DEBOUNCE_FLOOR {
+                        recompute(&mut state, &snapshot_tx, &image_tx, &shutdown_t, true);
+                        last_event = None;
+                    }
                 }
             }
         })
@@ -229,7 +279,7 @@ fn spawn_no_watcher(
         request_tx,
         snapshot_rx,
         image_rx,
-        poll_mode: Arc::new(AtomicBool::new(false)),
+        poll_mode: poll_flag,
         shutdown,
         handle: Some(handle),
     })
@@ -511,13 +561,27 @@ fn skip_ignored(state: &mut WorkerState, changed: &[PathBuf]) -> bool {
     all_ignored(changed, |p| matcher.is_ignored_untracked(p, index.as_ref()))
 }
 
-/// The channels the worker loop reads from and writes to: watcher events,
-/// UI requests in, snapshots and preview images out.
+/// The channels the worker loop reads from and writes to: UI requests in,
+/// snapshots and preview images out. Watcher events live in [`WatchHandle`],
+/// which a worktree switch can re-arm.
 struct LoopChannels {
-    event_rx: Receiver<WorkerEvent>,
     request_rx: Receiver<Request>,
     snapshot_tx: Sender<ArcSnapshot>,
     image_tx: Sender<PreviewImage>,
+}
+
+/// The watcher a loop can re-arm on a worktree switch, plus the event
+/// receiver its select arm drains and the process-lifetime poll-mode flag.
+/// In request-only mode `watcher` starts as `None` with a never-ready
+/// receiver; a successful switch arms live updates in place.
+struct WatchHandle {
+    watcher: Option<Watcher>,
+    event_rx: Receiver<WorkerEvent>,
+    poll_flag: Arc<AtomicBool>,
+    /// One-shot flag: set when a worktree switch completed, consumed (and
+    /// cleared) by the owning loop so it can drop the old root's stale
+    /// debounce-window locals.
+    switched: bool,
 }
 
 /// Main loop with watcher events + requests + debounce timer.
@@ -528,17 +592,23 @@ fn run_loop(
     highlighter: Option<Highlighter>,
     repo_root: PathBuf,
     initial_branch: git::BranchState,
+    poll_flag: Arc<AtomicBool>,
     watcher: Watcher,
     shutdown: Arc<AtomicBool>,
     channels: LoopChannels,
 ) {
     let LoopChannels {
-        mut event_rx,
         request_rx,
         snapshot_tx,
         image_tx,
     } = channels;
-    let _watcher = watcher; // keep alive for the life of the loop
+    let event_rx = watcher.receiver().clone();
+    let mut watch = WatchHandle {
+        watcher: Some(watcher),
+        event_rx,
+        poll_flag,
+        switched: false,
+    };
     let mut state = WorkerState::new(rev, empty, highlighter, repo_root, initial_branch);
     state.send_initial(&snapshot_tx);
     // First real snapshot comes from the initial recompute, so startup never
@@ -582,7 +652,7 @@ fn run_loop(
         let timeout = tick.min(HARD_CEILING);
 
         select! {
-            recv(event_rx) -> ev => match ev {
+            recv(watch.event_rx) -> ev => match ev {
                 Ok(we) => {
                     last_event = Some(Instant::now());
                     match &we {
@@ -613,10 +683,18 @@ fn run_loop(
                     crate::perf_evt!("request kind={} seq={}", request_kind(&r), request_seq(&r));
                     // Fold any queued requests so a burst (rapid `j`) runs at
                     // most the latest of each kind.
-                    let survivors = coalesce(r, &request_rx, &shutdown, &state.rev);
+                    let survivors =
+                        coalesce(r, &request_rx, &shutdown, &state.rev, &state.repo_root);
                     let mut quit = false;
                     for survivor in survivors {
-                        if handle_request(survivor, &mut state, &snapshot_tx, &image_tx, &shutdown) {
+                        if handle_request(
+                            survivor,
+                            &mut state,
+                            &snapshot_tx,
+                            &image_tx,
+                            &shutdown,
+                            &mut watch,
+                        ) {
                             quit = true;
                             break;
                         }
@@ -624,13 +702,25 @@ fn run_loop(
                     if quit {
                         break;
                     }
+                    if watch.switched {
+                        // A switch dropped everything keyed by the old root;
+                        // these locals still hold old-root paths and flags,
+                        // so reset them instead of feeding `skip_ignored`
+                        // across roots or forcing a redundant recompute via
+                        // a stale `saw_refs`.
+                        watch.switched = false;
+                        last_event = None;
+                        saw_refs = false;
+                        unattributable = false;
+                        changed_paths.clear();
+                    }
                 }
                 Err(_) => break,
             },
             default(timeout) => {}
         }
         if event_closed {
-            event_rx = crossbeam_channel::never();
+            watch.event_rx = crossbeam_channel::never();
             event_closed = false;
         }
 
@@ -683,28 +773,32 @@ fn run_loop(
 /// `SetRev` and in ascending request-seq order. An empty result means
 /// everything was superseded.
 ///
-/// `current_rev` is the base revision already in effect. A `SetRev` naming it
-/// is a no-op that `handle_request` will not recompute for, so it must not
-/// discard requests queued alongside it — otherwise a selection sent with an
-/// equal-rev `SetRev` would be dropped and never served.
+/// `current_rev` is the base revision already in effect and `current_root` the
+/// worktree already in effect. A `SetRev` naming the current rev, or a
+/// `SwitchWorktree` naming the current root, is a no-op that
+/// `handle_request` will not recompute for, so it must not discard requests
+/// queued alongside it — otherwise a selection sent with an equal-rev
+/// `SetRev` (or an accidental re-pick of the current worktree) would be
+/// dropped and never served.
 fn coalesce(
     first: Request,
     rx: &Receiver<Request>,
     shutdown: &AtomicBool,
     current_rev: &str,
+    current_root: &Path,
 ) -> Vec<Request> {
     if matches!(first, Request::Shutdown) {
         return vec![Request::Shutdown];
     }
     let mut folded = Folded::default();
-    folded.absorb(first, current_rev);
+    folded.absorb(first, current_rev, current_root);
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return vec![Request::Shutdown];
         }
         match rx.try_recv() {
             Ok(Request::Shutdown) => return vec![Request::Shutdown],
-            Ok(r) => folded.absorb(r, current_rev),
+            Ok(r) => folded.absorb(r, current_rev, current_root),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
     }
@@ -722,6 +816,9 @@ fn coalesce(
 #[derive(Default)]
 struct Folded {
     set_rev: Option<String>,
+    /// Worktree switch, when one was absorbed: dominates everything queued
+    /// before it, including `SetRev` (refs are per-worktree-HEAD here).
+    switch: Option<PathBuf>,
     diff: Option<Request>,
     highlight: Option<Request>,
     image: Option<Request>,
@@ -730,7 +827,7 @@ struct Folded {
 }
 
 impl Folded {
-    fn absorb(&mut self, r: Request, current_rev: &str) {
+    fn absorb(&mut self, r: Request, current_rev: &str, current_root: &Path) {
         self.absorbed += 1;
         match r {
             // A rev switch discards everything queued before it, but requests
@@ -746,6 +843,24 @@ impl Folded {
                     self.image = None;
                 }
                 self.set_rev = Some(rev);
+            }
+            Request::SwitchWorktree { root } => {
+                // A real switch discards everything queued before it — diffs,
+                // highlights, images, and any `SetRev` (the post-switch
+                // recompute derives the rev from the new worktree's HEAD) —
+                // because all of them are keyed by paths/refs from the old
+                // worktree. Requests queued after it survive and execute once
+                // the switch lands. A switch to the root already in effect is
+                // a no-op for `handle_request`, so it must not discard the
+                // requests around it.
+                let effective = self.switch.as_deref().unwrap_or(current_root);
+                if root != effective {
+                    self.set_rev = None;
+                    self.diff = None;
+                    self.highlight = None;
+                    self.image = None;
+                }
+                self.switch = Some(root);
             }
             Request::Diff { .. } => self.diff = Some(r),
             Request::Highlight { .. } => self.highlight = Some(r),
@@ -784,14 +899,29 @@ impl Folded {
         // so a higher-seq survivor emitted first would stale-drop a lower-seq
         // one. Emit in ascending seq instead.
         survivors.sort_by_key(request_seq);
-        match self.set_rev {
-            Some(rev) => {
-                let mut out = Vec::with_capacity(survivors.len() + 1);
-                out.push(Request::SetRev { rev });
+        // `absorb` clears any `SetRev` queued before a real switch, so a
+        // surviving one was queued after it: the post-switch recompute
+        // derives the rev from the new worktree's HEAD, and this `SetRev`
+        // re-points it explicitly.
+        match self.switch {
+            Some(root) => {
+                let mut out = Vec::with_capacity(survivors.len() + 2);
+                out.push(Request::SwitchWorktree { root });
+                if let Some(rev) = self.set_rev {
+                    out.push(Request::SetRev { rev });
+                }
                 out.extend(survivors);
                 out
             }
-            None => survivors,
+            None => match self.set_rev {
+                Some(rev) => {
+                    let mut out = Vec::with_capacity(survivors.len() + 1);
+                    out.push(Request::SetRev { rev });
+                    out.extend(survivors);
+                    out
+                }
+                None => survivors,
+            },
         }
     }
 }
@@ -803,7 +933,7 @@ fn request_seq(r: &Request) -> Seq {
         Request::Diff { seq, .. }
         | Request::Highlight { seq, .. }
         | Request::LoadImage { seq, .. } => *seq,
-        Request::SetRev { .. } | Request::Shutdown => 0,
+        Request::SetRev { .. } | Request::SwitchWorktree { .. } | Request::Shutdown => 0,
     }
 }
 
@@ -814,6 +944,7 @@ fn request_kind(r: &Request) -> &'static str {
         Request::Highlight { .. } => "highlight",
         Request::LoadImage { .. } => "image",
         Request::SetRev { .. } => "setrev",
+        Request::SwitchWorktree { .. } => "switch",
         Request::Shutdown => "shutdown",
     }
 }
@@ -912,6 +1043,7 @@ fn handle_request(
     tx: &Sender<ArcSnapshot>,
     image_tx: &Sender<PreviewImage>,
     shutdown: &AtomicBool,
+    watch: &mut WatchHandle,
 ) -> bool {
     // Don't start expensive work once the UI has begun tearing us down.
     if shutdown.load(Ordering::Relaxed) {
@@ -919,6 +1051,21 @@ fn handle_request(
     }
     match req {
         Request::Shutdown => true,
+        Request::SwitchWorktree { root } => {
+            if root == state.repo_root {
+                // Same-root switch: a no-op here, so it must not have
+                // discarded the requests coalesced around it.
+                return false;
+            }
+            if let Err(e) = switch_worktree(state, &root, tx, image_tx, shutdown, watch) {
+                // Validation/re-aim failure: surface the error over the
+                // current (unchanged) view; `switch_worktree` left every bit
+                // of state untouched.
+                state.last_error = Some(e);
+                send_error_snapshot(state, tx);
+            }
+            false
+        }
         Request::SetRev { rev } => {
             if rev != state.rev {
                 state.rev = rev;
@@ -969,6 +1116,109 @@ fn handle_request(
             false
         }
     }
+}
+
+/// Re-aim the worker at another worktree of the same repository: validate
+/// (same-repository identity, then the git layer's own root validation),
+/// re-aim the git layer, drop everything keyed by the old worktree's paths,
+/// emit a busy placeholder, re-arm the watcher, then run a full
+/// debounce-bypassing recompute. `Err(message)` is returned only before any
+/// mutation, so the caller can surface the error over the untouched current
+/// view.
+#[allow(clippy::too_many_arguments)]
+fn switch_worktree(
+    state: &mut WorkerState,
+    root: &Path,
+    tx: &Sender<ArcSnapshot>,
+    image_tx: &Sender<PreviewImage>,
+    shutdown: &AtomicBool,
+    watch: &mut WatchHandle,
+) -> Result<(), String> {
+    // Same-repository identity first: a switch stays within the current
+    // repository's worktree set (`Request::SwitchWorktree` promises "same
+    // repository, different workdir"). Both sides resolve to their worktree
+    // set's shared common dir; canonicalize each so symlinked paths can't
+    // fake a mismatch, falling back to the raw paths if either side fails.
+    let current = git::open_repo_at(&state.repo_root).map_err(|e| e.to_string())?;
+    let target = git::open_repo_at(root).map_err(|e| e.to_string())?;
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(current.common_dir()) != canon(target.common_dir()) {
+        return Err(format!(
+            "worktree belongs to a different repository: {}",
+            root.display()
+        ));
+    }
+    // Validate and re-aim the git layer in one step; its messages cover both
+    // "not a git repository" and "not inside a checked-out worktree"
+    // (`gix::discover` otherwise happily accepts a *parent* repository for a
+    // stray directory inside one).
+    git::set_repo_root(root.to_path_buf()).map_err(|e| e.to_string())?;
+
+    // Paths collide across worktrees, so stale diffs are the correctness
+    // risk: nothing keyed by old-worktree paths may survive the switch. The
+    // rev label stays (it re-resolves against the new worktree's HEAD), the
+    // branch state recomputes.
+    state.cache = LruCache::new(CACHE_CAP);
+    state.last_changes = HashMap::new();
+    state.last_diff = None;
+    state.last_highlight = Arc::new(Vec::new());
+    state.last_tree = None;
+    state.last_branch = git::BranchState::default();
+    state.last_error = None;
+    state.selected_path = None;
+    state.ctx = 3;
+    state.preview_active = false;
+    state.uncommitted_stats = None;
+    // The old worktree's raised floor must not suppress the new root's
+    // watcher-driven recomputes for the raised window's duration.
+    state.floor_raised_at = None;
+    // The exclude chain was parsed from the old worktree's repo; rebuild it.
+    state.ignore = IgnoreMatcher::open();
+    state.repo_root = root.to_path_buf();
+    // Switch committed: the loop must drop the old root's debounce-window
+    // locals (paths and flags that no longer apply).
+    watch.switched = true;
+
+    // Busy placeholder with an empty tree, so the UI never flashes the old
+    // worktree's tree (or a stale diff) while the new scan runs. Sent before
+    // the watcher drop/re-arm below: `Watcher::drop` can block up to its
+    // timeout on a wedged watch thread, and this placeholder is the UI's
+    // only immediate switch feedback.
+    send_snapshot(
+        state,
+        tx,
+        empty_tree(),
+        None,
+        Arc::new(Vec::new()),
+        None,
+        true,
+    );
+
+    // Re-arm the watcher on the new root, resetting the shared poll flag so
+    // the UI's process-lifetime Arc reflects the new watcher, not the old
+    // root's degradation. Drop the old watcher first: its thread shuts down
+    // with a bounded timeout here on the worker thread, acceptable at switch
+    // time. In request-only mode this (re)arms live updates; a failed start
+    // continues request-only, mirroring the spawn-time degradation (a missing
+    // watcher is not an error the user can fix, so it is logged, not
+    // surfaced over the freshly recomputed view).
+    drop(watch.watcher.take());
+    match Watcher::start_with_flag(root.to_path_buf(), watch.poll_flag.clone()) {
+        Ok(w) => {
+            watch.event_rx = w.receiver().clone();
+            watch.watcher = Some(w);
+        }
+        Err(e) => {
+            watch.watcher = None;
+            watch.event_rx = crossbeam_channel::never();
+            crate::perf_evt!("switch watcher re-arm failed err={e}");
+        }
+    }
+
+    // Full recompute, bypassing the debounce. `refs_moved` re-derives branch
+    // state from the new worktree's HEAD.
+    recompute(state, tx, image_tx, shutdown, true);
+    Ok(())
 }
 
 /// Read and decode the image at `path` (relative to the repo root) and send the
@@ -1971,6 +2221,7 @@ mod tests {
             &tx,
             &image_tx,
             &shutdown,
+            &mut test_watch(),
         );
 
         assert!(!quit);
@@ -2123,15 +2374,21 @@ mod tests {
 
     /// Enqueue `requests`, receive the first, and fold the rest (as the loop
     /// does) with no shutdown pending. The base already in effect is
-    /// `main...HEAD`, so a `SetRev` to any other rev supersedes queued work.
+    /// `main...HEAD` and the root `/repo`, so a `SetRev` to any other rev or
+    /// a `SwitchWorktree` to any other root supersedes queued work.
     fn coalesced(requests: Vec<Request>) -> Vec<Request> {
+        coalesced_at(requests, Path::new("/repo"))
+    }
+
+    /// [`coalesced`] with an explicit root already in effect.
+    fn coalesced_at(requests: Vec<Request>, current_root: &Path) -> Vec<Request> {
         let (tx, rx) = crossbeam_channel::unbounded::<Request>();
         for r in requests {
             tx.send(r).unwrap();
         }
         let first = rx.recv().unwrap();
         let shutdown = AtomicBool::new(false);
-        coalesce(first, &rx, &shutdown, "main...HEAD")
+        coalesce(first, &rx, &shutdown, "main...HEAD", current_root)
     }
 
     fn diff_req(path: &str, seq: Seq) -> Request {
@@ -2150,6 +2407,52 @@ mod tests {
             to: 5,
             seq,
         }
+    }
+
+    fn switch_req(root: &str) -> Request {
+        Request::SwitchWorktree {
+            root: PathBuf::from(root),
+        }
+    }
+
+    /// A watch handle with no live watcher and a never-ready event receiver:
+    /// the request-only loop's starting shape.
+    fn test_watch() -> WatchHandle {
+        WatchHandle {
+            watcher: None,
+            event_rx: crossbeam_channel::never(),
+            poll_flag: Arc::new(AtomicBool::new(false)),
+            switched: false,
+        }
+    }
+
+    #[test]
+    fn disconnected_watcher_channel_spins_but_never_does_not() {
+        // The loops swap a closed watcher receiver for `never()` because
+        // crossbeam's `select!` treats a disconnected channel as permanently
+        // ready (a 100% CPU spin), while `never()` never wakes its arm so the
+        // loop falls back to its default tick. The loop bodies are not
+        // directly testable without a thread; this pins the channel
+        // semantics the swap relies on.
+        let (tx, rx) = crossbeam_channel::unbounded::<WorkerEvent>();
+        drop(tx);
+        let mut disconnected = false;
+        crossbeam_channel::select! {
+            recv(rx) -> ev => {
+                assert!(ev.is_err(), "a disconnected channel yields Err");
+                disconnected = true;
+            }
+            default(Duration::from_secs(1)) => {}
+        }
+        assert!(disconnected, "a disconnected arm is always ready");
+
+        let never_rx: Receiver<WorkerEvent> = crossbeam_channel::never();
+        let mut woke = false;
+        crossbeam_channel::select! {
+            recv(never_rx) -> _ => woke = true,
+            default(Duration::ZERO) => {}
+        }
+        assert!(!woke, "never() must keep the arm silent");
     }
 
     #[test]
@@ -2227,7 +2530,14 @@ mod tests {
         state.ctx = 3;
         let shutdown = AtomicBool::new(false);
         for survivor in out {
-            handle_request(survivor, &mut state, &snap_tx, &image_tx, &shutdown);
+            handle_request(
+                survivor,
+                &mut state,
+                &snap_tx,
+                &image_tx,
+                &shutdown,
+                &mut test_watch(),
+            );
         }
         // Executed in seq order, so the image request was accepted (its
         // `preview_active` side effect ran) rather than stale-dropped.
@@ -2285,19 +2595,383 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_switch_drops_requests_before_it() {
+        let out = coalesced_at(
+            vec![diff_req("a", 1), switch_req("/other")],
+            Path::new("/repo"),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Request::SwitchWorktree { root } if root == Path::new("/other")));
+    }
+
+    #[test]
+    fn coalesce_keeps_requests_after_switch() {
+        // Selections queued alongside a worktree switch survive the fold and
+        // are served after the switch's recompute (switch first, then the
+        // survivors in seq order).
+        let out = coalesced_at(
+            vec![
+                diff_req("a", 1),
+                switch_req("/other"),
+                diff_req("b", 2),
+                hl_req("b", 3),
+            ],
+            Path::new("/repo"),
+        );
+        assert_eq!(out.len(), 3);
+        assert!(matches!(&out[0], Request::SwitchWorktree { root } if root == Path::new("/other")));
+        assert!(matches!(&out[1], Request::Diff { path, seq, .. } if path == "b" && *seq == 2));
+        assert!(
+            matches!(&out[2], Request::Highlight { path, seq, .. } if path == "b" && *seq == 3)
+        );
+    }
+
+    #[test]
+    fn coalesce_switch_drops_setrev_before_it() {
+        // The post-switch recompute derives the rev from the new worktree's
+        // HEAD, so a base switch queued before a worktree switch is stale.
+        let out = coalesced_at(
+            vec![
+                Request::SetRev {
+                    rev: "x...HEAD".into(),
+                },
+                switch_req("/other"),
+            ],
+            Path::new("/repo"),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Request::SwitchWorktree { .. }));
+    }
+
+    #[test]
+    fn coalesce_keeps_setrev_after_switch() {
+        let out = coalesced_at(
+            vec![
+                switch_req("/other"),
+                Request::SetRev {
+                    rev: "x...HEAD".into(),
+                },
+            ],
+            Path::new("/repo"),
+        );
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], Request::SwitchWorktree { .. }));
+        assert!(matches!(&out[1], Request::SetRev { rev } if rev == "x...HEAD"));
+    }
+
+    #[test]
+    fn coalesce_latest_switch_dominates() {
+        let out = coalesced_at(
+            vec![switch_req("/one"), diff_req("a", 1), switch_req("/two")],
+            Path::new("/repo"),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Request::SwitchWorktree { root } if root == Path::new("/two")));
+    }
+
+    #[test]
+    fn coalesce_same_root_switch_keeps_queued_diff() {
+        // A SwitchWorktree naming the root already in effect is a no-op for
+        // `handle_request`; it must not discard a selection queued around it.
+        let out = coalesced_at(
+            vec![diff_req("a", 1), switch_req("/repo")],
+            Path::new("/repo"),
+        );
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], Request::SwitchWorktree { root } if root == Path::new("/repo")));
+        assert!(matches!(&out[1], Request::Diff { path, seq, .. } if path == "a" && *seq == 1));
+    }
+
+    #[test]
+    fn same_root_switch_is_a_no_op() {
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(4);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            PathBuf::from("/repo"),
+            git::BranchState::default(),
+        );
+        state.cache.put(
+            ("a.rs".into(), 3u32),
+            new_cached_diff(Arc::new(sample_diff(3)), None),
+        );
+        let shutdown = AtomicBool::new(false);
+        let mut watch = test_watch();
+
+        let quit = handle_request(
+            switch_req("/repo"),
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+            &mut watch,
+        );
+
+        assert!(!quit);
+        assert!(
+            !watch.switched,
+            "a same-root no-op must not reset the debounce window"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a same-root switch must not emit a snapshot"
+        );
+        assert_eq!(state.repo_root, PathBuf::from("/repo"));
+        assert!(
+            state.cache.get(&("a.rs".to_string(), 3)).is_some(),
+            "a same-root switch must not drop the cache"
+        );
+    }
+
+    #[test]
+    fn switch_to_non_repo_root_errors_and_keeps_state() {
+        // The current root is a real repository; the target is a plain
+        // directory that is not a git repository (and not inside one), so
+        // validation must fail before any state mutation.
+        let repo_dir = tempfile::tempdir().unwrap();
+        crate::git::test_util::repo_with_commits(repo_dir.path(), &["one\n"]);
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(4);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "main...HEAD".into(),
+            false,
+            None,
+            repo_dir.path().to_path_buf(),
+            git::BranchState::default(),
+        );
+        state.cache.put(
+            ("a.rs".into(), 3u32),
+            new_cached_diff(Arc::new(sample_diff(3)), None),
+        );
+        state.last_tree = Some(Arc::new(Tree::build(vec![('M', "a.rs".to_string())])));
+        let shutdown = AtomicBool::new(false);
+        let mut watch = test_watch();
+
+        let quit = handle_request(
+            switch_req(dir.path().to_str().unwrap()),
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+            &mut watch,
+        );
+
+        assert!(!quit);
+        let snap = rx.recv().unwrap();
+        // Name the expected failure modes so a mis-rooted environment (TMPDIR
+        // inside some repository) fails with context, not a confusing assert:
+        // the target is rejected as "not a git repository", "not inside a
+        // checked-out worktree", or — when the environment plants one — as a
+        // different repository.
+        let err = snap
+            .error
+            .clone()
+            .unwrap_or_else(|| panic!("the failure must reach the status line"));
+        assert!(
+            err.contains("not a git repository")
+                || err.contains("not a worktree root")
+                || err.contains("not inside a checked-out worktree")
+                || err.contains("different repository"),
+            "unexpected failure mode: {err}"
+        );
+        assert!(!snap.busy);
+        assert!(!watch.switched);
+        // All state untouched: no switch, no cache drop, rev intact.
+        assert_eq!(state.repo_root, repo_dir.path());
+        assert_eq!(state.rev, "main...HEAD");
+        assert!(state.cache.get(&("a.rs".to_string(), 3)).is_some());
+    }
+
+    #[test]
+    fn switch_to_other_repository_errors_and_keeps_state() {
+        // `SwitchWorktree` promises "same repository, different workdir": a
+        // directory belonging to a different repository must be rejected
+        // before any state mutation, even though it is a valid worktree root.
+        let a_dir = tempfile::tempdir().unwrap();
+        crate::git::test_util::repo_with_commits(a_dir.path(), &["one\n"]);
+        let b_dir = tempfile::tempdir().unwrap();
+        crate::git::test_util::repo_with_commits(b_dir.path(), &["two\n"]);
+
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(4);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let mut state = WorkerState::new(
+            "HEAD".into(),
+            false,
+            None,
+            a_dir.path().to_path_buf(),
+            git::BranchState::default(),
+        );
+        state.cache.put(
+            ("a.rs".into(), 3u32),
+            new_cached_diff(Arc::new(sample_diff(3)), None),
+        );
+        let shutdown = AtomicBool::new(false);
+        let mut watch = test_watch();
+
+        let quit = handle_request(
+            switch_req(b_dir.path().to_str().unwrap()),
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+            &mut watch,
+        );
+        assert!(!quit);
+        let snap = rx.recv().unwrap();
+        let err = snap
+            .error
+            .clone()
+            .unwrap_or_else(|| panic!("the failure must reach the status line"));
+        assert!(
+            err.contains("different repository"),
+            "a cross-repo switch must be rejected as such: {err}"
+        );
+        assert!(!watch.switched);
+        // All state untouched: no switch, no cache drop.
+        assert_eq!(state.repo_root, a_dir.path());
+        assert!(state.cache.get(&("a.rs".to_string(), 3)).is_some());
+    }
+
+    #[test]
+    fn switch_worktree_recomputes_from_new_root() {
+        // End-to-end: depends on `git::set_repo_root`, which the git-layer
+        // agent implements in parallel (the todo!() stub panics until then).
+        // `set_repo_root` mutates the process-global root, so serialize
+        // against the git module's own root tests and restore the cwd
+        // fallback on drop (cargo runs tests in parallel threads).
+        let _root_guard = root_lock();
+
+        let main_dir = tempfile::tempdir().unwrap();
+        crate::git::test_util::repo_with_commits(main_dir.path(), &["one\n"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        crate::git::test_util::run_git(
+            main_dir.path(),
+            &["worktree", "add", "-b", "side", wt.to_str().unwrap()],
+        );
+        // Untracked file existing only in the new worktree.
+        std::fs::write(wt.join("wt-only.txt"), "from wt\n").unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(16);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(4);
+        let mut state = WorkerState::new(
+            "HEAD".into(),
+            false,
+            None,
+            main_dir.path().to_path_buf(),
+            git::BranchState::default(),
+        );
+        state.cache.put(
+            ("stale.rs".into(), 3u32),
+            new_cached_diff(Arc::new(sample_diff(3)), None),
+        );
+        // A raised floor from the old worktree's slow scan must not survive
+        // the switch.
+        state.floor_raised_at = Some(Instant::now());
+        let shutdown = AtomicBool::new(false);
+        let mut watch = test_watch();
+
+        let quit = handle_request(
+            switch_req(wt.to_str().unwrap()),
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+            &mut watch,
+        );
+        assert!(!quit);
+        assert!(
+            watch.switched,
+            "a completed switch must flag the loop to drop stale debounce state"
+        );
+        assert!(
+            state.floor_raised_at.is_none(),
+            "the switch must clear the old worktree's raised floor"
+        );
+
+        // Placeholder busy snapshot with an empty tree, then the recompute's
+        // busy (fresh tree) and settled phases.
+        let placeholder = rx.recv().unwrap();
+        assert!(
+            placeholder.busy,
+            "the switch must emit a busy placeholder first"
+        );
+        assert!(
+            placeholder.tree.flatten().is_empty(),
+            "the placeholder must not carry the old worktree's tree"
+        );
+        let busy = rx.recv().unwrap();
+        assert!(busy.busy);
+        let settled = rx.recv().unwrap();
+        assert!(!settled.busy);
+        assert!(
+            settled.tree.nodes.iter().any(|n| n.path == "wt-only.txt"),
+            "the settled tree must come from the new worktree"
+        );
+        assert_eq!(state.repo_root, wt);
+        assert!(
+            state.cache.get(&("stale.rs".to_string(), 3)).is_none(),
+            "the switch must drop the old worktree's diff cache"
+        );
+
+        // A diff for a new-worktree-only path serves content from the new
+        // root (no stale old-worktree cache entry can answer it).
+        let quit = handle_request(
+            diff_req("wt-only.txt", 1),
+            &mut state,
+            &tx,
+            &image_tx,
+            &shutdown,
+            &mut test_watch(),
+        );
+        assert!(!quit);
+        let snap = rx.recv().unwrap();
+        let diff = snap.selected_diff.as_ref().unwrap();
+        assert!(
+            diff.lines.iter().any(|l| l.raw_text.contains("from wt")),
+            "the diff must be built from the new worktree's content"
+        );
+    }
+
+    /// Serialize root-touching tests against every other module's, via the
+    /// crate-wide `test_support::GIT_ROOT_LOCK`; `RootGuard::drop` restores
+    /// the cwd fallback so the next test starts from clean global state.
+    fn root_lock() -> RootGuard {
+        let lock = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        RootGuard { _lock: lock }
+    }
+
+    struct RootGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            git::clear_repo_root_for_tests();
+        }
+    }
+
+    #[test]
     fn coalesce_shutdown_flag_returns_shutdown() {
         let (tx, rx) = crossbeam_channel::unbounded::<Request>();
         tx.send(diff_req("a", 1)).unwrap();
         let first = rx.recv().unwrap();
         let shutdown = AtomicBool::new(true);
-        let out = coalesce(first, &rx, &shutdown, "main...HEAD");
+        let out = coalesce(first, &rx, &shutdown, "main...HEAD", Path::new("/repo"));
         assert!(matches!(out.as_slice(), [Request::Shutdown]));
     }
 
     #[test]
     fn recompute_emits_busy_then_settled() {
         // Not hermetic: the `main...HEAD` rev runs the uncommitted-only scan
-        // against the process cwd repo.
+        // against the process cwd repo, so serialize against tests that
+        // point the global root elsewhere.
+        let _root_guard = root_lock();
         let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(8);
         let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
         let mut state = WorkerState::new(
@@ -2330,7 +3004,9 @@ mod tests {
     #[test]
     fn settled_snapshot_carries_diff_error() {
         // Not hermetic: building the selected diff resolves the bogus rev in
-        // the process cwd repo (which is expected to fail).
+        // the process cwd repo (which is expected to fail), so serialize
+        // against tests that point the global root elsewhere.
+        let _root_guard = root_lock();
         let (tx, rx) = crossbeam_channel::bounded::<ArcSnapshot>(8);
         let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
         let mut state = WorkerState::new(
@@ -2407,7 +3083,11 @@ mod tests {
     #[test]
     fn refs_moved_recompute_refreshes_branch_state() {
         // A ref move must re-walk branch state rather than reuse the cache.
-        // Not hermetic: `git::branch_state` reads the process cwd repo.
+        // Reads the real repo via the global root (cwd fallback), so it must
+        // serialize against tests that point the root at temp worktrees.
+        let _guard = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (tx, _rx) = crossbeam_channel::bounded::<ArcSnapshot>(8);
         let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
         let mut state = WorkerState::new(
@@ -2542,6 +3222,7 @@ mod tests {
             &snap_tx,
             &image_tx,
             &shutdown,
+            &mut test_watch(),
         );
 
         assert!(!quit);

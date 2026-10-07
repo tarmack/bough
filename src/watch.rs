@@ -104,6 +104,9 @@ const PENDING_CAP: usize = 4096;
 /// a bounded time for the thread to finish.
 pub struct Watcher {
     rx: Receiver<WorkerEvent>,
+    /// Read only through `poll_mode_flag` (tests); the field must stay on the
+    /// struct so the watch thread can flip the caller-shared Arc.
+    #[allow(dead_code)]
     poll_mode: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -113,9 +116,18 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Start watching `repo_root`.
-    pub fn start(repo_root: PathBuf) -> Result<Watcher, WatchError> {
-        let poll_mode = Arc::new(AtomicBool::new(false));
+    /// Start watching `repo_root`, sharing a caller-owned poll-mode flag. The
+    /// worker owns one process-lifetime flag (the UI clones it once and reads
+    /// it every frame), so re-arming the watcher on a worktree switch must
+    /// reuse that `Arc` rather than mint a new one the UI would never see.
+    /// A fresh watcher always starts un-degraded: the flag may still read
+    /// `true` from a previous root's degradation, and the reset happens here
+    /// before the thread spawns, so no race can re-set it first.
+    pub fn start_with_flag(
+        repo_root: PathBuf,
+        poll_mode: Arc<AtomicBool>,
+    ) -> Result<Watcher, WatchError> {
+        poll_mode.store(false, Ordering::Relaxed);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded::<WorkerEvent>(128);
         let (done_tx, done_rx) = bounded::<()>(1);
@@ -155,6 +167,7 @@ impl Watcher {
 
     /// The shared degradation flag. The worker/UI clone this `Arc` and read it
     /// every frame, so they see a mid-run degradation the moment it happens.
+    #[allow(dead_code)]
     pub fn poll_mode_flag(&self) -> Arc<AtomicBool> {
         self.poll_mode.clone()
     }
@@ -1372,11 +1385,28 @@ mod tests {
     #[test]
     fn poll_mode_flag_is_shared_with_the_watcher() {
         let dir = tempfile::tempdir().unwrap();
-        let watcher = Watcher::start(dir.path().to_path_buf()).unwrap();
+        let watcher =
+            Watcher::start_with_flag(dir.path().to_path_buf(), Arc::new(AtomicBool::new(false)))
+                .unwrap();
         let flag = watcher.poll_mode_flag();
         // A store through one clone must be visible through another: the UI
         // holds the same allocation the watcher flips on degradation.
         flag.store(true, Ordering::Relaxed);
         assert!(watcher.poll_mode_flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn start_with_flag_keeps_caller_flag_identity_and_resets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag = Arc::new(AtomicBool::new(true));
+        let watcher = Watcher::start_with_flag(dir.path().to_path_buf(), flag.clone()).unwrap();
+
+        // The watcher must flip the caller's exact Arc, not a fresh one:
+        // the worker re-arms with one process-lifetime flag the UI already
+        // holds a clone of.
+        assert!(Arc::ptr_eq(&watcher.poll_mode_flag(), &flag));
+        // A new watcher starts un-degraded, even when the shared flag still
+        // reads true from a previous root's degradation.
+        assert!(!flag.load(Ordering::Relaxed));
     }
 }

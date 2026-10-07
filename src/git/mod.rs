@@ -10,15 +10,27 @@ mod error;
 mod lfs;
 mod refs;
 mod status;
+mod worktrees;
 
 pub use diff::*;
 pub use error::GitError;
 pub use refs::*;
 pub use status::*;
+pub use worktrees::*;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use crate::diff::FileStatus;
+
+/// The process-global repository root the worktree-switch mechanism pins
+/// every `open_repo()` call to; `None` means "resolve from the process cwd"
+/// (the startup behaviour).
+static REPO_ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn repo_root_slot() -> &'static RwLock<Option<PathBuf>> {
+    REPO_ROOT.get_or_init(|| RwLock::new(None))
+}
 
 /// Per-file metadata used to annotate the tree/stats and diff-view header.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,19 +45,76 @@ pub struct FileMeta {
     pub binary: bool,
 }
 
-/// Open the repository containing `cwd` (searching upward). The callers run
-/// from the repository root, so this mirrors the old behaviour of running
-/// `git` in the process working directory.
+/// Open the repository the git layer currently resolves from: the stored
+/// root after a worktree switch, else the process cwd (searching upward).
 pub(crate) fn open_repo() -> Result<gix::Repository, GitError> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| GitError::message(format!("cannot read current directory: {e}")))?;
-    open_repo_at(&cwd)
+    open_repo_at(&current_repo_root())
 }
 
 /// Open the repository containing `dir`, searching upward through parent
 /// directories.
 pub(crate) fn open_repo_at(dir: &Path) -> Result<gix::Repository, GitError> {
     gix::discover(dir).map_err(|e| GitError::message(format!("not a git repository: {e}")))
+}
+
+/// Set the repository root every `open_repo()` call resolves from (the
+/// worktree-switch mechanism; process cwd is left untouched). Canonicalizes
+/// first and validates the canonical path, so the stored root is exactly the
+/// path that was checked: git administration paths (anything with a `.git`
+/// component) are rejected outright, and the rest must open and lie inside
+/// a checked-out worktree.
+pub(crate) fn set_repo_root(root: PathBuf) -> Result<(), GitError> {
+    let canonical = std::fs::canonicalize(&root)
+        .map_err(|e| GitError::message(format!("cannot canonicalize {}: {e}", root.display())))?;
+    // A `.git` path (the main admin dir, a linked worktree's admin dir, …)
+    // discovers to the enclosing repo and would look coherent, but is not a
+    // checked-out worktree.
+    if canonical.components().any(|c| c.as_os_str() == ".git") {
+        return Err(GitError::message(format!(
+            "{} is a git administration path, not a checked-out worktree",
+            root.display()
+        )));
+    }
+    let repo = open_repo_at(&canonical)?;
+    let covered = repo.workdir().is_some_and(|workdir| {
+        let workdir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+        canonical.starts_with(workdir)
+    });
+    if !covered {
+        return Err(GitError::message(format!(
+            "{} is not inside a checked-out worktree",
+            root.display()
+        )));
+    }
+    let mut slot = repo_root_slot()
+        .write()
+        .map_err(|_| GitError::message("repo root lock poisoned"))?;
+    *slot = Some(canonical);
+    Ok(())
+}
+
+/// The root the git layer currently resolves from: the last
+/// `set_repo_root` value, or the process cwd before any switch. Reading the
+/// stored value is poison-tolerant so a panicked writer cannot silently
+/// retarget every `open_repo()` back at the startup repo.
+pub(crate) fn current_repo_root() -> PathBuf {
+    repo_root_slot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Test-only: drop the stored root so `current_repo_root()` falls back to
+/// the process cwd again. Global-root tests hold a shared mutex and call
+/// this when their guard drops (cargo runs tests in parallel threads).
+#[cfg(test)]
+pub(crate) fn clear_repo_root_for_tests() {
+    if let Some(lock) = REPO_ROOT.get() {
+        if let Ok(mut root) = lock.write() {
+            *root = None;
+        }
+    }
 }
 
 /// Resolve `spec` to a single object id (e.g. `HEAD`, a branch, `HEAD:path`).

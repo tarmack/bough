@@ -3,8 +3,9 @@
 
 use crate::git::{open_repo, resolve_id};
 
-/// All local branch names, sorted alphabetically (e.g. for the branch
-/// picker).
+/// All local branch names, most recently committed tip first (e.g. for the
+/// branch picker). Alphabetical as the tiebreak and as the fallback when a
+/// tip cannot be resolved to a commit.
 pub fn local_branches() -> Vec<String> {
     match open_repo() {
         Ok(repo) => local_branches_in(&repo),
@@ -20,12 +21,32 @@ pub(crate) fn local_branches_in(repo: &gix::Repository) -> Vec<String> {
     let Ok(iter) = platform.local_branches() else {
         return Vec::new();
     };
-    let mut names: Vec<String> = iter
+    let mut tips: Vec<(String, Option<i64>)> = iter
         .filter_map(Result::ok)
-        .map(|r| r.name().shorten().to_string())
+        .map(|r| {
+            let name = r.name().shorten().to_string();
+            let time = r
+                .target()
+                .try_id()
+                .and_then(|id| commit_time(repo, id.to_owned()));
+            (name, time)
+        })
         .collect();
-    names.sort();
-    names
+    // Unresolvable tips (`None`) sort last by time, then alphabetically.
+    tips.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    tips.into_iter().map(|(name, _)| name).collect()
+}
+
+/// Unix commit time of the commit `id` points at; `None` when the commit
+/// cannot be read or its committer timestamp cannot be parsed (one lookup,
+/// no history walk).
+pub(crate) fn commit_time(repo: &gix::Repository, id: gix::ObjectId) -> Option<i64> {
+    repo.find_commit(id)
+        .ok()?
+        .committer()
+        .ok()
+        .and_then(|sig| gix::date::parse_header(sig.time))
+        .map(|t| t.seconds)
 }
 
 /// The `n` most recent commits from `HEAD`, newest first: full oid hex plus
@@ -239,15 +260,69 @@ mod tests {
     }
 
     #[test]
-    fn local_branches_lists_only_local_heads_sorted() {
+    fn local_branches_lists_only_local_heads() {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commits(dir.path(), &["a", "b"]);
         run_git(dir.path(), &["branch", "feature"]);
         let repo = gix::discover(dir.path()).unwrap();
 
+        // Both tips share the newest commit: the tiebreak is alphabetical.
         assert_eq!(
             local_branches_in(&repo),
             vec!["feature".to_string(), "main".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_branches_order_by_tip_time_then_name() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        run_git(dir.path(), &["config", "user.email", "t@e"]);
+        run_git(dir.path(), &["config", "user.name", "T"]);
+
+        let commit_at = |date: &str| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .args(["commit", "--allow-empty", "-m", "c"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        commit_at("2000-01-01T00:00:00");
+        // `main` and `aa` share the older tip.
+        run_git(dir.path(), &["branch", "aa"]);
+
+        run_git(dir.path(), &["checkout", "-b", "zz"]);
+        std::fs::write(dir.path().join("z.txt"), "z\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        commit_at("2000-01-02T00:00:00");
+
+        // A tip pointing at a missing object cannot be resolved to a time
+        // and falls back to the alphabetical tail.
+        let heads = dir.path().join(".git/refs/heads");
+        std::fs::create_dir_all(&heads).unwrap();
+        std::fs::write(
+            heads.join("broken"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+
+        let repo = gix::discover(dir.path()).unwrap();
+        // Newest tip first (`zz` beats `aa` despite sorting after it), then
+        // the tied older tips alphabetically, then the unresolvable tip.
+        assert_eq!(
+            local_branches_in(&repo),
+            vec![
+                "zz".to_string(),
+                "aa".to_string(),
+                "main".to_string(),
+                "broken".to_string()
+            ]
         );
     }
 

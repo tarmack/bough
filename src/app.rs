@@ -7,19 +7,22 @@
 //! `crate::input` and rendering in `crate::view`.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use ratatui::layout::Rect;
 
 use crate::diff::{Diff, LineKind};
+use crate::git::{DirtyStats, WorktreeInfo};
 use crate::highlight::TokenOwned;
 use crate::perf;
 use crate::preview;
@@ -36,6 +39,10 @@ pub const MAX_CONTEXT: u32 = 200;
 pub const CONTEXT_STEP: i32 = 3;
 /// Cells scrolled horizontally per `h`/`l` press.
 pub const HSCROLL_STEP: usize = 2;
+/// Worktree id of the main checkout (the synthetic picker entry); the
+/// per-worktree view-memory map and `current_worktree`'s `None` both
+/// canonicalize to it.
+pub(crate) const MAIN_WORKTREE: &str = "main";
 
 /// Which changes the app shows. Named for the user's mental model, not git
 /// plumbing: "what work am I looking at?" for users keeping oversight of
@@ -61,15 +68,27 @@ pub enum Origin {
     Picked(String),
 }
 
-/// One row in the base-picker popup: `rev` is the revision spec the diff is
-/// computed against (`<rev>...HEAD`), `label` is what the row displays.
+/// Which flavor of picker popup is open; Enter (and clicks) dispatch on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    /// Compare against a rev (branch / commit-tag pickers).
+    Base,
+    /// Switch the worktree being viewed.
+    Worktree,
+}
+
+/// One row in the base-picker popup: `label` is what the row displays and
+/// `rev` is the revision spec the diff is computed against
+/// (`<rev>...HEAD`). Worktree rows ([`PickerKind::Worktree`]) overload
+/// `rev` with the worktree id (mirroring `label`); the row's full
+/// [`WorktreeInfo`] lives in [`BasePicker::worktrees`].
 pub struct PickerEntry {
     pub rev: String,
     pub label: String,
 }
 
 /// Base-picker popup state (opened with `b` for branches, `t` for
-/// commits/tags).
+/// commits/tags, `w` for worktrees).
 pub struct BasePicker {
     /// Popup title, e.g. ` compare against a branch `.
     pub title: String,
@@ -77,6 +96,92 @@ pub struct BasePicker {
     pub entries: Vec<PickerEntry>,
     /// Selected row index.
     pub selection: usize,
+    /// Case-insensitive substring filter typed into the popup's filter row;
+    /// empty means unfiltered. Lives on the picker, so it resets on every
+    /// open and dies on close.
+    pub filter: String,
+    /// Which picker flavor is open; Enter dispatches on it.
+    pub kind: PickerKind,
+    /// Worktree rows for [`PickerKind::Worktree`], index-aligned with
+    /// `entries` (empty for the base kinds).
+    pub worktrees: Vec<WorktreeInfo>,
+}
+
+impl BasePicker {
+    /// Case-insensitive substring haystack for row `i`: the revision spec
+    /// and label for base rows; the worktree id, branch, and path for
+    /// worktree rows (whose `rev`/`label` hold only the id, so building
+    /// from them would search the id twice).
+    fn haystack(&self, i: usize) -> String {
+        let entry = &self.entries[i];
+        let mut hay = format!("{} {}", entry.rev, entry.label);
+        if self.kind == PickerKind::Worktree {
+            if let Some(wt) = self.worktrees.get(i) {
+                hay = format!(
+                    "{} {} {}",
+                    wt.id,
+                    wt.branch.as_deref().unwrap_or(""),
+                    wt.path.display()
+                );
+            }
+        }
+        hay.to_lowercase()
+    }
+
+    /// Real indices of the rows matching the filter, in display order. An
+    /// empty filter selects every row.
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.entries.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        (0..self.entries.len())
+            .filter(|&i| self.haystack(i).contains(&needle))
+            .collect()
+    }
+
+    /// Whether row `i` can hold the selection (`missing` worktree rows
+    /// render dimmed and are unselectable).
+    fn selectable(&self, i: usize) -> bool {
+        self.kind != PickerKind::Worktree || self.worktrees.get(i).is_some_and(|w| !w.missing)
+    }
+}
+
+/// Sort key for worktree-picker rows: missing worktrees always last, then
+/// by uncommitted-change count (descending, unknown = 0), then by tip
+/// commit time (descending, unknown last). A stable sort preserves the git
+/// listing order (main first, then id) for full ties.
+fn worktree_sort_key(
+    w: &WorktreeInfo,
+    dirty: Option<usize>,
+) -> (bool, Reverse<usize>, Reverse<i64>) {
+    (
+        w.missing,
+        Reverse(dirty.unwrap_or(0)),
+        Reverse(w.tip_time.unwrap_or(i64::MIN)),
+    )
+}
+
+/// The view state remembered per worktree so switching back restores what
+/// the user was looking at. Deliberately excludes toggles that are session
+/// preferences (`word_diff_on`, context width, collapsed hunks): those carry
+/// across switches, not per-worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeUiState {
+    /// Which comparison the worktree was being viewed in.
+    pub mode: Mode,
+    /// The origin the worktree's branch view was measured from, so an
+    /// `Uncommitted` mode round-trips (`m`) to the worktree's own origin
+    /// instead of one inherited from another worktree.
+    pub last_origin: Option<Origin>,
+    /// The selected file path (dirs select too).
+    pub selected_path: Option<String>,
+    /// Expanded directory set, as of switch-out.
+    pub expanded_dirs: HashSet<String>,
+    pub tree_scroll: usize,
+    pub diff_scroll: usize,
+    /// Horizontal (column) scroll of the diff pane.
+    pub diff_col: usize,
 }
 
 /// Interactive screen regions recorded by the last render for mouse
@@ -102,6 +207,9 @@ pub enum FooterZone {
     Source,
     /// The mode pill: cycles the view mode.
     Mode,
+    /// The `worktree:<id>` pill (linked worktrees only): opens the
+    /// worktree picker.
+    Worktree,
 }
 
 /// Base-picker popup geometry in screen coordinates.
@@ -111,7 +219,8 @@ pub struct PickerGeometry {
     pub popup: Rect,
     /// Inner rect, inside the border — the entry-list area.
     pub inner: Rect,
-    /// Index of the first entry visible at the top of `inner`.
+    /// Real index of the first entry row rendered in `inner` (the top inner
+    /// row is the filter box; entry rows follow beneath it).
     pub first_row: usize,
 }
 
@@ -288,6 +397,31 @@ pub struct App {
     /// Transient status-line message ("copied N lines", "copied path") with its
     /// expiry; shown for ~3 seconds.
     pub flash: Option<(String, Instant)>,
+    /// Id of the linked worktree being viewed (`worktree:<id>` footer pill);
+    /// `None` in the main checkout. UI agent owns the full switching UX.
+    pub current_worktree: Option<String>,
+    /// Per-worktree view memory, keyed by worktree id (`main` for the main
+    /// checkout). Written on switch-out, consumed on switch-back.
+    pub worktree_ui: HashMap<String, WorktreeUiState>,
+    /// View state of the worktree just switched to, awaiting its first tree
+    /// snapshot (consumed once in `apply_snapshot`).
+    pending_restore: Option<WorktreeUiState>,
+    /// Set while a worktree switch is in flight, until the switch's BUSY
+    /// placeholder snapshot arrives in `apply_snapshot`. Keeps stale
+    /// settled snapshots from the old root queued ahead of the placeholder
+    /// (channel FIFO) from consuming `pending_restore`.
+    awaiting_switch: bool,
+    /// Results of the picker's background dirty-count scan: `(id, stats)`
+    /// pairs streamed in by the scan thread. Dropped when the picker closes.
+    pub dirty_rx: Option<Receiver<(String, DirtyStats)>>,
+    /// Dirty counts seen so far, keyed by worktree id; feeds the picker's
+    /// `±N` chips and survives picker close (a cheap cache).
+    pub dirty_counts: HashMap<String, usize>,
+    /// Cancel flag for the dirty-count scan thread: set when the receiver is
+    /// dropped in `close_picker` so the thread stops before spending another
+    /// git scan on a picker that is already gone (crossbeam's `Sender` has
+    /// no disconnect check).
+    dirty_scan_cancel: Arc<AtomicBool>,
 }
 
 impl App {
@@ -358,6 +492,13 @@ impl App {
             preview: crate::preview::Preview::new(),
             diff_selection: DiffSelection::default(),
             flash: None,
+            current_worktree: None,
+            worktree_ui: HashMap::new(),
+            pending_restore: None,
+            awaiting_switch: false,
+            dirty_rx: None,
+            dirty_counts: HashMap::new(),
+            dirty_scan_cancel: Arc::new(AtomicBool::new(false)),
         };
         app.request_diff();
         app
@@ -397,6 +538,24 @@ impl App {
 
         self.snapshot = snap;
 
+        // A BUSY placeholder (e.g. the worktree switch's own marker
+        // snapshot) clears the awaiting-switch gate; it must never consume
+        // the pending restore (guarded below).
+        if self.snapshot.busy {
+            self.awaiting_switch = false;
+        }
+
+        // A settled snapshot whose tree did NOT change can only mean the
+        // switch never landed (the worker rejected it — its error snapshot
+        // replays the old view's tree Arc verbatim). A real switch always
+        // changes the tree Arc (the new root's tree is freshly built).
+        // Drop the stale restore instead of letting a later unrelated
+        // recompute consume it onto the old worktree's tree.
+        if !self.snapshot.busy && !tree_changed && self.awaiting_switch {
+            self.awaiting_switch = false;
+            self.pending_restore = None;
+        }
+
         if content_changed {
             // A recompute can deliver a new `Diff` Arc over the same visible
             // raw range; without re-arming, `maybe_request_highlight` would
@@ -409,27 +568,43 @@ impl App {
         if tree_changed {
             // Trees are born collapsed; only dirs the user has expanded live in
             // `expanded_dirs`, so a fresh snapshot can never open new folders.
-            let mut tree = (*self.snapshot.tree).clone();
-            tree.expand_paths(&self.expanded_dirs);
-            self.flat = tree.flatten();
+            // A pending worktree-restore overrides the usual relocation
+            // (consumed once, so later snapshots never re-trigger it). It may
+            // only be consumed by the settled snapshot of the switched-to
+            // worktree: the switch's BUSY placeholder cleared the
+            // `awaiting_switch` gate above, while stale settled snapshots
+            // from the old root queued ahead of it (channel FIFO) are
+            // skipped while the gate is still set.
+            let pending = if !self.snapshot.busy && !self.awaiting_switch {
+                self.pending_restore.take()
+            } else {
+                None
+            };
+            if let Some(p) = pending {
+                relocated = self.apply_pending_restore(&p);
+            } else {
+                let mut tree = (*self.snapshot.tree).clone();
+                tree.expand_paths(&self.expanded_dirs);
+                self.flat = tree.flatten();
 
-            // Re-locate selection by path; nearest-sibling fallback.
-            self.selection = relocate_selection(&self.flat, &tree, &old_path);
-            self.tree = tree;
-            let new_selected = self
-                .flat
-                .get(self.selection)
-                .map(|&idx| self.tree.nodes[idx].path.clone());
-            relocated = new_selected != old_path;
-            self.selected_path = new_selected;
+                // Re-locate selection by path; nearest-sibling fallback.
+                self.selection = relocate_selection(&self.flat, &tree, &old_path);
+                self.tree = tree;
+                let new_selected = self
+                    .flat
+                    .get(self.selection)
+                    .map(|&idx| self.tree.nodes[idx].path.clone());
+                relocated = new_selected != old_path;
+                self.selected_path = new_selected;
 
-            // A relocation (the selected path vanished and a sibling was chosen)
-            // changes the selection without an input event; reset the per-file
-            // view state and ask the worker for its diff so the pane never
-            // shows stale content (or the dead file's section indices).
-            if relocated {
-                self.reset_diff_view();
-                self.request_diff();
+                // A relocation (the selected path vanished and a sibling was chosen)
+                // changes the selection without an input event; reset the per-file
+                // view state and ask the worker for its diff so the pane never
+                // shows stale content (or the dead file's section indices).
+                if relocated {
+                    self.reset_diff_view();
+                    self.request_diff();
+                }
             }
         }
 
@@ -447,6 +622,58 @@ impl App {
                 None => self.clamp_diff_scroll(),
             }
         }
+    }
+
+    /// Apply a pending per-worktree view restore against the tree that just
+    /// arrived in `apply_snapshot`: expansion is the saved set ∩ the new
+    /// tree, the selection is the saved path only when it survived (else
+    /// reset), and the per-pane scrolls come back verbatim. Session
+    /// preferences (context width, folded hunks) are preserved across the
+    /// restore, so the re-requested diff uses the user's context level.
+    /// Always returns `true`: a restore already relocated the view, so the
+    /// caller only needs to clamp the diff scroll.
+    fn apply_pending_restore(&mut self, state: &WorktreeUiState) -> bool {
+        let mut tree = (*self.snapshot.tree).clone();
+        let dirs: HashSet<String> = state
+            .expanded_dirs
+            .iter()
+            .filter(|d| {
+                tree.nodes
+                    .iter()
+                    .any(|n| n.kind == tree::Kind::Dir && n.path == **d)
+            })
+            .cloned()
+            .collect();
+        self.expanded_dirs = dirs.clone();
+        tree.expand_paths(&dirs);
+        self.flat = tree.flatten();
+        self.selection = state
+            .selected_path
+            .as_deref()
+            .and_then(|path| {
+                self.flat
+                    .iter()
+                    .position(|&idx| tree.nodes[idx].path == path)
+            })
+            .unwrap_or(0);
+        self.tree = tree;
+        self.selected_path = self
+            .flat
+            .get(self.selection)
+            .map(|&idx| self.tree.nodes[idx].path.clone());
+        self.tree_scroll = state.tree_scroll;
+        self.diff_col = state.diff_col;
+        // `reset_diff_view` clears the collapsed set and resets the context
+        // width; both are session preferences that carry across switches
+        // (see `WorktreeUiState`), so save and re-apply them.
+        let context_lines = self.context_lines;
+        let collapsed_hunks = self.collapsed_hunks.clone();
+        self.reset_diff_view();
+        self.context_lines = context_lines;
+        self.collapsed_hunks = collapsed_hunks;
+        self.diff_scroll = state.diff_scroll;
+        self.request_diff();
+        true
     }
 
     /// True when the worker still has in-flight or pending work for the shown
@@ -631,6 +858,12 @@ impl App {
             .map(|(base, _)| base.trim().to_string())
     }
 
+    /// Track which worktree the app is viewing (`None` = main checkout);
+    /// called at startup and on every in-app worktree switch.
+    pub fn set_current_worktree(&mut self, id: Option<String>) {
+        self.current_worktree = id;
+    }
+
     /// Switch between the branch view and uncommitted-only. The branch view's
     /// origin is remembered so the round trip returns to it.
     pub fn toggle_mode(&mut self) {
@@ -733,26 +966,334 @@ impl App {
             title: title.to_string(),
             entries,
             selection,
+            filter: String::new(),
+            kind: PickerKind::Base,
+            worktrees: Vec::new(),
+        });
+    }
+
+    /// Open the worktree picker, listing every worktree of the repository. A
+    /// background thread scans each worktree's uncommitted-change count so
+    /// the rows' `±N` chips fill in without ever blocking the UI thread.
+    pub fn open_worktree_picker(&mut self) {
+        self.picker_error = None;
+        // `worktrees` swallows the repo-open error into an empty list; probe
+        // once so the status line can explain why `w` did nothing.
+        if let Err(e) = crate::git::open_repo() {
+            self.picker_error = Some(format!("worktrees unavailable: {e}"));
+            return;
+        }
+        let (entries, worktree_err) = crate::git::worktrees_with_error();
+        if let Some(e) = worktree_err {
+            self.picker_error = Some(format!("worktrees unavailable: {e}"));
+            return;
+        }
+        if entries.is_empty() {
+            self.picker_error = Some("worktrees unavailable: none found".to_string());
+            return;
+        }
+        self.open_worktree_picker_with(entries.clone());
+        // Stream dirty counts in from a scan thread: one independent
+        // repository open per worktree path, owned data only. Sends fail
+        // harmlessly once the receiver is dropped (picker closed), and the
+        // thread exits after this fixed list either way. A previous scan can
+        // still be running after a rapid close/reopen; don't spawn a second
+        // concurrent scanner over the same slot — the existing receiver and
+        // the `dirty_counts` cache keep the chips filled until counts land.
+        if self.dirty_rx.is_none() {
+            // Only live worktrees get scanned: a `missing` row (pruned, or a
+            // crafted/untrusted gitdir target) must never feed the scan
+            // thread a filesystem path to enumerate.
+            let targets: Vec<(String, PathBuf)> = entries
+                .iter()
+                .filter(|w| !w.missing)
+                .map(|w| (w.id.clone(), w.path.clone()))
+                .collect();
+            let (tx, rx) = crossbeam_channel::unbounded::<(String, DirtyStats)>();
+            self.dirty_scan_cancel.store(false, Ordering::Relaxed);
+            let cancel = Arc::clone(&self.dirty_scan_cancel);
+            let spawned = std::thread::Builder::new()
+                .name("bough-dirty".into())
+                .spawn(move || {
+                    for (id, path) in targets {
+                        // The picker can close mid-scan; stop before spending
+                        // another git scan on a receiver that is already gone.
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Some(stats) = crate::git::dirty_count(&path) {
+                            if tx.send((id, stats)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                })
+                .is_ok();
+            if spawned {
+                self.dirty_rx = Some(rx);
+            }
+        }
+    }
+
+    /// Testable core of [`App::open_worktree_picker`]: open the worktree
+    /// picker with an explicit entry list (no git calls, no scan thread).
+    pub fn open_worktree_picker_with(&mut self, entries: Vec<WorktreeInfo>) {
+        if entries.is_empty() {
+            return;
+        }
+        // Activity order (see `worktree_sort_key`); cached dirty counts from
+        // a previous picker visit apply immediately.
+        let mut entries = entries;
+        entries.sort_by_key(|w| worktree_sort_key(w, self.dirty_counts.get(&w.id).copied()));
+        let current = self
+            .current_worktree
+            .clone()
+            .unwrap_or_else(|| MAIN_WORKTREE.to_string());
+        let mut selection = entries.iter().position(|w| w.id == current).unwrap_or(0);
+        if entries[selection].missing {
+            selection = entries.iter().position(|w| !w.missing).unwrap_or(selection);
+        }
+        let picker_entries = entries
+            .iter()
+            .map(|w| PickerEntry {
+                rev: w.id.clone(),
+                label: w.id.clone(),
+            })
+            .collect();
+        self.base_picker = Some(BasePicker {
+            title: " switch worktree ".to_string(),
+            entries: picker_entries,
+            selection,
+            filter: String::new(),
+            kind: PickerKind::Worktree,
+            worktrees: entries,
         });
     }
 
     /// Close the base picker (Esc/q, or after a pick).
     pub fn close_picker(&mut self) {
         self.base_picker = None;
+        // The dirty-count scan has no audience anymore; dropping the
+        // receiver makes the scan thread's remaining sends fail harmlessly,
+        // and the cancel flag stops it before its next git scan.
+        self.dirty_rx = None;
+        self.dirty_scan_cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Enter in the picker: switch the diff base to the selected entry's rev.
+    /// Enter in the picker: switch the diff base to the selected entry's rev,
+    /// or switch worktrees when the worktree picker is open. A no-op when the
+    /// selection fell out of the filtered subset (the filter emptied the
+    /// list): never a stale pick from before the rows narrowed.
     pub fn select_picked_base(&mut self) {
-        let Some(rev) = self
+        let target = self.base_picker.as_ref().and_then(|p| {
+            p.filtered_indices()
+                .contains(&p.selection)
+                .then_some((p.kind, p.selection))
+        });
+        let Some((kind, selection)) = target else {
+            return;
+        };
+        match kind {
+            PickerKind::Worktree => self.select_picked_worktree(),
+            PickerKind::Base => {
+                let rev = self.base_picker.as_ref().unwrap().entries[selection]
+                    .rev
+                    .clone();
+                self.base_picker = None;
+                self.set_base(rev);
+            }
+        }
+    }
+
+    /// Enter in the worktree picker: switch to the selected worktree, unless
+    /// its directory is gone (flash an error instead).
+    fn select_picked_worktree(&mut self) {
+        let Some(wt) = self
             .base_picker
             .as_ref()
-            .and_then(|p| p.entries.get(p.selection).map(|e| e.rev.clone()))
+            .and_then(|p| p.worktrees.get(p.selection).cloned())
         else {
             self.base_picker = None;
             return;
         };
-        self.base_picker = None;
-        self.set_base(rev);
+        if wt.missing {
+            self.flash = Some(("worktree directory is gone".to_string(), Instant::now()));
+            return;
+        }
+        self.switch_worktree(&wt);
+    }
+
+    /// Switch the view to worktree `wt`: save the current worktree's view
+    /// state, aim the worker at the new root, and stash the target's saved
+    /// state for the two-phase restore in `apply_snapshot`. Switching to the
+    /// worktree already viewed only closes the picker (the worker would drop
+    /// the same-root switch, and the view must not visibly reset).
+    fn switch_worktree(&mut self, wt: &WorktreeInfo) {
+        let from = self
+            .current_worktree
+            .clone()
+            .unwrap_or_else(|| MAIN_WORKTREE.to_string());
+        if from == wt.id {
+            self.close_picker();
+            return;
+        }
+        self.worktree_ui.insert(from, self.capture_ui_state());
+        let saved = self.worktree_ui.remove(&wt.id);
+        self.set_current_worktree((!wt.main).then(|| wt.id.clone()));
+        let _ = self.request_tx.send(Request::SwitchWorktree {
+            root: wt.path.clone(),
+        });
+        self.close_picker();
+        match &saved {
+            Some(state) => {
+                self.mode = state.mode.clone();
+                // Restore the worktree's own remembered origin so an
+                // `Uncommitted` mode round-trips to it instead of to the
+                // origin of the worktree switched away from.
+                self.last_origin = state.last_origin.clone();
+            }
+            None => {
+                // Never visited: present the startup view rather than
+                // carrying the previous worktree's mode/selection across.
+                self.mode = Mode::Branch(Origin::Default);
+                self.last_origin = None;
+                self.selection = 0;
+                self.selected_path = None;
+                self.expanded_dirs.clear();
+            }
+        }
+        // Both branches drive the worker to the mode's revision, exactly as
+        // if the user had re-picked it (`apply_base_switch` sends SetRev).
+        self.apply_base_switch();
+        // The gate stays set until the switch's BUSY placeholder arrives, so
+        // stale old-root snapshots queued ahead of it (channel FIFO) can
+        // never consume the pending restore in `apply_snapshot`.
+        self.awaiting_switch = true;
+        self.pending_restore = saved;
+    }
+
+    /// Snapshot the current view state for the per-worktree memory.
+    fn capture_ui_state(&self) -> WorktreeUiState {
+        WorktreeUiState {
+            mode: self.mode.clone(),
+            last_origin: self.last_origin.clone(),
+            selected_path: self.selected_path.clone(),
+            expanded_dirs: self.expanded_dirs.clone(),
+            tree_scroll: self.tree_scroll,
+            diff_scroll: self.diff_scroll,
+            diff_col: self.diff_col,
+        }
+    }
+
+    /// Move the picker selection one row within the filtered subset, skipping
+    /// `missing` worktree rows (they render dimmed and are unselectable).
+    /// Clamped at both ends of the filtered subset.
+    pub fn picker_step(&mut self, down: bool) {
+        let Some(picker) = self.base_picker.as_mut() else {
+            return;
+        };
+        let rows: Vec<usize> = picker
+            .filtered_indices()
+            .into_iter()
+            .filter(|&i| picker.selectable(i))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let pos = rows
+            .iter()
+            .position(|&r| r == picker.selection)
+            .unwrap_or(0);
+        let next = if down { pos + 1 } else { pos.saturating_sub(1) };
+        if next < rows.len() {
+            picker.selection = rows[next];
+        }
+    }
+
+    /// Append a typed character to the picker filter and re-anchor the
+    /// selection onto the filtered subset.
+    pub fn picker_push_filter(&mut self, c: char) {
+        if let Some(picker) = self.base_picker.as_mut() {
+            picker.filter.push(c);
+            Self::reanchor_picker_selection(picker);
+        }
+    }
+
+    /// Drop the picker filter's last character (Backspace).
+    pub fn picker_filter_backspace(&mut self) {
+        if let Some(picker) = self.base_picker.as_mut() {
+            picker.filter.pop();
+            Self::reanchor_picker_selection(picker);
+        }
+    }
+
+    /// Clear the picker filter entirely (the first of two Esc presses).
+    pub fn picker_clear_filter(&mut self) {
+        if let Some(picker) = self.base_picker.as_mut() {
+            picker.filter.clear();
+            Self::reanchor_picker_selection(picker);
+        }
+    }
+
+    /// Re-anchor the picker selection after a filter or order change: keep it
+    /// when it still points at a selectable row of the filtered subset,
+    /// otherwise jump to the first selectable row. When nothing matches, the
+    /// selection is left alone and Enter no-ops.
+    fn reanchor_picker_selection(picker: &mut BasePicker) {
+        let selectable: Vec<usize> = picker
+            .filtered_indices()
+            .into_iter()
+            .filter(|&i| picker.selectable(i))
+            .collect();
+        if selectable.is_empty() || selectable.contains(&picker.selection) {
+            return;
+        }
+        picker.selection = selectable[0];
+    }
+
+    /// Drain the background dirty-count scan into the picker's chip map.
+    /// Called once per loop tick; returns `true` when any count landed (the
+    /// picker rows changed and a redraw is warranted). Arriving counts also
+    /// re-sort the open worktree picker into activity order, with the
+    /// selection following its worktree id so rows don't shift under the
+    /// user.
+    pub fn poll_dirty_counts(&mut self) -> bool {
+        let Some(rx) = self.dirty_rx.clone() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Ok((id, stats)) = rx.try_recv() {
+            self.dirty_counts.insert(id, stats.files);
+            changed = true;
+        }
+        if changed
+            && self
+                .base_picker
+                .as_ref()
+                .is_some_and(|p| p.kind == PickerKind::Worktree)
+        {
+            let mut picker = self.base_picker.take().unwrap();
+            let selected_id = picker.worktrees.get(picker.selection).map(|w| w.id.clone());
+            picker
+                .worktrees
+                .sort_by_key(|w| worktree_sort_key(w, self.dirty_counts.get(&w.id).copied()));
+            picker.entries = picker
+                .worktrees
+                .iter()
+                .map(|w| PickerEntry {
+                    rev: w.id.clone(),
+                    label: w.id.clone(),
+                })
+                .collect();
+            if let Some(id) = selected_id {
+                if let Some(pos) = picker.worktrees.iter().position(|w| w.id == id) {
+                    picker.selection = pos;
+                }
+            }
+            Self::reanchor_picker_selection(&mut picker);
+            self.base_picker = Some(picker);
+        }
+        changed
     }
 
     /// Switch the comparison origin to `base...HEAD`. Picking the default
@@ -973,6 +1514,7 @@ impl App {
             FooterZone::Source if right => self.open_commit_picker(),
             FooterZone::Source => self.open_branch_picker(),
             FooterZone::Mode => self.toggle_mode(),
+            FooterZone::Worktree => self.open_worktree_picker(),
         }
         true
     }
@@ -998,12 +1540,21 @@ impl App {
                 && row < r.y.saturating_add(r.height)
         };
         if in_rect(g.inner) {
-            let entry = g.first_row + (row - g.inner.y) as usize;
-            let in_bounds = self
-                .base_picker
-                .as_ref()
-                .is_some_and(|p| entry < p.entries.len());
-            if in_bounds {
+            let offset = (row - g.inner.y) as usize;
+            // Row 0 of the inner area is the filter box: a click there is
+            // consumed but inert. Entry rows are offset by one below it, and
+            // `first_row` is their first rendered real index — map the click
+            // through the filtered subset.
+            let picked = if offset == 0 {
+                None
+            } else {
+                self.base_picker.as_ref().and_then(|p| {
+                    let visible = p.filtered_indices();
+                    let start = visible.iter().position(|&i| i == g.first_row)?;
+                    visible.get(start + offset - 1).copied()
+                })
+            };
+            if let Some(entry) = picked {
                 if let Some(picker) = self.base_picker.as_mut() {
                     picker.selection = entry;
                 }
@@ -1015,19 +1566,10 @@ impl App {
         true
     }
 
-    /// Wheel inside the base picker: move the selection one entry.
+    /// Wheel inside the base picker: move the selection one entry (skipping
+    /// unselectable worktree rows).
     pub fn picker_scroll(&mut self, up: bool) {
-        let Some(picker) = self.base_picker.as_mut() else {
-            return;
-        };
-        let Some(last) = picker.entries.len().checked_sub(1) else {
-            return;
-        };
-        picker.selection = if up {
-            picker.selection.saturating_sub(1)
-        } else {
-            picker.selection.saturating_add(1).min(last)
-        };
+        self.picker_step(!up);
     }
 
     // ── Convenience accessors for snapshot data ─────────────────────────
@@ -2793,6 +3335,10 @@ mod tests {
 
     #[test]
     fn click_footer_source_left_opens_branch_picker() {
+        // Real opener: reads the global repo root (see t_opens_commit_picker).
+        let _guard = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (tx, _rx) = crossbeam_channel::bounded::<Request>(4);
         let mut app = App::new(
             sample_snapshot(Tree::build(Vec::new())),
@@ -2811,6 +3357,10 @@ mod tests {
 
     #[test]
     fn click_footer_source_right_opens_commit_picker() {
+        // Real opener: reads the global repo root (see t_opens_commit_picker).
+        let _guard = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (tx, _rx) = crossbeam_channel::bounded::<Request>(4);
         let mut app = App::new(
             sample_snapshot(Tree::build(Vec::new())),
@@ -2865,8 +3415,8 @@ mod tests {
             first_row: 0,
         });
 
-        // inner.y = 1, so row 2 is entry 1 (`feature`).
-        assert!(app.click_picker(3, 2));
+        // inner.y = 1: row 2 is the filter row, row 3 is entry 1 (`feature`).
+        assert!(app.click_picker(3, 3));
         assert!(app.base_picker.is_none());
         match rx.try_recv().unwrap() {
             Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
@@ -3327,5 +3877,739 @@ mod tests {
             "switching files drops the diff selection"
         );
         assert!(app.diff_selection.anchor.is_none());
+    }
+
+    /// A worktree entry for the picker tests: id, path, branch, main, missing.
+    fn wtinfo(
+        id: &str,
+        path: &str,
+        branch: Option<&str>,
+        main: bool,
+        missing: bool,
+    ) -> WorktreeInfo {
+        WorktreeInfo {
+            id: id.to_string(),
+            path: PathBuf::from(path),
+            branch: branch.map(Into::into),
+            main,
+            missing,
+            tip_time: None,
+        }
+    }
+
+    /// `main` + one linked worktree `wt-b` at /r/b.
+    fn two_worktrees() -> Vec<WorktreeInfo> {
+        vec![
+            wtinfo("main", "/r/main", Some("main"), true, false),
+            wtinfo("wt-b", "/r/b", Some("feature"), false, false),
+        ]
+    }
+
+    #[test]
+    fn open_worktree_picker_with_selects_current_entry() {
+        let mut app = sample_app();
+        app.set_current_worktree(Some("wt-b".into()));
+        app.open_worktree_picker_with(vec![
+            wtinfo("main", "/r/main", Some("main"), true, false),
+            wtinfo("wt-b", "/r/b", Some("feature"), false, false),
+            wtinfo("gone", "/r/gone", None, false, true),
+        ]);
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.kind, PickerKind::Worktree);
+        assert_eq!(picker.title, " switch worktree ");
+        assert_eq!(picker.selection, 1, "selection starts on the current entry");
+
+        // An empty list is a no-op: the already-open picker stays.
+        app.open_worktree_picker_with(Vec::new());
+        assert!(app.base_picker.is_some(), "empty list leaves the picker");
+    }
+
+    #[test]
+    fn worktree_picker_skips_missing_rows() {
+        let mut app = sample_app();
+        app.open_worktree_picker_with(vec![
+            wtinfo("main", "/r/main", Some("main"), true, false),
+            wtinfo("gone", "/r/gone", None, false, true),
+            wtinfo("wt-c", "/r/c", Some("c"), false, false),
+        ]);
+        // Missing rows sort last: main, wt-c, gone.
+        app.picker_step(true);
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().selection,
+            1,
+            "steps onto wt-c"
+        );
+        app.picker_step(true);
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().selection,
+            1,
+            "missing row is unselectable: clamped at wt-c"
+        );
+        app.picker_step(false);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 0, "skips back");
+        app.picker_step(false);
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().selection,
+            0,
+            "clamped at start"
+        );
+    }
+
+    #[test]
+    fn worktree_enter_on_missing_flashes_without_switching() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_worktree_picker_with(two_worktrees());
+        app.base_picker.as_mut().unwrap().worktrees[1].missing = true;
+        app.base_picker.as_mut().unwrap().selection = 1;
+
+        app.select_picked_base();
+
+        let (msg, _) = app.flash.clone().expect("flash error set");
+        assert_eq!(msg, "worktree directory is gone");
+        assert!(
+            app.base_picker.is_some(),
+            "picker stays open for another pick"
+        );
+        assert_eq!(app.current_worktree, None);
+        assert!(
+            rx.try_recv().is_err(),
+            "a missing worktree sends no request"
+        );
+    }
+
+    #[test]
+    fn worktree_enter_sends_switch_and_updates_current() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_worktree_picker_with(two_worktrees());
+        app.picker_step(true);
+
+        app.select_picked_base();
+
+        assert!(app.base_picker.is_none(), "picker closes on switch");
+        assert_eq!(app.current_worktree.as_deref(), Some("wt-b"));
+        match rx.try_recv().unwrap() {
+            Request::SwitchWorktree { root } => assert_eq!(root, PathBuf::from("/r/b")),
+            other => panic!("expected SwitchWorktree, got {other:?}"),
+        }
+        // An unvisited worktree presents the startup view, so the switch is
+        // followed by a SetRev for the startup revision.
+        match rx.try_recv().unwrap() {
+            Request::SetRev { rev } => assert_eq!(rev, "main...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn worktree_enter_on_current_worktree_only_closes() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_worktree_picker_with(two_worktrees());
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().selection,
+            0,
+            "main is current"
+        );
+
+        app.select_picked_base();
+
+        assert!(app.base_picker.is_none());
+        assert_eq!(app.current_worktree, None);
+        assert!(rx.try_recv().is_err(), "same-root switch sends nothing");
+    }
+
+    #[test]
+    fn worktree_switch_round_trip_restores_view_state() {
+        let tree = Tree::build(vec![
+            ('M', "src/a.rs".to_string()),
+            ('M', "src/b.rs".to_string()),
+            ('M', "top.rs".to_string()),
+        ]);
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        let mut app = App::new(
+            sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv(); // initial diff
+
+        // Shape the main worktree's view: expand src/, select src/b.rs,
+        // uncommitted mode against a picked origin. Flat order is
+        // [src, src/a.rs, src/b.rs, top.rs].
+        app.expand_or_refresh();
+        app.move_down(2);
+        let _ = rx.try_recv(); // Diff for src/b.rs
+        assert_eq!(app.selected_path.as_deref(), Some("src/b.rs"));
+
+        app.set_base("feature".to_string());
+        let _ = rx.try_recv(); // SetRev feature...HEAD
+        app.toggle_mode();
+        let _ = rx.try_recv(); // SetRev HEAD
+
+        // A → B.
+        app.open_worktree_picker_with(two_worktrees());
+        app.picker_step(true);
+        app.select_picked_base();
+        assert_eq!(app.current_worktree.as_deref(), Some("wt-b"));
+        let saved = app
+            .worktree_ui
+            .get("main")
+            .expect("state saved on switch-out");
+        assert_eq!(saved.mode, Mode::Uncommitted);
+        assert_eq!(
+            saved.last_origin,
+            Some(Origin::Picked("feature".to_string())),
+            "the saved origin round-trips with the saved mode"
+        );
+        assert_eq!(saved.selected_path.as_deref(), Some("src/b.rs"));
+        assert!(saved.expanded_dirs.contains("src"));
+        match rx.try_recv().unwrap() {
+            Request::SwitchWorktree { root } => assert_eq!(root, PathBuf::from("/r/b")),
+            other => panic!("expected SwitchWorktree, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            Request::SetRev { rev } => assert_eq!(rev, "main...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+
+        // Mutate the view "in" B; the changes must not leak into A's memory.
+        app.move_down(1);
+        let _ = rx.try_recv();
+
+        // B → A: the picker opens with the selection on the current entry.
+        app.open_worktree_picker_with(two_worktrees());
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1);
+        app.picker_step(false);
+        app.select_picked_base();
+        assert_eq!(app.current_worktree, None);
+        match rx.try_recv().unwrap() {
+            Request::SwitchWorktree { root } => assert_eq!(root, PathBuf::from("/r/main")),
+            other => panic!("expected SwitchWorktree, got {other:?}"),
+        }
+        // The restored uncommitted mode re-asks for its revision.
+        match rx.try_recv().unwrap() {
+            Request::SetRev { rev } => assert_eq!(rev, "HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+
+        // A stale settled snapshot from the old root, queued before the
+        // switch's BUSY placeholder (channel FIFO), must not consume the
+        // pending restore.
+        app.apply_snapshot(sample_snapshot(Tree::build(vec![
+            ('M', "top.rs".to_string()),
+            ('M', "old-root-only.rs".to_string()),
+        ])));
+        assert!(
+            app.pending_restore.is_some(),
+            "a settled pre-placeholder snapshot must not consume the restore"
+        );
+        // The stale snapshot legitimately relocated the (still B-phase)
+        // selection and asked for its diff; drain it so the restore's own
+        // Diff request is unambiguous below.
+        let _ = rx.try_recv();
+
+        // The switch's BUSY placeholder clears the awaiting-switch gate but
+        // must not consume the restore either.
+        let mut placeholder = sample_snapshot(Tree::build(Vec::new()));
+        Arc::get_mut(&mut placeholder).unwrap().busy = true;
+        app.apply_snapshot(placeholder);
+        assert!(
+            app.pending_restore.is_some(),
+            "the BUSY placeholder must not consume the restore"
+        );
+        assert!(!app.awaiting_switch, "the placeholder clears the gate");
+
+        // Session preferences in effect when the restored tree lands (context
+        // width, folded hunks) must survive the restore instead of being
+        // reset to defaults.
+        app.context_lines = 5;
+        app.collapsed_hunks = [2].into_iter().collect();
+
+        // Two-phase restore: A's tree arrives from the worker.
+        let tree_a = Tree::build(vec![
+            ('M', "src/a.rs".to_string()),
+            ('M', "src/b.rs".to_string()),
+            ('M', "top.rs".to_string()),
+        ]);
+        app.apply_snapshot(sample_snapshot(tree_a));
+        assert_eq!(app.mode, Mode::Uncommitted);
+        assert_eq!(app.selected_path.as_deref(), Some("src/b.rs"));
+        assert!(app.expanded_dirs.contains("src"));
+        let src_idx = app.flat[0];
+        assert!(app.tree.nodes[src_idx].expanded);
+        match rx.try_recv().unwrap() {
+            Request::Diff { path, ctx, .. } => {
+                assert_eq!(path, "src/b.rs");
+                assert_eq!(
+                    ctx, 5,
+                    "the diff is re-requested at the preserved context level"
+                );
+            }
+            other => panic!("expected Diff for the restored selection, got {other:?}"),
+        }
+        assert_eq!(
+            app.context_lines, 5,
+            "the restore preserves the context width"
+        );
+        assert!(
+            app.collapsed_hunks.contains(&2),
+            "the restore preserves folded hunks"
+        );
+
+        // The restored mode round-trips to the worktree's own remembered
+        // origin, not one inherited from the worktree switched away from.
+        app.toggle_mode();
+        assert_eq!(
+            app.mode,
+            Mode::Branch(Origin::Picked("feature".to_string()))
+        );
+        let _ = rx.try_recv(); // SetRev feature...HEAD
+
+        // Idempotent: a later unrelated snapshot must not re-trigger restore.
+        let tree_a2 = Tree::build(vec![
+            ('M', "src/a.rs".to_string()),
+            ('M', "src/b.rs".to_string()),
+            ('M', "top.rs".to_string()),
+        ]);
+        app.apply_snapshot(sample_snapshot(tree_a2));
+        assert_eq!(app.selected_path.as_deref(), Some("src/b.rs"));
+        assert!(rx.try_recv().is_err(), "restore fires once");
+    }
+
+    #[test]
+    fn failed_switch_drops_its_pending_restore() {
+        // A worker-rejected switch replays the OLD view as a settled error
+        // snapshot: the SAME tree Arc, so `tree_changed == false`. The
+        // stale restore must be dropped there, not left armed for a later
+        // unrelated recompute to apply onto the old worktree's tree.
+        let tree = Tree::build(vec![('M', "old.rs".to_string())]);
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        let mut app = App::new(
+            sample_snapshot(tree),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv(); // initial diff
+
+        app.pending_restore = Some(WorktreeUiState {
+            mode: Mode::Uncommitted,
+            last_origin: None,
+            selected_path: Some("target.rs".to_string()),
+            expanded_dirs: HashSet::new(),
+            tree_scroll: 0,
+            diff_scroll: 0,
+            diff_col: 0,
+        });
+        app.awaiting_switch = true;
+
+        // The rejected switch's settled error snapshot: every inner Arc is
+        // shared with the current snapshot, so nothing changed.
+        let replay = app.snapshot.clone();
+        app.apply_snapshot(replay);
+        assert!(app.pending_restore.is_none(), "stale restore dropped");
+        assert!(!app.awaiting_switch, "gate cleared");
+        assert!(
+            rx.try_recv().is_err(),
+            "no diff requested from the stale restore"
+        );
+    }
+
+    #[test]
+    fn worktree_switch_to_unvisited_worktree_starts_fresh() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        let mut app = App::new(
+            sample_snapshot(Tree::build(vec![('M', "a.rs".to_string())])),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.toggle_mode();
+        let _ = rx.try_recv();
+
+        app.open_worktree_picker_with(two_worktrees());
+        app.picker_step(true);
+        app.select_picked_base();
+
+        // Startup defaults, not the previous worktree's mode/selection.
+        assert_eq!(app.mode, Mode::Branch(Origin::Default));
+        assert_eq!(app.selected_path, None);
+        assert!(app.expanded_dirs.is_empty());
+
+        // The new tree arrives: selection lands on the first row.
+        app.apply_snapshot(sample_snapshot(Tree::build(vec![(
+            'M',
+            "z.rs".to_string(),
+        )])));
+        assert_eq!(app.selected_path.as_deref(), Some("z.rs"));
+    }
+
+    #[test]
+    fn poll_dirty_counts_stores_arriving_counts() {
+        let mut app = sample_app();
+        assert!(!app.poll_dirty_counts(), "no scan: nothing to drain");
+        let (tx, rx) = crossbeam_channel::unbounded::<(String, DirtyStats)>();
+        app.dirty_rx = Some(rx);
+        tx.send(("wt-b".to_string(), DirtyStats { files: 3 }))
+            .unwrap();
+        tx.send(("main".to_string(), DirtyStats { files: 0 }))
+            .unwrap();
+
+        assert!(app.poll_dirty_counts());
+        assert_eq!(app.dirty_counts.get("wt-b"), Some(&3));
+        assert_eq!(app.dirty_counts.get("main"), Some(&0));
+        assert!(!app.poll_dirty_counts(), "drained: no change");
+    }
+
+    /// A picker entry with `rev` used as both revision spec and label.
+    fn pentry(rev: &str) -> PickerEntry {
+        PickerEntry {
+            rev: rev.to_string(),
+            label: rev.to_string(),
+        }
+    }
+
+    /// A worktree entry with a tip commit time, for the ordering tests.
+    fn wt_timed(id: &str, tip_time: Option<i64>) -> WorktreeInfo {
+        WorktreeInfo {
+            id: id.to_string(),
+            path: PathBuf::from(format!("/r/{id}")),
+            branch: Some(id.to_string()),
+            main: id == "main",
+            missing: false,
+            tip_time,
+        }
+    }
+
+    /// Ids of the open worktree picker's rows, in display order.
+    fn picker_ids(app: &App) -> Vec<String> {
+        app.base_picker
+            .as_ref()
+            .unwrap()
+            .worktrees
+            .iter()
+            .map(|w| w.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn worktree_picker_orders_dirty_then_tip_then_listing() {
+        let mut app = sample_app();
+        let entries = || {
+            vec![
+                wt_timed("wt-b", Some(100)),
+                wt_timed("main", Some(300)),
+                wt_timed("wt-a", Some(200)),
+            ]
+        };
+
+        // Recency only: newest tip first.
+        app.open_worktree_picker_with(entries());
+        assert_eq!(picker_ids(&app), ["main", "wt-a", "wt-b"]);
+
+        // Dirty beats recency.
+        app.close_picker();
+        app.dirty_counts.insert("wt-b".to_string(), 3);
+        app.open_worktree_picker_with(entries());
+        assert_eq!(picker_ids(&app), ["wt-b", "main", "wt-a"]);
+
+        // Missing always last.
+        app.close_picker();
+        app.open_worktree_picker_with(vec![
+            wtinfo("gone", "/r/gone", None, false, true),
+            wtinfo("main", "/r/main", Some("main"), true, false),
+        ]);
+        assert_eq!(picker_ids(&app), ["main", "gone"]);
+
+        // Unknown tip time sorts last within its tier.
+        app.close_picker();
+        app.open_worktree_picker_with(vec![wt_timed("wt-x", None), wt_timed("main", Some(50))]);
+        assert_eq!(picker_ids(&app), ["main", "wt-x"]);
+    }
+
+    #[test]
+    fn poll_dirty_counts_resorts_picker_and_selection_follows_id() {
+        let mut app = sample_app();
+        app.open_worktree_picker_with(vec![
+            wt_timed("main", Some(300)),
+            wt_timed("wt-a", Some(200)),
+        ]);
+        app.base_picker.as_mut().unwrap().selection = 1; // on wt-a
+        let (tx, rx) = crossbeam_channel::unbounded::<(String, DirtyStats)>();
+        app.dirty_rx = Some(rx);
+        tx.send(("wt-a".to_string(), DirtyStats { files: 5 }))
+            .unwrap();
+
+        assert!(app.poll_dirty_counts());
+
+        // wt-a jumped to the top and the selection followed its id, not its
+        // (shifted) index; entries stay index-aligned with the worktrees.
+        assert_eq!(picker_ids(&app), ["wt-a", "main"]);
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.worktrees[picker.selection].id, "wt-a");
+        assert_eq!(picker.entries[picker.selection].rev, "wt-a");
+    }
+
+    #[test]
+    fn filter_narrows_base_picker_and_enter_picks_the_match() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_picker_with(
+            " compare against a branch ",
+            vec![pentry("develop"), pentry("feature/x"), pentry("main")],
+        );
+        // Selection prefills on the current base (main); typing re-anchors.
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 2);
+        for c in "fea".chars() {
+            app.picker_push_filter(c);
+        }
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "fea");
+        assert_eq!(picker.filtered_indices(), vec![1]);
+        assert_eq!(picker.selection, 1, "re-anchored onto the surviving row");
+
+        // j/k stay within the filtered subset; Enter picks it.
+        app.picker_step(true);
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1, "clamped");
+        app.select_picked_base();
+        assert!(app.base_picker.is_none());
+        assert_eq!(
+            app.mode,
+            Mode::Branch(Origin::Picked("feature/x".to_string()))
+        );
+        match rx.try_recv().unwrap() {
+            Request::SetRev { rev } => assert_eq!(rev, "feature/x...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_matching_is_case_insensitive() {
+        let mut app = sample_app();
+        app.open_picker_with(" b ", vec![pentry("develop"), pentry("feature/x")]);
+        for c in "DEV".chars() {
+            app.picker_push_filter(c);
+        }
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().filtered_indices(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn filter_matches_commit_subject_and_full_oid() {
+        let mut app = sample_app();
+        app.open_commit_picker_with(vec![
+            PickerEntry {
+                rev: "abcdef1234567890".to_string(),
+                label: "abcdef1 fix the worker loop".to_string(),
+            },
+            PickerEntry {
+                rev: "1111111111111111".to_string(),
+                label: "1111111 unrelated".to_string(),
+            },
+        ]);
+        for c in "worker".chars() {
+            app.picker_push_filter(c);
+        }
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().filtered_indices(),
+            vec![0],
+            "subject matches"
+        );
+        app.picker_clear_filter();
+        for c in "cdef1234".chars() {
+            app.picker_push_filter(c);
+        }
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().filtered_indices(),
+            vec![0],
+            "full oid matches (via the rev)"
+        );
+        app.picker_clear_filter();
+        for c in "unrel".chars() {
+            app.picker_push_filter(c);
+        }
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().filtered_indices(),
+            vec![1]
+        );
+        app.select_picked_base();
+        assert_eq!(
+            app.mode,
+            Mode::Branch(Origin::Picked("1111111111111111".to_string()))
+        );
+    }
+
+    #[test]
+    fn filter_matches_worktree_branch_path_and_id() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_worktree_picker_with(two_worktrees());
+        for c in "feat".chars() {
+            app.picker_push_filter(c);
+        }
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.filtered_indices(), vec![1], "branch matches");
+        assert_eq!(picker.selection, 1);
+        app.select_picked_base();
+        match rx.try_recv().unwrap() {
+            Request::SwitchWorktree { root } => assert_eq!(root, PathBuf::from("/r/b")),
+            other => panic!("expected SwitchWorktree, got {other:?}"),
+        }
+
+        app.open_worktree_picker_with(two_worktrees());
+        for c in "/r/main".chars() {
+            app.picker_push_filter(c);
+        }
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().filtered_indices(),
+            vec![0],
+            "path matches"
+        );
+        app.picker_clear_filter();
+        for c in "b".chars() {
+            app.picker_push_filter(c);
+        }
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().filtered_indices(),
+            vec![1],
+            "id matches"
+        );
+    }
+
+    #[test]
+    fn filter_backspace_edits_and_enter_on_empty_list_is_noop() {
+        let mut app = sample_app();
+        app.open_picker_with(" b ", vec![pentry("develop"), pentry("feature/x")]);
+        for c in "evex".chars() {
+            app.picker_push_filter(c);
+        }
+        assert!(
+            app.base_picker
+                .as_ref()
+                .unwrap()
+                .filtered_indices()
+                .is_empty(),
+            "no row matches"
+        );
+        app.select_picked_base();
+        assert!(
+            app.base_picker.is_some(),
+            "empty filtered list: Enter is a no-op"
+        );
+
+        // Backspace narrows the filter back to a matching prefix; the
+        // selection was already on a surviving row and stays put.
+        app.picker_filter_backspace();
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "eve");
+        assert_eq!(picker.filtered_indices(), vec![0]);
+        assert_eq!(picker.selection, 0);
+    }
+
+    #[test]
+    fn filter_clear_restores_full_list_and_does_not_survive_reopen() {
+        let mut app = sample_app();
+        app.open_picker_with(" b ", vec![pentry("develop"), pentry("feature/x")]);
+        for c in "fea".chars() {
+            app.picker_push_filter(c);
+        }
+        app.picker_clear_filter();
+        let picker = app.base_picker.as_ref().unwrap();
+        assert!(picker.filter.is_empty());
+        assert_eq!(picker.filtered_indices(), vec![0, 1]);
+
+        // Closing drops the filter; a fresh open starts unfiltered.
+        app.picker_push_filter('f');
+        app.close_picker();
+        app.open_picker_with(" b ", vec![pentry("develop"), pentry("feature/x")]);
+        let picker = app.base_picker.as_ref().unwrap();
+        assert!(picker.filter.is_empty(), "filter resets on open");
+        assert_eq!(picker.filtered_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn click_picker_maps_rows_through_the_filter() {
+        let (tx, rx) = crossbeam_channel::bounded::<Request>(8);
+        let mut app = App::new(
+            sample_snapshot(Tree::build(Vec::new())),
+            tx,
+            false,
+            "main...HEAD".to_string(),
+            "HEAD".to_string(),
+        );
+        let _ = rx.try_recv();
+        app.open_picker_with(" b ", vec![pentry("develop"), pentry("feature/x")]);
+        for c in "fea".chars() {
+            app.picker_push_filter(c);
+        }
+        // The renderer maps the first visible row to real index 1.
+        app.mouse.picker = Some(PickerGeometry {
+            popup: Rect::new(0, 0, 20, 6),
+            inner: Rect::new(1, 1, 18, 4),
+            first_row: 1,
+        });
+        // inner.y = 1: row 2 is the first entry row → the only match.
+        assert!(app.click_picker(3, 2));
+        assert!(app.base_picker.is_none());
+        match rx.try_recv().unwrap() {
+            Request::SetRev { rev } => assert_eq!(rev, "feature/x...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+
+        // A click on the filter row itself is consumed but inert.
+        app.open_picker_with(" b ", vec![pentry("develop"), pentry("feature/x")]);
+        app.picker_push_filter('f');
+        app.mouse.picker = Some(PickerGeometry {
+            popup: Rect::new(0, 0, 20, 6),
+            inner: Rect::new(1, 1, 18, 4),
+            first_row: 1,
+        });
+        assert!(app.click_picker(3, 1), "filter-row click consumed");
+        assert!(app.base_picker.is_some(), "filter-row click is inert");
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1);
     }
 }

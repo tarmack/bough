@@ -11,14 +11,15 @@ mod diff;
 mod tree;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::app::{App, MouseGeometry, PickerGeometry};
+use crate::app::{App, MouseGeometry, PickerGeometry, PickerKind};
+use crate::git::WorktreeInfo;
 use crate::preview;
 
 /// How long a transient copy confirmation (`App::flash`) overrides the
@@ -87,8 +88,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 }
 
 /// Draw the base-picker popup centered over the panes: a bordered list of
-/// selectable bases with the current branch marked and the selected row
-/// reversed. The list scrolls so the selection is always visible.
+/// selectable entries with the current one marked and the selected row
+/// reversed. The list scrolls so the selection is always visible. Worktree
+/// pickers render richer rows (branch, path, dirty chip) and dim missing
+/// worktrees.
 fn render_branch_picker(f: &mut Frame, app: &mut App) {
     let Some(picker) = app.base_picker.as_ref() else {
         return;
@@ -99,20 +102,58 @@ fn render_branch_picker(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let longest = picker
-        .entries
-        .iter()
-        .map(|e| e.label.chars().count())
-        .max()
-        .unwrap_or(0);
+    let worktree_kind = picker.kind == PickerKind::Worktree;
+    let current_wt = app
+        .current_worktree
+        .as_deref()
+        .unwrap_or(crate::app::MAIN_WORKTREE);
+    // The filtered subset drives every row surface: the list below, the
+    // match count, and `first_row` (which `click_picker` maps clicks back
+    // through). Selection surfaces in `App` recompute the same subset.
+    let visible = picker.filtered_indices();
+    // Worktree rows are built once per draw: the same texts feed the width
+    // measurement and the render loop (each build allocates the row, its
+    // truncated path, and its chip).
+    let mut row_texts: Vec<String> = if worktree_kind {
+        visible
+            .iter()
+            .map(|&i| {
+                let wt = &picker.worktrees[i];
+                worktree_row_text(
+                    wt,
+                    app.dirty_counts.get(&wt.id).copied(),
+                    wt.id == current_wt,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Popup width tracks display columns (what the terminal paints), not
+    // chars — a wide-char row would otherwise clip mid-glyph.
+    let longest = if worktree_kind {
+        row_texts
+            .iter()
+            .map(|t| display_width(t))
+            .max()
+            .unwrap_or(0)
+    } else {
+        picker
+            .entries
+            .iter()
+            .map(|e| display_width(&e.label))
+            .max()
+            .unwrap_or(0)
+    };
     let max_w = (area.width.saturating_mul(3) / 5).max(1);
     let width =
         (u16::try_from(longest).unwrap_or(u16::MAX).saturating_add(6)).clamp(28.min(max_w), max_w);
+    // +1 inner row for the shared filter row above the entry list.
     let max_h = (area.height.saturating_mul(4) / 5).max(1);
     let height = (u16::try_from(picker.entries.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(2))
-    .clamp(5.min(max_h), max_h);
+        .saturating_add(3))
+    .clamp(6.min(max_h), max_h);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -124,30 +165,119 @@ fn render_branch_picker(f: &mut Frame, app: &mut App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let rows = inner.height as usize;
-    // Scroll so the selection is visible, anchoring the window's bottom to the
-    // selection once the list outgrows the popup.
-    let start = picker.selection.saturating_sub(rows.saturating_sub(1));
+    let list_rows = (inner.height as usize).saturating_sub(1);
+    let sel_pos = visible
+        .iter()
+        .position(|&i| i == picker.selection)
+        .unwrap_or(0);
+    let start = sel_pos.saturating_sub(list_rows.saturating_sub(1));
     app.mouse.picker = Some(PickerGeometry {
         popup: rect,
         inner,
-        first_row: start,
+        first_row: visible.get(start).copied().unwrap_or(0),
     });
-    let current = app.snapshot.branch_state.name.as_deref();
-    for (i, entry) in picker.entries.iter().enumerate().skip(start).take(rows) {
-        let mut text = entry.label.clone();
-        if current == Some(entry.label.as_str()) {
-            text.push_str(" *");
-        }
-        let style = if i == picker.selection {
-            Style::default().add_modifier(Modifier::REVERSED)
+
+    // Shared filter row: dim prompt, typed text, block cursor, and a match
+    // count once the filter is non-empty.
+    if inner.height > 0 {
+        let dim = Style::default().fg(Color::DarkGray);
+        let count = if picker.filter.is_empty() {
+            String::new()
         } else {
-            Style::default()
+            format!("  {}/{}", visible.len(), picker.entries.len())
+        };
+        let line = Line::from(vec![
+            Span::styled("filter: ", dim),
+            Span::raw(picker.filter.clone()),
+            Span::raw("█"),
+            Span::styled(count, dim),
+        ]);
+        f.buffer_mut()
+            .set_line(inner.x, inner.y, &line, inner.width);
+    }
+
+    let current_branch = app.snapshot.branch_state.name.as_deref();
+    for (offset, &i) in visible.iter().skip(start).take(list_rows).enumerate() {
+        let row_y = inner.y + 1 + offset as u16;
+        let (text, style) = if worktree_kind {
+            let wt = &picker.worktrees[i];
+            let mut style = if wt.missing {
+                // A pruned worktree reads as unavailable.
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            if i == picker.selection && !wt.missing {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            (std::mem::take(&mut row_texts[start + offset]), style)
+        } else {
+            let mut text = picker.entries[i].label.clone();
+            if current_branch == Some(text.as_str()) {
+                text.push_str(" *");
+            }
+            let style = if i == picker.selection {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            (text, style)
         };
         let line = Line::styled(text, style);
-        f.buffer_mut()
-            .set_line(inner.x, inner.y + (i - start) as u16, &line, inner.width);
+        f.buffer_mut().set_line(inner.x, row_y, &line, inner.width);
     }
+}
+
+/// Text of one worktree-picker row: the worktree id (the current one marked
+/// with `*`), its branch (or `(detached)`), the path capped from the right,
+/// and the `±N` dirty chip once that worktree's count has arrived.
+fn worktree_row_text(wt: &WorktreeInfo, dirty: Option<usize>, is_current: bool) -> String {
+    let branch = wt.branch.as_deref().unwrap_or("(detached)");
+    let mut text = format!(
+        "{}{}  {}  {}",
+        wt.id,
+        if is_current { " *" } else { "" },
+        branch,
+        truncate_right(&wt.path.display().to_string(), 40),
+    );
+    if let Some(n) = dirty {
+        text.push_str(&format!("  ±{n}"));
+    }
+    text
+}
+
+/// Display width of `s` in terminal cells. ratatui 0.30 does not re-export
+/// `unicode-width`, so measure through `Span::width`, which uses the same
+/// crate internally as `Line::width()` (the footer zones' measurement).
+fn display_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Keep the head of `s` within `max` display columns (terminal cells, not
+/// chars — CJK/emoji glyphs span more than one column), marking the cut
+/// with `…`. The kept head plus the `…` always fit in `max` columns.
+fn truncate_right(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    // One column is reserved for the `…`; zero-width chars at the cut edge
+    // still fit (width 0 never exceeds the budget).
+    let budget = max - 1;
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let w = display_width(ch.encode_utf8(&mut buf));
+        if used + w > budget {
+            break;
+        }
+        kept.push(ch);
+        used += w;
+    }
+    format!("{kept}…")
 }
 
 fn status_line(app: &App) -> Option<String> {
@@ -212,7 +342,8 @@ mod tests {
         assert!(g.inner.x >= g.popup.x && g.inner.y >= g.popup.y);
         assert!(g.inner.x + g.inner.width <= g.popup.x + g.popup.width);
         assert!(g.inner.y + g.inner.height <= g.popup.y + g.popup.height);
-        let rows = g.inner.height as usize;
+        // The top inner row is the filter box; entry rows follow beneath it.
+        let rows = g.inner.height as usize - 1;
         assert_eq!(g.first_row, 9usize.saturating_sub(rows.saturating_sub(1)));
         assert!(g.first_row > 0, "scrolled picker: {g:?}");
 
@@ -246,5 +377,129 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(4),
         ));
         assert_eq!(status_line(&app), None);
+    }
+
+    /// A worktree entry for the picker-render test.
+    fn wtinfo(id: &str, path: &str, branch: Option<&str>, missing: bool) -> WorktreeInfo {
+        WorktreeInfo {
+            id: id.to_string(),
+            path: std::path::PathBuf::from(path),
+            branch: branch.map(Into::into),
+            main: id == "main",
+            missing,
+            tip_time: None,
+        }
+    }
+
+    #[test]
+    fn worktree_picker_rows_mark_current_and_dim_missing() {
+        let mut app = sample_app();
+        app.set_current_worktree(Some("wt-b".into()));
+        app.open_worktree_picker_with(vec![
+            wtinfo("main", "/repos/bough", Some("main"), false),
+            wtinfo("wt-b", "/repos/.wt/b", Some("feature"), false),
+            wtinfo("gone", "/repos/.wt/gone", None, true),
+        ]);
+        app.dirty_counts.insert("wt-b".into(), 3);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let g = app.mouse.picker.expect("picker geometry");
+        let buf = terminal.backend().buffer();
+        let row_text = |row: u16| {
+            (g.inner.x..g.inner.x + g.inner.width)
+                .map(|x| buf.cell((x, row)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+
+        // Selection starts on the current worktree (wt-b), so all three rows
+        // are visible in order below the filter row: main, wt-b (marked, with
+        // its dirty chip), and the dimmed missing one.
+        let filter_row = row_text(g.inner.y);
+        assert!(filter_row.contains("filter:"), "{filter_row}");
+        let row0 = row_text(g.inner.y + 1);
+        let row1 = row_text(g.inner.y + 2);
+        let row2 = row_text(g.inner.y + 3);
+        assert!(row0.contains("main"), "{row0}");
+        assert!(!row0.contains('*'), "non-current is unmarked: {row0}");
+        assert!(row1.contains("wt-b *"), "current is marked: {row1}");
+        assert!(row1.contains("feature"), "{row1}");
+        assert!(row1.contains("/repos/.wt/b"), "{row1}");
+        assert!(row1.contains("±3"), "dirty chip: {row1}");
+        assert!(row2.contains("gone"), "{row2}");
+        assert!(row2.contains("(detached)"), "{row2}");
+        let missing_cell = buf.cell((g.inner.x, g.inner.y + 3)).unwrap();
+        assert_eq!(missing_cell.fg, Color::DarkGray, "missing row is dimmed");
+    }
+
+    #[test]
+    fn filter_row_shows_prompt_cursor_and_match_count() {
+        let mut app = sample_app();
+        app.open_picker_with(
+            " b ",
+            vec![
+                PickerEntry {
+                    rev: "alpha".into(),
+                    label: "alpha".into(),
+                },
+                PickerEntry {
+                    rev: "beta".into(),
+                    label: "beta".into(),
+                },
+            ],
+        );
+        app.picker_push_filter('a');
+        app.picker_push_filter('l');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let g = app.mouse.picker.expect("picker geometry");
+        let row_text = |buf: &ratatui::buffer::Buffer, row: u16| {
+            (g.inner.x..g.inner.x + g.inner.width)
+                .map(|x| buf.cell((x, row)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+        let buf = terminal.backend().buffer();
+
+        // Prompt, typed text, block cursor, and the 1/2 match count.
+        let filter_row = row_text(buf, g.inner.y);
+        assert!(filter_row.contains("filter: al█"), "{filter_row}");
+        assert!(filter_row.contains("1/2"), "{filter_row}");
+        // Entry rows start beneath the filter row and only show the match.
+        let first_entry = row_text(buf, g.inner.y + 1);
+        assert!(first_entry.contains("alpha"));
+        assert!(!first_entry.contains("beta"));
+
+        // An empty filter shows the bare prompt with no count.
+        app.picker_clear_filter();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let empty_row = row_text(buf, g.inner.y);
+        assert!(empty_row.contains("filter: █"), "{empty_row}");
+        assert!(!empty_row.contains("/2"), "{empty_row}");
+    }
+
+    #[test]
+    fn truncate_right_caps_with_ellipsis() {
+        assert_eq!(truncate_right("short", 40), "short");
+        let long = truncate_right("/a/very/long/path/that/keeps/going/on", 10);
+        assert_eq!(long.chars().count(), 10);
+        assert!(long.ends_with('…'));
+        assert_eq!(truncate_right("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_right_budgets_display_columns() {
+        // CJK glyphs span two terminal columns each: 10 chars paint 14
+        // columns, so char-count truncation would overflow the budget.
+        let path = "/git/仓库/项目";
+        assert_eq!(display_width(path), 14);
+        let cut = truncate_right(path, 10);
+        assert!(cut.ends_with('…'));
+        assert_eq!(display_width(&cut), 10);
+        // ASCII rows keep the old behaviour: chars and columns agree.
+        let ascii = truncate_right("/a/very/long/path", 10);
+        assert_eq!(display_width(&ascii), 10);
+        assert_eq!(ascii.chars().count(), 10);
     }
 }

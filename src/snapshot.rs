@@ -5,6 +5,7 @@
 //! Pure data — no logic. The worker (`crate::worker`) produces
 //! `ArcSnapshot`s; the UI thread holds one and never mutates it in place.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::diff::Diff;
@@ -79,6 +80,12 @@ pub enum Request {
     /// Switch the base the diffs are computed against (e.g. between `HEAD`
     /// and `main...HEAD`) and recompute the whole tree + diff.
     SetRev { rev: String },
+    /// Switch the worktree being viewed (same repository, different
+    /// workdir). The worker re-aims the git layer, drops caches, re-arms the
+    /// watcher, and recomputes everything. A root equal to the current one
+    /// is a no-op passed through by coalescing and ignored by the worker
+    /// (mirroring same-rev `SetRev`).
+    SwitchWorktree { root: PathBuf },
     /// Tear the worker down cleanly (UI is exiting).
     Shutdown,
 }

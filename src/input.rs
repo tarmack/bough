@@ -281,6 +281,10 @@ pub fn run(
         if drain_snapshots(snapshot_rx, app, &mut worker_dead) {
             redraw.mark();
         }
+        // The worktree picker's dirty chips fill in asynchronously.
+        if app.poll_dirty_counts() {
+            redraw.mark();
+        }
         if let Some(img) = preview::drain_previews(image_rx) {
             app.preview.accept(img);
             redraw.mark();
@@ -505,7 +509,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
 
     // An open base picker captures every key (including `q`) until closed.
     if app.base_picker.is_some() {
-        return handle_picker_key(key.code, app);
+        return handle_picker_key(key, app);
     }
 
     // Esc always quits, even with a pending `z`/`g` chord: clear the chord
@@ -533,7 +537,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('q') => true,
         KeyCode::Char('w') => {
-            app.word_diff_on = !app.word_diff_on;
+            app.open_worktree_picker();
             false
         }
         KeyCode::Char('m') => {
@@ -546,6 +550,10 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
         }
         KeyCode::Char('t') => {
             app.open_commit_picker();
+            false
+        }
+        KeyCode::Char('W') => {
+            app.word_diff_on = !app.word_diff_on;
             false
         }
         KeyCode::Char('z') => {
@@ -604,25 +612,39 @@ fn handle_fold_key(code: KeyCode, app: &mut App) -> bool {
 }
 
 /// Handle a key while the base picker is open. Every key is consumed so the
-/// popup owns focus until it closes (`b`, `t`, `q`, or Esc) — `q` must close
-/// the popup rather than quit the app.
-fn handle_picker_key(code: KeyCode, app: &mut App) -> bool {
-    match code {
-        KeyCode::Char('j') | KeyCode::Down => {
-            if let Some(p) = app.base_picker.as_mut() {
-                if !p.entries.is_empty() {
-                    p.selection = (p.selection + 1).min(p.entries.len() - 1);
-                }
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if let Some(p) = app.base_picker.as_mut() {
-                p.selection = p.selection.saturating_sub(1);
-            }
-        }
+/// popup owns focus until it closes. With an empty filter the close keys
+/// (`b`, `t`, `w`, `q`, Esc) close the popup; once the filter is non-empty
+/// they type into it instead (filtering by name is the whole point), and Esc
+/// clears the filter first — a second Esc closes. Ctrl/Alt chords (e.g.
+/// Ctrl+U) are consumed but never typed into the filter.
+fn handle_picker_key(key: KeyEvent, app: &mut App) -> bool {
+    let filtering = app
+        .base_picker
+        .as_ref()
+        .is_some_and(|p| !p.filter.is_empty());
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.picker_step(true),
+        KeyCode::Char('k') | KeyCode::Up => app.picker_step(false),
         KeyCode::Enter => app.select_picked_base(),
-        KeyCode::Char('b') | KeyCode::Char('t') | KeyCode::Char('q') | KeyCode::Esc => {
+        KeyCode::Esc => {
+            if filtering {
+                app.picker_clear_filter();
+            } else {
+                app.close_picker();
+            }
+        }
+        KeyCode::Backspace => app.picker_filter_backspace(),
+        KeyCode::Char('b') | KeyCode::Char('t') | KeyCode::Char('w') | KeyCode::Char('q')
+            if !filtering =>
+        {
             app.close_picker()
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.picker_push_filter(c)
         }
         _ => {}
     }
@@ -1568,7 +1590,34 @@ mod tests {
     }
 
     #[test]
+    fn picker_ctrl_chords_do_not_type_into_filter() {
+        let (mut app, _rx) = picker_app();
+        // A Ctrl-chord is consumed but must not type into the filter
+        // (Ctrl+C quitting is handled earlier in `handle_key`).
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut app
+        ));
+        assert!(app.base_picker.is_some());
+        assert!(
+            app.base_picker.as_ref().unwrap().filter.is_empty(),
+            "Ctrl+U must not type into the filter"
+        );
+        // Plain characters still type.
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.base_picker.as_ref().unwrap().filter, "u");
+    }
+
+    #[test]
     fn t_opens_commit_picker() {
+        // Real opener: reads the global repo root, so it must serialize
+        // against tests that point it at temporary worktrees.
+        let _guard = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut app = sample_app();
         assert!(app.base_picker.is_none());
         assert!(!handle_key(
@@ -1683,6 +1732,164 @@ mod tests {
             &mut app
         ));
         assert!(app.base_picker.is_none());
+    }
+
+    #[test]
+    fn w_while_picker_open_closes_it() {
+        // The picker owns focus: `w` must not steal it (it closes, like `b`).
+        let (mut app, _rx) = picker_app();
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
+    }
+
+    #[test]
+    fn filter_letters_type_into_the_filter_and_narrow() {
+        // With an empty filter, `t` would close the popup; once the filter is
+        // non-empty, close keys type into it instead.
+        let (mut app, rx) = picker_app();
+        // `u`/`r`/`e` are not close keys; they build the filter "ure", which
+        // only `feature` contains.
+        for code in ['u', 'r', 'e'] {
+            assert!(
+                !handle_key(
+                    KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
+                    &mut app
+                ),
+                "typing never quits"
+            );
+            assert!(app.base_picker.is_some(), "typing keeps the picker open");
+        }
+        // "ure" matches only `feature`; the selection re-anchors onto it.
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "ure");
+        assert_eq!(picker.filtered_indices(), vec![1]);
+        assert_eq!(picker.selection, 1);
+
+        // j/k stay inside the filtered subset; Enter picks the match.
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.base_picker.as_ref().unwrap().selection, 1, "clamped");
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none());
+        match rx.try_recv().unwrap() {
+            crate::snapshot::Request::SetRev { rev } => assert_eq!(rev, "feature...HEAD"),
+            other => panic!("expected SetRev, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_close_keys_type_then_backspace_restores_close_keys() {
+        let (mut app, _rx) = picker_app();
+        // "e" matches both rows, so the filter is non-empty and `b`, `t`,
+        // `w`, `q` type into it instead of closing.
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut app
+        ));
+        for code in ['b', 't', 'w', 'q'] {
+            assert!(!handle_key(
+                KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
+                &mut app
+            ));
+        }
+        assert_eq!(app.base_picker.as_ref().unwrap().filter, "ebtwq");
+        assert!(app.base_picker.is_some(), "close keys typed, not closed");
+
+        // Backspace strips the filter; once empty, `w` closes again.
+        for expected in ["ebtw", "ebt", "eb", "e", ""] {
+            assert!(!handle_key(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut app
+            ));
+            assert_eq!(app.base_picker.as_ref().unwrap().filter, expected);
+        }
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none(), "empty filter: `w` closes");
+    }
+
+    #[test]
+    fn filter_esc_clears_then_second_esc_closes() {
+        let (mut app, _rx) = picker_app();
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.base_picker.as_ref().unwrap().filter, "zz");
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app
+        ));
+        let picker = app.base_picker.as_ref().unwrap();
+        assert!(picker.filter.is_empty(), "first Esc clears the filter");
+        assert_eq!(picker.filtered_indices(), vec![0, 1]);
+
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app
+        ));
+        assert!(app.base_picker.is_none(), "second Esc closes");
+    }
+
+    #[test]
+    fn filter_matching_is_case_insensitive_via_keys() {
+        let (mut app, _rx) = picker_app();
+        for code in ['D', 'E', 'V'] {
+            assert!(!handle_key(
+                KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
+                &mut app
+            ));
+        }
+        let picker = app.base_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "DEV");
+        assert_eq!(picker.filtered_indices(), vec![0]);
+    }
+
+    #[test]
+    fn w_opens_worktree_picker_not_word_diff() {
+        // Real opener: reads the global repo root (see t_opens_commit_picker).
+        let _guard = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut app = sample_app();
+        let word_diff = app.word_diff_on;
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &mut app
+        ));
+        assert_eq!(app.word_diff_on, word_diff, "w must not toggle word diff");
+        assert!(app.base_picker.is_some(), "w opens the worktree picker");
+        assert_eq!(
+            app.base_picker.as_ref().unwrap().kind,
+            crate::app::PickerKind::Worktree
+        );
+    }
+
+    #[test]
+    fn shift_w_toggles_word_diff() {
+        let mut app = sample_app();
+        let word_diff = app.word_diff_on;
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT),
+            &mut app
+        ));
+        assert_ne!(app.word_diff_on, word_diff, "Shift-W toggles word diff now");
+        assert!(app.base_picker.is_none(), "Shift-W no longer opens pickers");
     }
 
     #[test]
@@ -2067,6 +2274,10 @@ mod tests {
 
     #[test]
     fn mouse_footer_right_click_source_opens_commit_picker() {
+        // Real opener: reads the global repo root (see t_opens_commit_picker).
+        let _guard = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (mut app, _rx) = routed_app();
         app.mouse.footer = Some(Rect::new(0, 19, 80, 1));
         app.mouse.footer_zones = vec![(crate::app::FooterZone::Source, Rect::new(0, 19, 20, 1))];
@@ -2089,9 +2300,9 @@ mod tests {
             inner: Rect::new(1, 1, 18, 4),
             first_row: 0,
         });
-        // inner.y = 1, so row 2 is entry 1 (`feature`).
+        // inner.y = 1: row 2 is the filter row, row 3 is entry 1 (`feature`).
         handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 3, 2),
+            mouse(MouseEventKind::Down(MouseButton::Left), 3, 3),
             &mut app,
         );
         assert!(app.base_picker.is_none());
@@ -2257,6 +2468,10 @@ mod tests {
 
     #[test]
     fn mouse_preview_suppresses_diff_but_not_footer_or_tree() {
+        // Real opener: reads the global repo root (see t_opens_commit_picker).
+        let _guard = crate::test_support::GIT_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (mut app, _rx) = routed_app();
         app.diff_width = 40;
         app.preview.set_enabled(true);

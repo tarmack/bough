@@ -52,6 +52,12 @@ struct Cli {
     /// Git revision to diff against (e.g. `main...`, `main..HEAD`).
     /// Defaults to the merge-base of `main` and `HEAD`.
     revision: Option<String>,
+    /// Start viewing the worktree matching this spec (exact id first, then
+    /// exact path) instead of the process working directory. Resolving the
+    /// spec is the one git call permitted before the git layer is aimed at
+    /// the chosen worktree; every other git call runs after the override.
+    #[arg(long)]
+    worktree: Option<String>,
     /// syntect theme name (default "Monokai Extended"). Use `--theme list` to
     /// print available themes and exit.
     #[arg(long, default_value = "Monokai Extended")]
@@ -127,6 +133,36 @@ fn main() -> io::Result<()> {
         eprintln!("bough: continuing without syntax highlighting.");
     }
 
+    // Resolving the `--worktree` spec is the one git call permitted before
+    // the override: it must enumerate the cwd repo's worktrees to find the
+    // target. Every git call that consumes repo state runs after this block
+    // — `open_repo()` resolves through the global root, so a late switch
+    // would make startup read the process cwd's worktree while the UI
+    // claims another. Without the flag nothing is set and the git layer
+    // falls back to the process cwd, keeping startup identical.
+    if let Some(spec) = &cli.worktree {
+        match git::resolve_worktree_spec(spec) {
+            Some(info) => {
+                if let Err(e) = git::set_repo_root(info.path.clone()) {
+                    eprintln!("bough: cannot open worktree '{}': {e}", info.id);
+                    std::process::exit(1);
+                }
+            }
+            None => {
+                eprintln!("bough: no worktree matching '{spec}'. Available:");
+                eprintln!("{}", format_available_worktrees(&git::worktrees()));
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Classify the resolved root once, right after the override: with
+    // `--worktree` the global root points at the chosen worktree; without
+    // it, the cwd-discovered repo (linked worktree id, or `None` for the
+    // main checkout). The perf line and the app's footer pill both report
+    // this, so they can never disagree.
+    let current_wt = git::current_worktree_id();
+
     let empty = match git::repo_state() {
         git::RepoState::NotARepo => {
             eprintln!("bough: not a git repository.");
@@ -150,10 +186,14 @@ fn main() -> io::Result<()> {
     // carries the resolved branch state so the first frame can show it.
     let initial_snapshot = initial_snapshot(empty, branch_state.clone());
 
-    let repo_root = std::env::current_dir()?;
+    // The worker and the perf line both see the resolved root (the chosen
+    // worktree with `--worktree`, the process cwd otherwise), never the raw
+    // cwd — so the watcher's view always matches the git layer's.
+    let repo_root = git::current_repo_root();
     crate::perf_evt!(
-        "startup repo={} revision={} empty={}",
+        "startup repo={} worktree={} revision={} empty={}",
         repo_root.display(),
+        current_wt.as_deref().unwrap_or("main"),
         revision,
         empty
     );
@@ -184,6 +224,7 @@ fn main() -> io::Result<()> {
     // The footer must reflect a degradation the moment the watcher thread
     // flips it, so the app reads the worker's real flag, not a spawn-time copy.
     app.poll_mode = worker.poll_mode.clone();
+    app.set_current_worktree(current_wt);
     // A degenerate comparison (no committed work since the origin: standing
     // on the trunk, or a branch still at the trunk's tip) is the uncommitted
     // view — start there instead of showing a branch view with no branch
@@ -279,6 +320,16 @@ fn starts_uncommitted(revision: &str, ahead: Option<u32>) -> bool {
     ahead == Some(0) || revision == "HEAD"
 }
 
+/// The `  <id>\t<path>` listing printed when a `--worktree` spec matches
+/// nothing, so the user can see the exact ids and paths that would resolve.
+fn format_available_worktrees(worktrees: &[git::WorktreeInfo]) -> String {
+    worktrees
+        .iter()
+        .map(|w| format!("  {}\t{}", w.id, w.path.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +380,48 @@ mod tests {
         // Two calls must hand out the same mutex, so the hook and `Drop`
         // serialize their restore sequences.
         assert!(std::ptr::eq(restore_lock(), restore_lock()));
+    }
+
+    #[test]
+    fn cli_parses_worktree_flag() {
+        let cli = Cli::try_parse_from(["bough", "--worktree", "wt-feature"])
+            .expect("--worktree with a value parses");
+        assert_eq!(cli.worktree.as_deref(), Some("wt-feature"));
+        // Absent flag stays `None` — the cwd startup path.
+        let cli = Cli::try_parse_from(["bough"]).expect("bare invocation parses");
+        assert!(cli.worktree.is_none());
+    }
+
+    #[test]
+    fn cli_rejects_worktree_without_value() {
+        assert!(Cli::try_parse_from(["bough", "--worktree"]).is_err());
+    }
+
+    #[test]
+    fn available_worktrees_listing_shows_id_and_path() {
+        let worktrees = vec![
+            git::WorktreeInfo {
+                id: "main".to_string(),
+                path: std::path::PathBuf::from("/repos/bough"),
+                branch: Some("main".to_string()),
+                main: true,
+                missing: false,
+                tip_time: None,
+            },
+            git::WorktreeInfo {
+                id: "experiment".to_string(),
+                path: std::path::PathBuf::from("/repos/.worktrees/experiment"),
+                branch: None,
+                main: false,
+                missing: true,
+                tip_time: None,
+            },
+        ];
+        assert_eq!(
+            format_available_worktrees(&worktrees),
+            "  main\t/repos/bough\n  experiment\t/repos/.worktrees/experiment"
+        );
+        // An empty listing prints nothing (just the header line remains).
+        assert_eq!(format_available_worktrees(&[]), "");
     }
 }

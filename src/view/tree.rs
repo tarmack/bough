@@ -350,9 +350,29 @@ pub fn render_footer(f: &mut Frame, app: &mut App, area: Rect, message: Option<&
     mode.push(Span::styled(format!(" {label} "), on_pill(mode_bg)));
     mode.push(pill_cap(CAP_RIGHT, mode_bg));
 
-    app.mouse.footer_zones = footer_pill_zones(area, &source, &mode);
+    // The worktree pill, left of the identity pill and only when a linked
+    // worktree is being viewed (`None` = main checkout, no pill). Cyan —
+    // unused by the other pills — marks "where am I".
+    let mut worktree: Vec<Span<'static>> = Vec::new();
+    if let Some(id) = &app.current_worktree {
+        worktree.push(pill_cap(CAP_LEFT, Color::Cyan));
+        worktree.push(Span::styled(
+            format!(" worktree:{id} "),
+            on_pill(Color::Cyan),
+        ));
+        worktree.push(pill_cap(CAP_RIGHT, Color::Cyan));
+        worktree.push(Span::styled(" ", bar_style()));
+    }
 
-    let right = Line::from(source.into_iter().chain(mode).collect::<Vec<_>>());
+    app.mouse.footer_zones = footer_pill_zones(area, &worktree, &source, &mode);
+
+    let right = Line::from(
+        worktree
+            .into_iter()
+            .chain(source)
+            .chain(mode)
+            .collect::<Vec<_>>(),
+    );
     draw_aligned(f, area.x, area.y, area.width, &left, Some(&right));
 }
 
@@ -365,17 +385,24 @@ fn bar_style() -> Style {
 const CAP_LEFT: &str = crate::theme::CAP_LEFT;
 const CAP_RIGHT: &str = crate::theme::CAP_RIGHT;
 
-/// Hitboxes for the footer's right pill, one per part in draw order. `source`
-/// precedes `mode`; either may be empty. The pill is right-aligned like
-/// [`draw_aligned`], so when it overflows the pane only its leading columns
-/// survive: zones clip to `area`, and a fully-clipped part is dropped.
-fn footer_pill_zones(area: Rect, source: &[Span], mode: &[Span]) -> Vec<(FooterZone, Rect)> {
+/// Hitboxes for the footer's right pill row, one per part in draw order.
+/// `worktree` precedes `source` precedes `mode`; any may be empty. The pill
+/// is right-aligned like [`draw_aligned`], so when it overflows the pane only
+/// its leading columns survive: zones clip to `area`, and a fully-clipped
+/// part is dropped.
+fn footer_pill_zones(
+    area: Rect,
+    worktree: &[Span],
+    source: &[Span],
+    mode: &[Span],
+) -> Vec<(FooterZone, Rect)> {
     if area.height == 0 {
         return Vec::new();
     }
+    let wt_w = Line::from(worktree.to_vec()).width();
     let source_w = Line::from(source.to_vec()).width();
     let mode_w = Line::from(mode.to_vec()).width();
-    let total = source_w + mode_w;
+    let total = wt_w + source_w + mode_w;
     if total == 0 {
         return Vec::new();
     }
@@ -394,15 +421,17 @@ fn footer_pill_zones(area: Rect, source: &[Span], mode: &[Span]) -> Vec<(FooterZ
             Rect::new(x0, area.y, end.min(edge).saturating_sub(x0), 1),
         ));
     };
+    let mut offset = x;
+    if wt_w > 0 {
+        push(FooterZone::Worktree, offset, wt_w);
+        offset = offset.saturating_add(u16::try_from(wt_w).unwrap_or(u16::MAX));
+    }
     if source_w > 0 {
-        push(FooterZone::Source, x, source_w);
+        push(FooterZone::Source, offset, source_w);
+        offset = offset.saturating_add(u16::try_from(source_w).unwrap_or(u16::MAX));
     }
     if mode_w > 0 {
-        push(
-            FooterZone::Mode,
-            x.saturating_add(u16::try_from(source_w).unwrap_or(u16::MAX)),
-            mode_w,
-        );
+        push(FooterZone::Mode, offset, mode_w);
     }
     zones
 }
@@ -810,6 +839,54 @@ mod tests {
         ])
         .width();
         assert_eq!(mode.width as usize, expected, "{zones:?}");
+    }
+
+    #[test]
+    fn footer_shows_worktree_pill_only_when_linked() {
+        let mut app = branch_app();
+        let buf = render(&mut app);
+        let bar: String = (0..80)
+            .map(|x| buf.cell((x, 23)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            !bar.contains("worktree:"),
+            "main checkout has no pill: {bar}"
+        );
+        assert!(
+            !app.mouse
+                .footer_zones
+                .iter()
+                .any(|(z, _)| *z == FooterZone::Worktree),
+            "{:?}",
+            app.mouse.footer_zones
+        );
+
+        app.set_current_worktree(Some("wt-b".into()));
+        let buf = render(&mut app);
+        let bar: String = (0..80)
+            .map(|x| buf.cell((x, 23)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            bar.contains("worktree:wt-b"),
+            "pill names the worktree: {bar}"
+        );
+        // The pill sits left of the identity pill, in draw order.
+        assert!(
+            bar.find("worktree:wt-b").unwrap() < bar.find("feature/x").unwrap(),
+            "worktree pill precedes the source pill: {bar}"
+        );
+        let zones = &app.mouse.footer_zones;
+        let wt = zones
+            .iter()
+            .find(|(z, _)| *z == FooterZone::Worktree)
+            .expect("worktree zone")
+            .1;
+        let source = zones
+            .iter()
+            .find(|(z, _)| *z == FooterZone::Source)
+            .expect("source zone")
+            .1;
+        assert!(wt.x + wt.width <= source.x, "{zones:?}");
     }
 
     #[test]
