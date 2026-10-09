@@ -1,7 +1,9 @@
 //! Per-file structured diff construction.
 //!
-//! Builds a [`Diff`] directly from gix's blob diff — no unified-diff text is
-//! produced. The `@@` hunk structure is walked from
+//! Named `filediff` to keep it apart from the shared diff data model in
+//! [`crate::diff`], whose types this module populates. Builds a [`Diff`]
+//! directly from gix's blob diff — no unified-diff text is produced. The
+//! `@@` hunk structure is walked from
 //! [`gix::diff::blob::Diff`] via the [`ConsumeHunk`] machinery, and body lines
 //! are stuffed straight into the renderer's data model.
 
@@ -361,19 +363,7 @@ fn build_file_diff(
 /// submodule, symlink-only target, FIFO, device, ...). Mirrors the LFS stub:
 /// correct header, no hunks, no body.
 fn stub_diff(path: &str, meta: &FileMeta) -> Diff {
-    let file_header = FileHeader {
-        path: path.to_string(),
-        old_path: meta.old_path.clone(),
-        status: meta.status,
-        added: 0,
-        deleted: 0,
-        rename_percent: meta.rename_percent,
-        mode_old: meta.mode_old,
-        mode_new: meta.mode_new,
-        binary: true,
-        lfs: None,
-        hunks: Vec::new(),
-    };
+    let file_header = FileHeader::from_meta(path, meta, None, true, Vec::new());
     Diff {
         header: file_header.clone(),
         files: vec![file_header],
@@ -394,19 +384,7 @@ fn build_file_diff_with(
     lfs: Option<LfsInfo>,
 ) -> Result<Diff, GitError> {
     if let Some(lfs) = lfs {
-        let file_header = FileHeader {
-            path: path.to_string(),
-            old_path: meta.old_path.clone(),
-            status: meta.status,
-            added: 0,
-            deleted: 0,
-            rename_percent: meta.rename_percent,
-            mode_old: meta.mode_old,
-            mode_new: meta.mode_new,
-            binary: true,
-            lfs: Some(lfs),
-            hunks: Vec::new(),
-        };
+        let file_header = FileHeader::from_meta(path, meta, Some(lfs), true, Vec::new());
         return Ok(Diff {
             header: file_header.clone(),
             files: vec![file_header],
@@ -456,19 +434,7 @@ fn build_file_diff_with(
 
     crate::diff::apply_word_pairs(&mut lines);
 
-    let file_header = FileHeader {
-        path: path.to_string(),
-        old_path: meta.old_path.clone(),
-        status: meta.status,
-        added: meta.added,
-        deleted: meta.deleted,
-        rename_percent: meta.rename_percent,
-        mode_old: meta.mode_old,
-        mode_new: meta.mode_new,
-        binary: meta.binary,
-        lfs: None,
-        hunks,
-    };
+    let file_header = FileHeader::from_meta(path, meta, None, meta.binary, hunks);
 
     Ok(Diff {
         header: file_header.clone(),

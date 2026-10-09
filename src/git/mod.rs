@@ -5,23 +5,21 @@
 //! produced as structured data (no `git` binary is spawned and no unified-diff
 //! text is generated).
 
-mod diff;
 mod error;
+mod filediff;
 mod lfs;
 mod refs;
 mod status;
 mod worktrees;
 
-pub use diff::*;
 pub use error::GitError;
+pub use filediff::*;
 pub use refs::*;
 pub use status::*;
 pub use worktrees::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-
-use crate::diff::FileStatus;
 
 /// The process-global repository root the worktree-switch mechanism pins
 /// every `open_repo()` call to; `None` means "resolve from the process cwd"
@@ -30,19 +28,6 @@ static REPO_ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
 fn repo_root_slot() -> &'static RwLock<Option<PathBuf>> {
     REPO_ROOT.get_or_init(|| RwLock::new(None))
-}
-
-/// Per-file metadata used to annotate the tree/stats and diff-view header.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FileMeta {
-    pub status: FileStatus,
-    pub added: usize,
-    pub deleted: usize,
-    pub old_path: Option<String>,
-    pub rename_percent: Option<u8>,
-    pub mode_old: Option<u32>,
-    pub mode_new: Option<u32>,
-    pub binary: bool,
 }
 
 /// Open the repository the git layer currently resolves from: the stored
@@ -93,6 +78,19 @@ pub(crate) fn set_repo_root(root: PathBuf) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Set the global repo root to the worktree named by `spec` (id or path),
+/// validating it first. One atomic entry point for "view this worktree":
+/// callers cannot resolve a spec and set the root in separate steps, which
+/// would leave a window where a git call reads the wrong worktree between
+/// them. `Ok(None)` means the spec matched no worktree (the caller lists
+/// what exists); `Err` means a match was found but could not be opened.
+pub fn select_worktree(spec: &str) -> Result<Option<crate::git::WorktreeInfo>, GitError> {
+    match resolve_worktree_spec(spec) {
+        Some(info) => set_repo_root(info.path.clone()).map(|_| Some(info)),
+        None => Ok(None),
+    }
+}
+
 /// The root the git layer currently resolves from: the last
 /// `set_repo_root` value, or the process cwd before any switch. Reading the
 /// stored value is poison-tolerant so a panicked writer cannot silently
@@ -124,6 +122,18 @@ pub(crate) fn resolve_id(repo: &gix::Repository, spec: &str) -> Result<gix::Obje
         .rev_parse_single(b)
         .map_err(|e| GitError::message(format!("cannot resolve {spec:?}: {e}")))?
         .detach())
+}
+
+/// Split a three-dot revision range (`base...HEAD`) into its two trimmed
+/// sides. `None` for a plain revision — and for a two-dot (`base..HEAD`)
+/// range, whose sides are not split off; callers that must reject two-dot
+/// ranges do so separately.
+pub(crate) fn split_range(rev: &str) -> Option<(&str, &str)> {
+    if rev.contains("..") && !rev.contains("...") {
+        return None;
+    }
+    let (base, head) = rev.split_once("...")?;
+    Some((base.trim(), head.trim()))
 }
 
 /// Test fixtures: build throwaway repositories with real commits via the `git`

@@ -14,12 +14,12 @@ const LFS_MAGIC: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
 /// Largest blob treated as a pointer candidate. Real pointers are well under
 /// 200 bytes; the cap keeps `find_blob` off large real content.
-pub(crate) const POINTER_MAX: u64 = 512;
+const POINTER_MAX: u64 = 512;
 
 /// True when `bytes` opens with the LFS pointer spec-version line. The magic
 /// line ends with LF, or CRLF on a Windows checkout, so a trailing `\r` is
 /// accepted.
-pub(crate) fn is_lfs_pointer(bytes: &[u8]) -> bool {
+fn is_lfs_pointer(bytes: &[u8]) -> bool {
     bytes.starts_with(LFS_MAGIC) && matches!(bytes.get(LFS_MAGIC.len()), None | Some(b'\n' | b'\r'))
 }
 
@@ -36,7 +36,7 @@ fn is_sha256_hex(value: &str) -> bool {
 /// Parse an LFS pointer's `oid sha256:` digest (without the prefix) and `size`.
 /// Returns `None` when the bytes aren't a pointer or either field is missing or
 /// malformed. The `oid` must be exactly 64 lowercase hex characters.
-pub(crate) fn lfs_pointer_info(bytes: &[u8]) -> Option<(String, u64)> {
+fn lfs_pointer_info(bytes: &[u8]) -> Option<(String, u64)> {
     if !is_lfs_pointer(bytes) {
         return None;
     }

@@ -16,6 +16,12 @@ use ratatui::layout::Rect;
 /// under the terminal's ~4096-byte limit after the control prefix.
 const CHUNK_B64: usize = 3072;
 
+/// Image id used by the probe's query escape and its reply needle.
+const PROBE_ID: u32 = 31;
+
+/// Per-cell pixel size assumed when the terminal reports no pixel geometry.
+const FALLBACK_CELL: (u32, u32) = (10, 20);
+
 /// Probe whether the terminal supports the kitty graphics protocol.
 ///
 /// Honours `BOUGH_NO_IMAGES` (any value but `"0"` disables), short-circuits
@@ -47,10 +53,8 @@ pub fn probe() -> bool {
 /// the budget expires.
 fn probe_escape() -> bool {
     let mut out = io::stdout();
-    if out
-        .write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c")
-        .is_err()
-    {
+    let probe = format!("\x1b_Gi={PROBE_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c");
+    if out.write_all(probe.as_bytes()).is_err() {
         return false;
     }
     if out.flush().is_err() {
@@ -115,8 +119,8 @@ fn probe_escape() -> bool {
 /// True when the accumulated reply carries a kitty graphics response (`_Gi=31;`)
 /// that is not an immediate error (`;E…`).
 fn has_ok_response(buf: &[u8]) -> bool {
-    let needle = b"_Gi=31;";
-    let Some(pos) = find_subslice(buf, needle) else {
+    let needle = format!("_Gi={PROBE_ID};");
+    let Some(pos) = find_subslice(buf, needle.as_bytes()) else {
         return false;
     };
     !buf[pos + needle.len()..].starts_with(b"E")
@@ -204,7 +208,7 @@ pub fn cell_size() -> (u32, u32) {
             }
         }
     }
-    (10, 20)
+    FALLBACK_CELL
 }
 
 /// Pixel geometry of a `winsize`, normalized to per-cell pixels.
@@ -215,7 +219,7 @@ fn px_to_cells(ws: &libc::winsize) -> (u32, u32) {
             (ws.ws_ypixel / ws.ws_row) as u32,
         )
     } else {
-        (10, 20)
+        FALLBACK_CELL
     }
 }
 

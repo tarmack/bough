@@ -4,7 +4,6 @@
 //! state lives in `crate::app::App` and all drawing in `crate::view`.
 
 use std::io::{self, Stdout};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,15 +13,14 @@ use crossterm::event::{
     MouseEventKind,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
 use ratatui::Terminal;
 
-use crate::app::{App, CONTEXT_STEP, HSCROLL_STEP};
+use crate::app::{rect_contains, App, CONTEXT_STEP, HSCROLL_STEP};
 use crate::perf::{self, Counter};
 use crate::preview::{self, PreviewImage};
-use crate::snapshot::{ArcSnapshot, Snapshot};
+use crate::snapshot::ArcSnapshot;
 use crate::theme::Focus;
-use crate::view;
+use crate::view::{self, PANE_DIVIDER_W};
 
 /// Poll timeout while the worker is busy: also the spinner-tick cadence, so the
 /// "scanning…" affordances are refreshed as state settles.
@@ -99,17 +97,7 @@ fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App, worker_dead: &mut 
     }
     if !*worker_dead && matches!(rx.try_recv(), Err(TryRecvError::Disconnected)) {
         *worker_dead = true;
-        app.snapshot = Arc::new(Snapshot {
-            seq: app.snapshot.seq,
-            busy: false,
-            empty: app.snapshot.empty,
-            tree: app.snapshot.tree.clone(),
-            selected_diff: None,
-            selected_highlight: Arc::new(Vec::new()),
-            error: Some("worker stopped: live updates disabled".into()),
-            branch_state: app.snapshot.branch_state.clone(),
-            uncommitted_stats: app.snapshot.uncommitted_stats,
-        });
+        app.mark_worker_dead();
         changed = true;
     }
     changed
@@ -294,10 +282,7 @@ pub fn run(
         // `status_line` drops a stale flash only on the next draw, and the idle
         // wait never wakes for its expiry. Catch the fresh→stale transition to
         // force that draw, and cap the wait so it lands right after expiry.
-        let flash_fresh = app
-            .flash
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() < view::FLASH_TTL);
+        let flash_fresh = app.flash_fresh();
         if flash_live && !flash_fresh {
             redraw.mark();
         }
@@ -313,7 +298,7 @@ pub fn run(
         let mut timeout = if app.is_busy() { BUSY_POLL } else { IDLE_POLL };
         if flash_fresh {
             if let Some((_, at)) = &app.flash {
-                timeout = timeout.min(view::FLASH_TTL.saturating_sub(at.elapsed()));
+                timeout = timeout.min(crate::app::FLASH_TTL.saturating_sub(at.elapsed()));
             }
         }
         let wake = classify_wake(events.recv_timeout(timeout));
@@ -370,17 +355,7 @@ pub fn run(
 /// `[0, diff_width)` and the one-column divider sits at `diff_width`, so the
 /// tree starts after it.
 fn in_tree_pane(app: &App, column: u16) -> bool {
-    column >= app.diff_width.saturating_add(1)
-}
-
-/// True when `(column, row)` falls inside `rect`. `None` is never inside.
-fn rect_contains(rect: Option<Rect>, column: u16, row: u16) -> bool {
-    rect.is_some_and(|r| {
-        column >= r.x
-            && column < r.x.saturating_add(r.width)
-            && row >= r.y
-            && row < r.y.saturating_add(r.height)
-    })
+    column >= app.diff_width.saturating_add(PANE_DIVIDER_W)
 }
 
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
@@ -404,7 +379,10 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
 
     let column = mouse.column;
     let row = mouse.row;
-    let in_footer = rect_contains(app.mouse.footer, column, row);
+    let in_footer = app
+        .mouse
+        .footer
+        .is_some_and(|r| rect_contains(r, column, row));
 
     // A release ends an in-progress diff drag even if a preview appeared
     // mid-drag: the preview gate below would otherwise swallow it and leave the
@@ -431,7 +409,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 // Any click in the tree pane — header strip, entry, or empty
                 // space below — focuses the tree pane.
                 app.focus = Focus::Tree;
-                if rect_contains(app.mouse.tree_list, column, row) {
+                if app
+                    .mouse
+                    .tree_list
+                    .is_some_and(|r| rect_contains(r, column, row))
+                {
                     app.click_tree_row(row);
                 }
             } else if column < app.diff_width {
@@ -457,7 +439,12 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
         MouseEventKind::Down(MouseButton::Right) => {
             if in_footer {
                 app.click_footer(column, true);
-            } else if in_tree_pane(app, column) && rect_contains(app.mouse.tree_list, column, row) {
+            } else if in_tree_pane(app, column)
+                && app
+                    .mouse
+                    .tree_list
+                    .is_some_and(|r| rect_contains(r, column, row))
+            {
                 app.copy_tree_path(row);
             }
         }
@@ -477,8 +464,10 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 }
                 return;
             }
-            let over_tree =
-                rect_contains(app.mouse.tree_list, column, row) || in_tree_pane(app, column);
+            // The tree pane always contains the (smaller) tree_list rect, so
+            // the rect hit-test never changes the result; `in_tree_pane`
+            // alone is the routing decision.
+            let over_tree = in_tree_pane(app, column);
             if over_tree {
                 if up {
                     app.move_up(1);
@@ -505,6 +494,17 @@ fn handle_key(key: KeyEvent, app: &mut App) -> bool {
     // Ctrl-C always quits, regardless of focus.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
+    }
+    // One modifier gate for all non-Ctrl-C chords: CONTROL/ALT/SUPER are
+    // consumed but never act, unifying the previously inconsistent per-handler
+    // policy (Ctrl+Q/Ctrl+W used to fall through to the bare-char arms and
+    // quit/open a picker). Plain (Shift-only or no-modifier) keys flow
+    // through to normal dispatch.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
     }
 
     // An open base picker captures every key (including `q`) until closed.
@@ -615,8 +615,9 @@ fn handle_fold_key(code: KeyCode, app: &mut App) -> bool {
 /// popup owns focus until it closes. With an empty filter the close keys
 /// (`b`, `t`, `w`, `q`, Esc) close the popup; once the filter is non-empty
 /// they type into it instead (filtering by name is the whole point), and Esc
-/// clears the filter first — a second Esc closes. Ctrl/Alt chords (e.g.
-/// Ctrl+U) are consumed but never typed into the filter.
+/// clears the filter first — a second Esc closes. Ctrl/Alt/Super chords are
+/// gated off in `handle_key` before reaching here, so the typing arm takes
+/// any plain `Char` unconditionally.
 fn handle_picker_key(key: KeyEvent, app: &mut App) -> bool {
     let filtering = app
         .base_picker
@@ -639,13 +640,7 @@ fn handle_picker_key(key: KeyEvent, app: &mut App) -> bool {
         {
             app.close_picker()
         }
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            app.picker_push_filter(c)
-        }
+        KeyCode::Char(c) => app.picker_push_filter(c),
         _ => {}
     }
     false
@@ -736,6 +731,8 @@ mod tests {
     use crate::diff::{DiffLine, FileHeader, FileStatus, HunkMeta, LineKind};
     use crate::test_support::*;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use std::sync::Arc;
 
     #[test]
     fn classify_wake_fatal_read_error_exits() {
@@ -1039,7 +1036,7 @@ mod tests {
         let mut app = crate::app::App::new(
             crate::test_support::sample_snapshot(tree),
             tx,
-            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );
@@ -1069,7 +1066,7 @@ mod tests {
         let mut app = crate::app::App::new(
             crate::test_support::sample_snapshot(tree),
             tx,
-            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );
@@ -1555,7 +1552,7 @@ mod tests {
         let mut app = App::new(
             crate::test_support::sample_snapshot(tree),
             tx,
-            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );
@@ -1686,7 +1683,7 @@ mod tests {
         let mut app = App::new(
             crate::test_support::sample_snapshot(tree),
             tx,
-            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );
@@ -1952,7 +1949,7 @@ mod tests {
         let mut app = App::new(
             crate::test_support::sample_snapshot(tree),
             tx,
-            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );
@@ -2005,7 +2002,7 @@ mod tests {
         let mut app = App::new(
             crate::test_support::sample_snapshot(tree),
             tx,
-            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             "main...HEAD".to_string(),
             "HEAD".to_string(),
         );

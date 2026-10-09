@@ -40,6 +40,8 @@ const HARD_CEILING: Duration = Duration::from_millis(100);
 const LARGE_DIFF_THRESHOLD: usize = 2000;
 /// Above this git wall time the floor raises to the ceiling.
 const SLOW_GIT_THRESHOLD: Duration = Duration::from_millis(200);
+/// Diff context lines until the UI's first selection names its own `ctx`.
+const DEFAULT_CTX: u32 = 3;
 /// Maximum number of `(path, ctx)` diffs kept in the worker's LRU.
 const CACHE_CAP: usize = 32;
 /// Child diffs built per emitted chunk while streaming a directory aggregate.
@@ -92,78 +94,44 @@ pub struct Worker {
     handle: Option<JoinHandle<()>>,
 }
 
+/// The startup facts every spawn path and [`run_loop`] share: the initial
+/// revision context, repo location, theme-bound highlighter, and the branch
+/// summary + error riding the first snapshot. Bundled once in `main` so the
+/// spawn chain threads a single value instead of six.
+pub(crate) struct SpawnInit {
+    pub(crate) rev: String,
+    pub(crate) empty: bool,
+    pub(crate) repo_root: PathBuf,
+    pub(crate) highlighter: Option<Highlighter>,
+    pub(crate) initial_branch: git::BranchState,
+    pub(crate) initial_error: Option<String>,
+}
+
 impl Worker {
-    /// Spawn the worker thread. `initial_theme` selects the syntect theme;
-    /// an unknown theme degrades to no-color (the worker still builds structured
-    /// diffs). `repo_root` is where `notify` watches.
-    pub fn spawn(
-        rev: String,
-        empty: bool,
-        repo_root: PathBuf,
-        initial_theme: String,
-        initial_branch: git::BranchState,
-    ) -> Result<Worker, WorkerError> {
+    /// Spawn the worker thread. `highlighter` colors diffs; `None` skips
+    /// syntax coloring. `repo_root` is where `notify` watches.
+    pub fn spawn(init: SpawnInit) -> Result<Worker, WorkerError> {
         // One process-lifetime poll-mode flag: the UI clones it once at spawn
         // and reads it every frame, so re-arming the watcher on a worktree
         // switch must reuse this Arc, never mint a new one the UI can't see.
         let poll_flag = Arc::new(AtomicBool::new(false));
-        let watcher = match Watcher::start_with_flag(repo_root.clone(), poll_flag.clone()) {
+        let watcher = match Watcher::start_with_flag(init.repo_root.clone(), poll_flag.clone()) {
             Ok(w) => w,
             Err(e) => {
                 // No watcher: surface via the first snapshot's error and run
                 // request-only. poll_mode stays false (watcher is off, not
                 // degraded to a workdir poll).
-                return spawn_no_watcher(
-                    rev,
-                    empty,
-                    repo_root,
-                    initial_theme,
-                    initial_branch,
-                    e.to_string(),
-                    poll_flag,
-                );
+                return spawn_no_watcher(init, e.to_string(), poll_flag);
             }
         };
-        let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
-        let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
-        let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_t = shutdown.clone();
-        let poll_flag_t = poll_flag.clone();
-
-        let theme = initial_theme;
-        let handle = thread::Builder::new()
-            .name("bough-worker".into())
-            .spawn(move || {
-                let highlighter = Highlighter::new(&theme).ok();
-                run_loop(
-                    rev,
-                    empty,
-                    highlighter,
-                    repo_root,
-                    initial_branch,
-                    poll_flag_t,
-                    watcher,
-                    shutdown_t,
-                    LoopChannels {
-                        request_rx,
-                        snapshot_tx,
-                        image_tx,
-                    },
-                );
-            })
-            .map_err(|e| WorkerError {
-                message: format!("failed to spawn worker thread: {e}"),
-            })?;
-
-        Ok(Worker {
-            request_tx,
-            snapshot_rx,
-            image_rx,
-            poll_mode: poll_flag,
-            shutdown,
-            handle: Some(handle),
-        })
+        let event_rx = watcher.receiver().clone();
+        let watch = WatchHandle {
+            watcher: Some(watcher),
+            event_rx,
+            poll_flag: poll_flag.clone(),
+            switched: false,
+        };
+        spawn_worker_thread(init, poll_flag, watch)
     }
 }
 
@@ -178,103 +146,57 @@ impl Drop for Worker {
     }
 }
 
-/// Degraded spawn path when the watcher failed to start.
+/// Degraded spawn path when the watcher failed to start: the same loop with a
+/// never-ready [`WatchHandle`], serving requests only. The watcher error rides
+/// the first snapshot's status line; a later worktree switch that successfully
+/// arms a watcher restores live updates.
 fn spawn_no_watcher(
-    rev: String,
-    empty: bool,
-    repo_root: PathBuf,
-    theme: String,
-    initial_branch: git::BranchState,
+    mut init: SpawnInit,
     watch_err: String,
     poll_flag: Arc<AtomicBool>,
+) -> Result<Worker, WorkerError> {
+    let watch = WatchHandle {
+        watcher: None,
+        event_rx: crossbeam_channel::never(),
+        poll_flag: poll_flag.clone(),
+        switched: false,
+    };
+    init.initial_error = Some(watch_err);
+    spawn_worker_thread(init, poll_flag, watch)
+}
+
+/// Shared spawn scaffolding for both spawn paths: the channel trio, the
+/// worker thread running [`run_loop`], and the assembled `Worker`. Callers
+/// resolve the `Highlighter` and bring their own `WatchHandle` (live, or the
+/// never-ready request-only one); `initial_error` rides the first snapshot's
+/// status line.
+fn spawn_worker_thread(
+    init: SpawnInit,
+    poll_flag: Arc<AtomicBool>,
+    watch: WatchHandle,
 ) -> Result<Worker, WorkerError> {
     let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
     let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
     let (image_tx, image_rx) = crossbeam_channel::unbounded::<PreviewImage>();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_t = shutdown.clone();
-    let poll_flag_t = poll_flag.clone();
-
-    let first_error = watch_err.clone();
     let handle = thread::Builder::new()
         .name("bough-worker".into())
         .spawn(move || {
-            let highlighter = Highlighter::new(&theme).ok();
-            // Emit one initial snapshot carrying the watcher error so the UI
-            // status line surfaces it, then serve Diff requests only.
-            let mut state =
-                WorkerState::new(rev.clone(), empty, highlighter, repo_root, initial_branch);
-            state.last_error = Some(first_error);
-            state.send_initial(&snapshot_tx);
-
-            // Request-only until a worktree switch successfully arms a
-            // watcher; the never-ready receiver keeps the select arm silent
-            // until then.
-            let mut watch = WatchHandle {
-                watcher: None,
-                event_rx: crossbeam_channel::never(),
-                poll_flag: poll_flag_t,
-                switched: false,
-            };
-            let mut last_event: Option<Instant> = None;
-            // Set when the watcher channel closes; the receiver is swapped for
-            // a never-ready one so `select!` blocks on requests/timeout instead
-            // of spinning on the permanently-ready disconnected arm.
-            let mut event_closed = false;
-
-            loop {
-                if shutdown_t.load(Ordering::Relaxed) {
-                    break;
-                }
-                crossbeam_channel::select! {
-                    recv(watch.event_rx) -> ev => {
-                        if ev.is_ok() {
-                            last_event = Some(Instant::now());
-                        } else {
-                            // Watcher closed; stop selecting the
-                            // permanently-ready disconnected arm.
-                            event_closed = true;
-                        }
-                    }
-                    recv(request_rx) -> msg => {
-                        match msg {
-                            Ok(req) => {
-                                if handle_request(
-                                    req,
-                                    &mut state,
-                                    &snapshot_tx,
-                                    &image_tx,
-                                    &shutdown_t,
-                                    &mut watch,
-                                ) {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    default(HARD_CEILING) => {}
-                }
-                if event_closed {
-                    watch.event_rx = crossbeam_channel::never();
-                    event_closed = false;
-                }
-                // Minimal debounce for the re-armed watcher path: batch the
-                // burst for one floor, then recompute. The main loop's
-                // adaptive/ignore gating is an optimisation, not a
-                // correctness need, and this path is a degraded fallback.
-                if let Some(le) = last_event {
-                    if le.elapsed() >= DEBOUNCE_FLOOR {
-                        recompute(&mut state, &snapshot_tx, &image_tx, &shutdown_t, true);
-                        last_event = None;
-                    }
-                }
-            }
+            run_loop(
+                init,
+                watch,
+                shutdown_t,
+                LoopChannels {
+                    request_rx,
+                    snapshot_tx,
+                    image_tx,
+                },
+            );
         })
         .map_err(|e| WorkerError {
             message: format!("failed to spawn worker thread: {e}"),
         })?;
-
     Ok(Worker {
         request_tx,
         snapshot_rx,
@@ -374,8 +296,6 @@ struct WorkerState {
     cache: LruCache<(String, u32), CachedDiff>,
     /// When the floor was last raised; `None` when floor is at the baseline.
     floor_raised_at: Option<Instant>,
-    /// Wall time of the last `git::changed_files` call, for adaptive floor.
-    last_git_wall: Duration,
     /// Wall time of the last completed recompute, driving the duty-cycle floor
     /// while the raised window is active.
     last_recompute: Duration,
@@ -396,6 +316,10 @@ struct WorkerState {
     /// view (its own totals already are uncommitted-only) or when the extra
     /// scan failed.
     uncommitted_stats: Option<(usize, usize)>,
+    /// The change sets (the workdir-dirty scans) from the most recent
+    /// full-mode `scan_entries`, kept so the uncommitted pass can recount
+    /// them against HEAD without walking the worktree a second time.
+    scan_sets: Option<git::ChangeSets>,
     /// Cached git exclude chain, used to skip a recompute when every changed
     /// path is ignored. `None` when the repository/excludes are unavailable,
     /// which always falls back to recomputing.
@@ -421,7 +345,7 @@ impl WorkerState {
             highlighter,
             repo_root,
             selected_path: None,
-            ctx: 3,
+            ctx: DEFAULT_CTX,
             latest_request_seq: 0,
             last_tree: None,
             last_diff: None,
@@ -429,13 +353,13 @@ impl WorkerState {
             last_error: None,
             cache: LruCache::new(CACHE_CAP),
             floor_raised_at: None,
-            last_git_wall: Duration::ZERO,
             last_recompute: Duration::ZERO,
             last_recompute_at: None,
             last_branch: initial_branch,
             last_changes: HashMap::new(),
             preview_active: false,
             uncommitted_stats: None,
+            scan_sets: None,
             ignore: IgnoreMatcher::open(),
             last_sent_busy: false,
         }
@@ -481,9 +405,9 @@ impl WorkerState {
 
 /// Cached git exclude chain: decides whether a changed path is git-ignored so
 /// an all-ignored watcher burst can skip its recompute. The `Stack` owns its
-/// parsed pattern state, so the chain is built once (in [`IgnoreMatcher::open`]
-/// / [`IgnoreMatcher::open_at`]) and reused across fires.
-pub(crate) struct IgnoreMatcher {
+/// parsed pattern state, so the chain is built once (in [`IgnoreMatcher::open`])
+/// and reused across fires.
+struct IgnoreMatcher {
     repo: gix::Repository,
     stack: gix::worktree::Stack,
 }
@@ -570,6 +494,17 @@ struct LoopChannels {
     image_tx: Sender<PreviewImage>,
 }
 
+/// The IO clump every request/recompute path threads through: the snapshot
+/// and preview-image senders plus the shared shutdown flag. Built once per
+/// loop ([`run_loop`]) and borrowed by reference, so paths that need only
+/// part of it still take the whole thing instead of growing their own
+/// parameter lists.
+struct LoopIo<'a> {
+    snapshot_tx: &'a Sender<ArcSnapshot>,
+    image_tx: &'a Sender<PreviewImage>,
+    shutdown: &'a AtomicBool,
+}
+
 /// The watcher a loop can re-arm on a worktree switch, plus the event
 /// receiver its select arm drains and the process-lifetime poll-mode flag.
 /// In request-only mode `watcher` starts as `None` with a never-ready
@@ -585,36 +520,39 @@ struct WatchHandle {
 }
 
 /// Main loop with watcher events + requests + debounce timer.
-#[allow(clippy::too_many_arguments)]
 fn run_loop(
-    rev: String,
-    empty: bool,
-    highlighter: Option<Highlighter>,
-    repo_root: PathBuf,
-    initial_branch: git::BranchState,
-    poll_flag: Arc<AtomicBool>,
-    watcher: Watcher,
+    init: SpawnInit,
+    mut watch: WatchHandle,
     shutdown: Arc<AtomicBool>,
     channels: LoopChannels,
 ) {
+    let SpawnInit {
+        rev,
+        empty,
+        highlighter,
+        repo_root,
+        initial_branch,
+        initial_error,
+    } = init;
     let LoopChannels {
         request_rx,
         snapshot_tx,
         image_tx,
     } = channels;
-    let event_rx = watcher.receiver().clone();
-    let mut watch = WatchHandle {
-        watcher: Some(watcher),
-        event_rx,
-        poll_flag,
-        switched: false,
+    let io = LoopIo {
+        snapshot_tx: &snapshot_tx,
+        image_tx: &image_tx,
+        shutdown: &shutdown,
     };
     let mut state = WorkerState::new(rev, empty, highlighter, repo_root, initial_branch);
+    // A failed watcher start surfaces its error on the first snapshot; the
+    // initial recompute below then clears it (success) or replaces it.
+    state.last_error = initial_error;
     state.send_initial(&snapshot_tx);
     // First real snapshot comes from the initial recompute, so startup never
     // blocks the main thread on the git scan (whose cost scales with the total
     // diff size).
-    recompute(&mut state, &snapshot_tx, &image_tx, &shutdown, true);
+    recompute(&mut state, &io, true, true);
 
     let mut last_event: Option<Instant> = None;
     // Set when the watcher channel closes; the receiver is swapped for a
@@ -642,11 +580,10 @@ fn run_loop(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        // Pre-select clock: only the tick timeout needs it; the fire
+        // condition re-reads the clock after the select.
         let now = Instant::now();
         let floor = current_floor(&state, now);
-        let debounce_due = last_event
-            .map(|le| should_fire(le, now, floor))
-            .unwrap_or(false);
         let tick = next_tick(last_event, state.last_recompute_at, now, floor);
 
         let timeout = tick.min(HARD_CEILING);
@@ -655,20 +592,18 @@ fn run_loop(
             recv(watch.event_rx) -> ev => match ev {
                 Ok(we) => {
                     last_event = Some(Instant::now());
-                    match &we {
-                        WorkerEvent::WorkdirChanged(paths) => {
-                            crate::perf_evt!("watch ev=workdir paths={}", paths.len());
-                        }
-                        WorkerEvent::RefsChanged => crate::perf_evt!("watch ev=refs"),
-                    }
                     match we {
                         WorkerEvent::WorkdirChanged(paths) => {
+                            crate::perf_evt!("watch ev=workdir paths={}", paths.len());
                             if paths.is_empty() {
                                 unattributable = true;
                             }
                             changed_paths.extend(paths);
                         }
-                        WorkerEvent::RefsChanged => saw_refs = true,
+                        WorkerEvent::RefsChanged => {
+                            crate::perf_evt!("watch ev=refs");
+                            saw_refs = true;
+                        }
                     }
                 }
                 Err(_) => {
@@ -687,14 +622,7 @@ fn run_loop(
                         coalesce(r, &request_rx, &shutdown, &state.rev, &state.repo_root);
                     let mut quit = false;
                     for survivor in survivors {
-                        if handle_request(
-                            survivor,
-                            &mut state,
-                            &snapshot_tx,
-                            &image_tx,
-                            &shutdown,
-                            &mut watch,
-                        ) {
+                        if handle_request(survivor, &mut state, &io, &mut watch) {
                             quit = true;
                             break;
                         }
@@ -725,10 +653,10 @@ fn run_loop(
         }
 
         let now = Instant::now();
-        let quiet_due = debounce_due
-            && last_event
-                .map(|le| should_fire(le, now, floor))
-                .unwrap_or(false);
+        let floor = current_floor(&state, now);
+        let quiet_due = last_event
+            .map(|le| should_fire(le, now, floor))
+            .unwrap_or(false);
         if quiet_due || churn_due(last_event, state.last_recompute_at, now, floor) {
             if state
                 .last_recompute_at
@@ -748,7 +676,12 @@ fn run_loop(
                 perf::tally(Counter::IgnoreSkips);
                 crate::perf_evt!("ignore skip paths={}", changed_paths.len());
             } else {
-                recompute(&mut state, &snapshot_tx, &image_tx, &shutdown, saw_refs);
+                recompute(
+                    &mut state,
+                    &io,
+                    saw_refs,
+                    !changed_paths.is_empty() || unattributable,
+                );
             }
             // A `.gitignore` edit invalidates the cached exclude chain; rebuild
             // it so a path newly ignored or unignored is judged correctly next.
@@ -1040,13 +973,11 @@ fn is_stale(latest: Seq, incoming: Seq) -> bool {
 fn handle_request(
     req: Request,
     state: &mut WorkerState,
-    tx: &Sender<ArcSnapshot>,
-    image_tx: &Sender<PreviewImage>,
-    shutdown: &AtomicBool,
+    io: &LoopIo,
     watch: &mut WatchHandle,
 ) -> bool {
     // Don't start expensive work once the UI has begun tearing us down.
-    if shutdown.load(Ordering::Relaxed) {
+    if io.shutdown.load(Ordering::Relaxed) {
         return true;
     }
     match req {
@@ -1057,12 +988,12 @@ fn handle_request(
                 // discarded the requests coalesced around it.
                 return false;
             }
-            if let Err(e) = switch_worktree(state, &root, tx, image_tx, shutdown, watch) {
+            if let Err(e) = switch_worktree(state, io, &root, watch) {
                 // Validation/re-aim failure: surface the error over the
                 // current (unchanged) view; `switch_worktree` left every bit
                 // of state untouched.
                 state.last_error = Some(e);
-                send_error_snapshot(state, tx);
+                send_error_snapshot(state, io);
             }
             false
         }
@@ -1073,7 +1004,7 @@ fn handle_request(
                 // longer apply once the base changes, so drop them.
                 state.cache = LruCache::new(CACHE_CAP);
                 state.last_error = None;
-                recompute(state, tx, image_tx, shutdown, true);
+                recompute(state, io, true, true);
             }
             false
         }
@@ -1084,7 +1015,7 @@ fn handle_request(
             state.latest_request_seq = seq;
             state.selected_path = Some(path.clone());
             state.ctx = ctx;
-            serve_diff(state, &path, ctx, tx, shutdown);
+            serve_diff(state, io, &path, ctx);
             false
         }
         Request::Highlight {
@@ -1103,7 +1034,7 @@ fn handle_request(
                 return false;
             }
             state.latest_request_seq = seq;
-            fill_highlight_range(state, &path, ctx, from, to, tx);
+            fill_highlight_range(state, io, &path, ctx, from, to);
             false
         }
         Request::LoadImage { path, seq } => {
@@ -1112,7 +1043,7 @@ fn handle_request(
             }
             state.latest_request_seq = seq;
             state.preview_active = true;
-            load_preview(state, &path, image_tx, tx);
+            load_preview(state, io, &path);
             false
         }
     }
@@ -1125,13 +1056,10 @@ fn handle_request(
 /// debounce-bypassing recompute. `Err(message)` is returned only before any
 /// mutation, so the caller can surface the error over the untouched current
 /// view.
-#[allow(clippy::too_many_arguments)]
 fn switch_worktree(
     state: &mut WorkerState,
+    io: &LoopIo,
     root: &Path,
-    tx: &Sender<ArcSnapshot>,
-    image_tx: &Sender<PreviewImage>,
-    shutdown: &AtomicBool,
     watch: &mut WatchHandle,
 ) -> Result<(), String> {
     // Same-repository identity first: a switch stays within the current
@@ -1166,9 +1094,11 @@ fn switch_worktree(
     state.last_branch = git::BranchState::default();
     state.last_error = None;
     state.selected_path = None;
-    state.ctx = 3;
+    state.ctx = DEFAULT_CTX;
     state.preview_active = false;
     state.uncommitted_stats = None;
+    // The dirty scans came from the old worktree's revision; stale.
+    state.scan_sets = None;
     // The old worktree's raised floor must not suppress the new root's
     // watcher-driven recomputes for the raised window's duration.
     state.floor_raised_at = None;
@@ -1186,7 +1116,7 @@ fn switch_worktree(
     // only immediate switch feedback.
     send_snapshot(
         state,
-        tx,
+        io,
         empty_tree(),
         None,
         Arc::new(Vec::new()),
@@ -1217,25 +1147,20 @@ fn switch_worktree(
 
     // Full recompute, bypassing the debounce. `refs_moved` re-derives branch
     // state from the new worktree's HEAD.
-    recompute(state, tx, image_tx, shutdown, true);
+    recompute(state, io, true, true);
     Ok(())
 }
 
 /// Read and decode the image at `path` (relative to the repo root) and send the
-/// finished preview on `tx`. A read/decode failure is surfaced in the status
-/// line via a snapshot that keeps the cached diff for `path` intact, so the
-/// pane never blanks on a bad image.
-fn load_preview(
-    state: &mut WorkerState,
-    path: &str,
-    tx: &Sender<PreviewImage>,
-    snapshot_tx: &Sender<ArcSnapshot>,
-) {
+/// finished preview on `io.image_tx`. A read/decode failure is surfaced in the
+/// status line via a snapshot that keeps the cached diff for `path` intact, so
+/// the pane never blanks on a bad image.
+fn load_preview(state: &mut WorkerState, io: &LoopIo, path: &str) {
     let result = read_preview_bytes(&state.repo_root, path)
         .and_then(|bytes| build_preview_bytes(&bytes, path.to_string()));
     match result {
         Ok(img) => {
-            let _ = tx.send(img);
+            let _ = io.image_tx.send(img);
         }
         Err(e) => {
             state.last_error = Some(format!("preview {path}: {e}"));
@@ -1245,8 +1170,8 @@ fn load_preview(
                 .get(&key)
                 .map(|entry| (entry.diff.clone(), entry.hl.clone()));
             match cached {
-                Some((diff, hl)) => send_diff_snapshot(state, Some(diff), hl, snapshot_tx),
-                None => send_error_snapshot(state, snapshot_tx),
+                Some((diff, hl)) => send_diff_snapshot(state, io, Some(diff), hl),
+                None => send_error_snapshot(state, io),
             }
         }
     }
@@ -1295,7 +1220,7 @@ fn read_preview_bytes(
 
 /// Decode image bytes and re-encode them as a PNG preview, downscaling when the
 /// long edge exceeds 1024px to keep the escape payload small.
-pub(crate) fn build_preview_bytes(
+fn build_preview_bytes(
     bytes: &[u8],
     path: String,
 ) -> Result<PreviewImage, Box<dyn std::error::Error + Send + Sync>> {
@@ -1371,7 +1296,12 @@ fn scan_entries(
             .collect();
         Ok((entries, stats))
     } else {
-        let changes = git::all_changes(&state.rev).map_err(|e| e.to_string())?;
+        let repo = git::open_repo().map_err(|e| e.to_string())?;
+        let (changes, sets) =
+            git::all_changes_in_with_sets(&repo, &state.rev).map_err(|e| e.to_string())?;
+        // Kept for the uncommitted pass: recounting these sets against HEAD
+        // skips the second workdir walk of a branch-mode recompute.
+        state.scan_sets = Some(sets);
         state.last_changes = changes
             .iter()
             .map(|c| (c.path.clone(), c.clone()))
@@ -1392,38 +1322,32 @@ fn scan_entries(
 ///
 /// Runs one scan of the working tree and derives the entries, per-file stats,
 /// and per-file metadata (for the diff header) from it, so nothing is rescanned
-/// on file selection. The uncommitted-only scan always runs (every watcher
-/// fire carries at least one event, and rev switches need it too);
-/// `refs_moved` controls whether branch state (which only refs can change) is
-/// re-walked.
-fn recompute(
-    state: &mut WorkerState,
-    tx: &Sender<ArcSnapshot>,
-    image_tx: &Sender<PreviewImage>,
-    shutdown: &AtomicBool,
-    refs_moved: bool,
-) {
+/// on file selection. `refs_moved` controls whether branch state (which only
+/// refs can change) is re-walked. `workdir_dirty` says whether the workdir may
+/// have changed since the last recompute: true at startup and on a rev or
+/// worktree switch; on the watcher path, `!changed_paths.is_empty() ||
+/// unattributable`, since a refs-only window cannot move the uncommitted
+/// totals the second scan below recomputes.
+fn recompute(state: &mut WorkerState, io: &LoopIo, refs_moved: bool, workdir_dirty: bool) {
     let t0 = Instant::now();
     perf::tally(Counter::Recomputes);
     let mut span = perf::span("recompute");
     let (entries, stats) = {
         let _scan = perf::span("git_scan");
-        match scan_entries(state, shutdown) {
+        match scan_entries(state, io.shutdown) {
             Ok(x) => x,
             Err(err) => {
-                if shutdown.load(Ordering::Relaxed) {
+                if io.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
                 state.last_error = Some(err);
-                send_error_snapshot(state, tx);
+                send_error_snapshot(state, io);
                 return;
             }
         }
     };
     span.detail(format_args!("entries={}", entries.len()));
-    recompute_from_scan(
-        state, tx, image_tx, shutdown, refs_moved, entries, stats, t0,
-    );
+    recompute_from_scan(state, io, refs_moved, workdir_dirty, entries, stats, t0);
     state.last_recompute = t0.elapsed();
     state.last_recompute_at = Some(Instant::now());
 }
@@ -1431,13 +1355,11 @@ fn recompute(
 /// The post-scan half of [`recompute`]: evict, refresh branch stats, build the
 /// tree, then stream the two phases (busy tree, settled diff). Split out so the
 /// two-phase sequencing is testable without a live repository.
-#[allow(clippy::too_many_arguments)]
 fn recompute_from_scan(
     state: &mut WorkerState,
-    tx: &Sender<ArcSnapshot>,
-    image_tx: &Sender<PreviewImage>,
-    shutdown: &AtomicBool,
+    io: &LoopIo,
     refs_moved: bool,
+    workdir_dirty: bool,
     entries: Vec<Entry>,
     stats: LineStats,
     t0: Instant,
@@ -1447,7 +1369,7 @@ fn recompute_from_scan(
     // highlight progress for every other file.
     evict_changed(state);
 
-    state.last_git_wall = t0.elapsed();
+    let git_wall = t0.elapsed();
     // Branch state (ahead/behind, unpushed) can only change when refs move, so
     // a workdir-only window reuses the cached value instead of re-walking.
     if refs_moved {
@@ -1457,20 +1379,40 @@ fn recompute_from_scan(
     // In branch comparisons, how much of the view is uncommitted mid-flight
     // work: a second, uncommitted-only scan. The uncommitted view's own
     // totals already are uncommitted-only, so skip it there. A failure just
-    // hides the split from the footer.
+    // hides the split from the footer. With `!workdir_dirty` the totals are a
+    // pure function of the unchanged workdir, so the previous scan's result
+    // is reused instead of rescanning.
     state.uncommitted_stats = if state.rev.contains("...") {
-        let _scan = perf::span("uncommitted_scan");
-        git::all_changes("HEAD").ok().map(|changes| {
-            changes
-                .iter()
-                .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted))
-        })
+        if !workdir_dirty && state.uncommitted_stats.is_some() {
+            state.uncommitted_stats
+        } else {
+            let _scan = perf::span("uncommitted_scan");
+            // Reuse the rev scan's dirty sets, recounted against HEAD (the
+            // committed set is HEAD→HEAD, empty by construction), instead of
+            // walking the worktree a second time. Without sets — only a
+            // direct call outside `recompute` lands here — fall back to the
+            // standalone scan.
+            let totals = |changes: &[git::ChangeInfo]| {
+                changes
+                    .iter()
+                    .fold((0, 0), |(a, d), c| (a + c.added, d + c.deleted))
+            };
+            match state.scan_sets.take() {
+                Some(sets) => git::open_repo()
+                    .ok()
+                    .and_then(|repo| git::count_and_merge(&repo, sets.into_against_head()).ok())
+                    .map(|changes| totals(&changes)),
+                None => git::all_changes("HEAD")
+                    .ok()
+                    .map(|changes| totals(&changes)),
+            }
+        }
     } else {
         None
     };
 
     // Adaptive floor: slow git or huge diff raises the floor for 10s.
-    if state.last_git_wall > SLOW_GIT_THRESHOLD || entries.len() > LARGE_DIFF_THRESHOLD {
+    if git_wall > SLOW_GIT_THRESHOLD || entries.len() > LARGE_DIFF_THRESHOLD {
         state.floor_raised_at = Some(Instant::now());
         crate::perf_evt!("debounce floor raised entries={}", entries.len());
     }
@@ -1484,7 +1426,7 @@ fn recompute_from_scan(
     };
     state.last_tree = Some(tree.clone());
 
-    if shutdown.load(Ordering::Relaxed) {
+    if io.shutdown.load(Ordering::Relaxed) {
         return;
     }
 
@@ -1493,9 +1435,9 @@ fn recompute_from_scan(
     state.last_error = None;
     let prev_diff = state.last_diff.clone();
     let prev_hl = state.last_highlight.clone();
-    send_snapshot(state, tx, tree.clone(), prev_diff, prev_hl, None, true);
+    send_snapshot(state, io, tree.clone(), prev_diff, prev_hl, None, true);
 
-    if shutdown.load(Ordering::Relaxed) {
+    if io.shutdown.load(Ordering::Relaxed) {
         return;
     }
 
@@ -1503,9 +1445,9 @@ fn recompute_from_scan(
     // snapshot with `busy = false`.
     let rev = state.rev.clone();
     let ctx = state.ctx;
-    let (diff, hl) = build_selected_diff(state, &tree, &rev, ctx, tx, shutdown);
+    let (diff, hl) = build_selected_diff(state, io, &tree, &rev, ctx);
 
-    if shutdown.load(Ordering::Relaxed) {
+    if io.shutdown.load(Ordering::Relaxed) {
         return;
     }
     state.last_diff = diff.clone();
@@ -1513,7 +1455,7 @@ fn recompute_from_scan(
     // A `build_selected_diff` failure set `state.last_error`; surface it on the
     // settled snapshot rather than dropping it behind a hard-coded `None`.
     let error = state.last_error.clone();
-    send_snapshot(state, tx, tree, diff, hl, error, false);
+    send_snapshot(state, io, tree, diff, hl, error, false);
 
     // Refresh an image preview when the selected image changed on disk: its
     // binary diff is content-identical, so nothing else in the snapshot
@@ -1522,7 +1464,7 @@ fn recompute_from_scan(
     if state.preview_active {
         if let Some(path) = state.selected_path.clone() {
             if state.last_changes.contains_key(&path) && crate::preview::is_image_path(&path) {
-                load_preview(state, &path, image_tx, tx);
+                load_preview(state, io, &path);
             }
         }
     }
@@ -1557,13 +1499,27 @@ fn empty_tree() -> Arc<Tree> {
     Arc::new(Tree::build(Vec::new()))
 }
 
-/// Send a snapshot that carries `error` but preserves the last known tree/diff.
-fn send_error_snapshot(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
+/// Send a settled snapshot whose tree and error come from the last known
+/// state, with the caller supplying the diff and highlight.
+fn send_settled_from_last(
+    state: &mut WorkerState,
+    io: &LoopIo,
+    diff: Option<Arc<Diff>>,
+    hl: Arc<HighlightLines>,
+) {
     let tree = state.last_tree.clone().unwrap_or_else(empty_tree);
-    let diff = state.last_diff.clone();
-    let hl = state.last_highlight.clone();
     let error = state.last_error.clone();
-    send_snapshot(state, tx, tree, diff, hl, error, false);
+    send_snapshot(state, io, tree, diff, hl, error, false);
+}
+
+/// Send a snapshot that carries `error` but preserves the last known tree/diff.
+fn send_error_snapshot(state: &mut WorkerState, io: &LoopIo) {
+    send_settled_from_last(
+        state,
+        io,
+        state.last_diff.clone(),
+        state.last_highlight.clone(),
+    );
 }
 
 /// Assemble and send a snapshot from the caller's tree/diff/highlight/error
@@ -1571,7 +1527,7 @@ fn send_error_snapshot(state: &mut WorkerState, tx: &Sender<ArcSnapshot>) {
 #[allow(clippy::too_many_arguments)]
 fn send_snapshot(
     state: &mut WorkerState,
-    tx: &Sender<ArcSnapshot>,
+    io: &LoopIo,
     tree: Arc<Tree>,
     diff: Option<Arc<Diff>>,
     highlight: Arc<HighlightLines>,
@@ -1584,18 +1540,17 @@ fn send_snapshot(
         state.last_sent_busy = busy;
     }
     perf::tally(Counter::SnapshotsSent);
-    let _ = tx.send(Arc::new(snap));
+    let _ = io.snapshot_tx.send(Arc::new(snap));
 }
 
 /// Parse + highlight the currently-selected file's diff, if it's in the tree.
 /// Returns `(diff, highlight)`. On any error, `(None, vec![])`.
 fn build_selected_diff(
     state: &mut WorkerState,
+    io: &LoopIo,
     tree: &Arc<Tree>,
     rev: &str,
     ctx: u32,
-    tx: &Sender<ArcSnapshot>,
-    shutdown: &AtomicBool,
 ) -> (Option<Arc<Diff>>, Arc<HighlightLines>) {
     let Some(path) = state.selected_path.clone() else {
         return (None, Arc::new(Vec::new()));
@@ -1604,20 +1559,19 @@ fn build_selected_diff(
     if !in_tree {
         return (None, Arc::new(Vec::new()));
     }
-    build_diff_for(&path, state, rev, ctx, tree, tx, shutdown)
+    build_diff_for(state, io, &path, rev, ctx, tree)
 }
 
 /// Parse one file's diff. Uses the LRU cache when hit; on miss parses fresh
 /// and caches it un-highlighted (highlighting is filled progressively via
 /// [`fill_highlight_range`] as the UI scrolls). Mutates `state.cache`.
 fn build_diff_for(
-    path: &str,
     state: &mut WorkerState,
+    io: &LoopIo,
+    path: &str,
     rev: &str,
     ctx: u32,
     tree: &Arc<Tree>,
-    tx: &Sender<ArcSnapshot>,
-    shutdown: &AtomicBool,
 ) -> (Option<Arc<Diff>>, Arc<HighlightLines>) {
     let key = (path.to_string(), ctx);
     let mut span = perf::span("diff_build");
@@ -1637,7 +1591,7 @@ fn build_diff_for(
     span.detail(format_args!("cache=miss path={path}"));
 
     let diff = if is_directory(state, path) {
-        build_directory_diff(path, state, rev, ctx, tree, tx, shutdown)
+        build_directory_diff(state, io, path, rev, ctx, tree)
     } else {
         build_single_file_diff(path, state, rev, ctx)
     };
@@ -1655,7 +1609,7 @@ fn build_diff_for(
             (Some(diff), hl)
         }
         Err(e) => {
-            if !shutdown.load(Ordering::Relaxed) {
+            if !io.shutdown.load(Ordering::Relaxed) {
                 state.last_error = Some(e.to_string());
             }
             (None, Arc::new(Vec::new()))
@@ -1698,13 +1652,12 @@ fn build_single_file_diff(
 /// header. Emits a busy snapshot every [`DIR_CHUNK`] children so the pane fills
 /// progressively; the caller sends the settled final snapshot.
 fn build_directory_diff(
-    path: &str,
     state: &mut WorkerState,
+    io: &LoopIo,
+    path: &str,
     rev: &str,
     ctx: u32,
     tree: &Arc<Tree>,
-    tx: &Sender<ArcSnapshot>,
-    shutdown: &AtomicBool,
 ) -> Result<Diff, git::GitError> {
     let prefix = format!("{path}/");
     let mut span = perf::span("dir_build");
@@ -1731,7 +1684,7 @@ fn build_directory_diff(
     let mut pending: Vec<Arc<Diff>> = Vec::with_capacity(DIR_CHUNK);
     let mut built = 0usize;
     for (p, ci) in entries {
-        if shutdown.load(Ordering::Relaxed) {
+        if io.shutdown.load(Ordering::Relaxed) {
             return Err(git::GitError::message("shutdown"));
         }
         pending.push(Arc::new(context.diff_file(&p, &ci.into_meta(), ctx)?));
@@ -1739,7 +1692,7 @@ fn build_directory_diff(
         if built.is_multiple_of(DIR_CHUNK) {
             Arc::make_mut(&mut aggregate).extend_from_children(&pending);
             pending.clear();
-            stream_directory_chunk(state, tree, path, &aggregate, tx);
+            stream_directory_chunk(state, io, tree, path, &aggregate);
         }
     }
     if !pending.is_empty() {
@@ -1754,10 +1707,10 @@ fn build_directory_diff(
 /// not copied, into the snapshot.
 fn stream_directory_chunk(
     state: &mut WorkerState,
+    io: &LoopIo,
     tree: &Arc<Tree>,
     path: &str,
     aggregate: &Arc<Diff>,
-    tx: &Sender<ArcSnapshot>,
 ) {
     if state.selected_path.as_deref() != Some(path) {
         return;
@@ -1766,7 +1719,7 @@ fn stream_directory_chunk(
     let partial = aggregate.clone();
     let hl = Arc::new(vec![None; partial.lines.len()]);
     let error = state.last_error.clone();
-    send_snapshot(state, tx, tree.clone(), Some(partial), hl, error, true);
+    send_snapshot(state, io, tree.clone(), Some(partial), hl, error, true);
 }
 
 /// Serve a `Request::Diff`: fetch the (cached or freshly-built) diff and send
@@ -1774,32 +1727,24 @@ fn stream_directory_chunk(
 /// fills in via `Request::Highlight` nudges from the UI, so a larger file's
 /// diff appears right away and colors in as it scrolls. Directory aggregates
 /// stream busy chunks from [`build_directory_diff`] before this settled send.
-fn serve_diff(
-    state: &mut WorkerState,
-    path: &str,
-    ctx: u32,
-    tx: &Sender<ArcSnapshot>,
-    shutdown: &AtomicBool,
-) {
+fn serve_diff(state: &mut WorkerState, io: &LoopIo, path: &str, ctx: u32) {
     let rev = state.rev.clone();
     let tree = state.last_tree.clone().unwrap_or_else(empty_tree);
-    let (diff, hl) = build_diff_for(path, state, &rev, ctx, &tree, tx, shutdown);
-    send_diff_snapshot(state, diff, hl, tx);
+    let (diff, hl) = build_diff_for(state, io, path, &rev, ctx, &tree);
+    send_diff_snapshot(state, io, diff, hl);
 }
 
 /// Assemble and send a settled snapshot whose only changed field vs the last
 /// full recompute is the selected diff (plus error).
 fn send_diff_snapshot(
     state: &mut WorkerState,
+    io: &LoopIo,
     diff: Option<Arc<Diff>>,
     hl: Arc<HighlightLines>,
-    tx: &Sender<ArcSnapshot>,
 ) {
     state.last_diff = diff.clone();
     state.last_highlight = hl.clone();
-    let tree = state.last_tree.clone().unwrap_or_else(empty_tree);
-    let error = state.last_error.clone();
-    send_snapshot(state, tx, tree, diff, hl, error, false);
+    send_settled_from_last(state, io, diff, hl);
 }
 
 /// Ensure a checkpoint exists at `(body / CKPT_STRIDE) * CKPT_STRIDE`, then
@@ -1856,11 +1801,11 @@ fn ensure_resume(
 /// jumps to any part of a large file color in immediately.
 fn fill_highlight_range(
     state: &mut WorkerState,
+    io: &LoopIo,
     path: &str,
     ctx: u32,
     from: usize,
     to: usize,
-    tx: &Sender<ArcSnapshot>,
 ) {
     let key = (path.to_string(), ctx);
     let mut span = perf::span("highlight_fill");
@@ -1918,7 +1863,7 @@ fn fill_highlight_range(
         None => return,
     };
     perf::tally(Counter::HighlightFills);
-    send_diff_snapshot(state, Some(diff), hl, tx);
+    send_diff_snapshot(state, io, Some(diff), hl);
 }
 
 /// Hand-rolled LRU keyed by `(path, ctx)`. `get` promotes the hit to the back;
@@ -2211,6 +2156,11 @@ mod tests {
         state.last_recompute = Duration::from_secs(60);
         state.floor_raised_at = Some(Instant::now());
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         assert_eq!(current_floor(&state, Instant::now()), ADAPTIVE_FLOOR_MAX);
 
         let quit = handle_request(
@@ -2218,9 +2168,7 @@ mod tests {
                 rev: "also-no-such-base...HEAD".into(),
             },
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             &mut test_watch(),
         );
 
@@ -2267,8 +2215,15 @@ mod tests {
         );
         state.selected_path = Some("x.rs".into());
         state.ctx = 3;
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &snap_tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
 
-        fill_highlight_range(&mut state, "x.rs", 3, 10, 20, &snap_tx);
+        fill_highlight_range(&mut state, &io, "x.rs", 3, 10, 20);
 
         let entry = state.cache.get(&key).unwrap();
         assert!(entry.hl.iter().take(10).all(|e| e.is_none()));
@@ -2341,10 +2296,15 @@ mod tests {
         );
         state.last_error = Some("stale".into());
         let shutdown = AtomicBool::new(false);
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         let tree = Arc::new(Tree::build(Vec::new()));
 
-        let (diff, _hl) =
-            build_diff_for("x.rs", &mut state, "main...HEAD", 3, &tree, &tx, &shutdown);
+        let (diff, _hl) = build_diff_for(&mut state, &io, "x.rs", "main...HEAD", 3, &tree);
 
         assert!(diff.is_some());
         assert!(
@@ -2529,15 +2489,13 @@ mod tests {
         state.selected_path = Some("a".into());
         state.ctx = 3;
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &snap_tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         for survivor in out {
-            handle_request(
-                survivor,
-                &mut state,
-                &snap_tx,
-                &image_tx,
-                &shutdown,
-                &mut test_watch(),
-            );
+            handle_request(survivor, &mut state, &io, &mut test_watch());
         }
         // Executed in seq order, so the image request was accepted (its
         // `preview_active` side effect ran) rather than stale-dropped.
@@ -2698,16 +2656,14 @@ mod tests {
             new_cached_diff(Arc::new(sample_diff(3)), None),
         );
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         let mut watch = test_watch();
 
-        let quit = handle_request(
-            switch_req("/repo"),
-            &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
-            &mut watch,
-        );
+        let quit = handle_request(switch_req("/repo"), &mut state, &io, &mut watch);
 
         assert!(!quit);
         assert!(
@@ -2748,14 +2704,17 @@ mod tests {
         );
         state.last_tree = Some(Arc::new(Tree::build(vec![('M', "a.rs".to_string())])));
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         let mut watch = test_watch();
 
         let quit = handle_request(
             switch_req(dir.path().to_str().unwrap()),
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             &mut watch,
         );
 
@@ -2809,14 +2768,17 @@ mod tests {
             new_cached_diff(Arc::new(sample_diff(3)), None),
         );
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         let mut watch = test_watch();
 
         let quit = handle_request(
             switch_req(b_dir.path().to_str().unwrap()),
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             &mut watch,
         );
         assert!(!quit);
@@ -2837,8 +2799,7 @@ mod tests {
 
     #[test]
     fn switch_worktree_recomputes_from_new_root() {
-        // End-to-end: depends on `git::set_repo_root`, which the git-layer
-        // agent implements in parallel (the todo!() stub panics until then).
+        // End-to-end: depends on `git::set_repo_root`.
         // `set_repo_root` mutates the process-global root, so serialize
         // against the git module's own root tests and restore the cwd
         // fallback on drop (cargo runs tests in parallel threads).
@@ -2872,14 +2833,17 @@ mod tests {
         // the switch.
         state.floor_raised_at = Some(Instant::now());
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         let mut watch = test_watch();
 
         let quit = handle_request(
             switch_req(wt.to_str().unwrap()),
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             &mut watch,
         );
         assert!(!quit);
@@ -2922,9 +2886,7 @@ mod tests {
         let quit = handle_request(
             diff_req("wt-only.txt", 1),
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             &mut test_watch(),
         );
         assert!(!quit);
@@ -2982,14 +2944,18 @@ mod tests {
             git::BranchState::default(),
         );
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         let entries = vec![('M', "a.rs".to_string())];
 
         recompute_from_scan(
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             false,
+            true,
             entries,
             HashMap::new(),
             Instant::now(),
@@ -3023,14 +2989,18 @@ mod tests {
             .last_changes
             .insert("a.rs".into(), change_info("a.rs"));
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
         let entries = vec![('M', "a.rs".to_string())];
 
         recompute_from_scan(
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             false,
+            true,
             entries,
             HashMap::new(),
             Instant::now(),
@@ -3065,13 +3035,17 @@ mod tests {
             ..Default::default()
         };
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
 
         recompute_from_scan(
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
             false,
+            true,
             Vec::new(),
             HashMap::new(),
             Instant::now(),
@@ -3102,12 +3076,16 @@ mod tests {
             ..Default::default()
         };
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
 
         recompute_from_scan(
             &mut state,
-            &tx,
-            &image_tx,
-            &shutdown,
+            &io,
+            true,
             true,
             Vec::new(),
             HashMap::new(),
@@ -3132,11 +3110,18 @@ mod tests {
         state.selected_path = Some("src".into());
         let tree = Arc::new(Tree::build(vec![('M', "src/a.rs".to_string())]));
         state.last_tree = Some(tree.clone());
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
 
         let mut aggregate = Arc::new(Diff::directory("src"));
         Arc::make_mut(&mut aggregate)
             .extend_from_children(&[Arc::new(sample_diff(3)), Arc::new(sample_diff(3))]);
-        stream_directory_chunk(&mut state, &tree, "src", &aggregate, &tx);
+        stream_directory_chunk(&mut state, &io, &tree, "src", &aggregate);
 
         let snap = rx.recv().unwrap();
         assert!(snap.busy);
@@ -3184,9 +3169,16 @@ mod tests {
         );
         state.selected_path = Some("x.rs".into());
         state.ctx = 3;
+        let (image_tx, _image_rx) = crossbeam_channel::bounded::<PreviewImage>(1);
+        let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &snap_tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
 
-        fill_highlight_range(&mut state, "x.rs", 3, 0, 10, &snap_tx);
-        fill_highlight_range(&mut state, "x.rs", 3, 10, 20, &snap_tx);
+        fill_highlight_range(&mut state, &io, "x.rs", 3, 0, 10);
+        fill_highlight_range(&mut state, &io, "x.rs", 3, 10, 20);
 
         let a = snap_rx.recv().unwrap();
         let b = snap_rx.recv().unwrap();
@@ -3215,15 +3207,13 @@ mod tests {
         state.selected_path = Some("x.rs".into());
         state.ctx = 3;
         let shutdown = AtomicBool::new(false);
+        let io = LoopIo {
+            snapshot_tx: &snap_tx,
+            image_tx: &image_tx,
+            shutdown: &shutdown,
+        };
 
-        let quit = handle_request(
-            hl_req("x.rs", 1),
-            &mut state,
-            &snap_tx,
-            &image_tx,
-            &shutdown,
-            &mut test_watch(),
-        );
+        let quit = handle_request(hl_req("x.rs", 1), &mut state, &io, &mut test_watch());
 
         assert!(!quit);
         assert!(

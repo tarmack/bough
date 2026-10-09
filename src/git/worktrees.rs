@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use crate::git::{commit_time, open_repo_at, staged_changes, unstaged_changes};
 
+use super::GitError;
+
 /// One row in the worktree picker and one resolution candidate for
 /// `--worktree`. The main checkout is a synthetic entry (`main == true`) so
 /// the picker always offers "home"; linked worktrees carry their id (the
@@ -53,10 +55,10 @@ const MAX_LINKED_WORKTREES: usize = 128;
 /// showing a partial list. Entry-level failures (one unreadable worktree)
 /// still degrade to that entry being `missing`/skipped, never blanking the
 /// list.
-pub fn worktrees_with_error() -> (Vec<WorktreeInfo>, Option<String>) {
+pub fn worktrees_with_error() -> (Vec<WorktreeInfo>, Option<GitError>) {
     match super::open_repo() {
         Ok(repo) => worktrees_in_with_error(&repo),
-        Err(e) => (Vec::new(), Some(e.to_string())),
+        Err(e) => (Vec::new(), Some(e)),
     }
 }
 
@@ -72,7 +74,7 @@ pub fn worktrees() -> Vec<WorktreeInfo> {
 /// outright (the main entry is still returned) or the list was truncated at
 /// [`MAX_LINKED_WORKTREES`]. Per-entry failures degrade that entry to
 /// `missing`/skipped, never blanking the list.
-pub fn worktrees_in_with_error(repo: &gix::Repository) -> (Vec<WorktreeInfo>, Option<String>) {
+pub fn worktrees_in_with_error(repo: &gix::Repository) -> (Vec<WorktreeInfo>, Option<GitError>) {
     let mut out = Vec::new();
 
     // Synthetic main entry: the workdir of the repo owning the main
@@ -103,7 +105,7 @@ pub fn worktrees_in_with_error(repo: &gix::Repository) -> (Vec<WorktreeInfo>, Op
         Err(e) => {
             return (
                 sort_worktrees(out),
-                Some(format!("cannot list worktrees: {e}")),
+                Some(GitError::message(format!("cannot list worktrees: {e}"))),
             );
         }
     };
@@ -112,9 +114,9 @@ pub fn worktrees_in_with_error(repo: &gix::Repository) -> (Vec<WorktreeInfo>, Op
         if listed == MAX_LINKED_WORKTREES {
             return (
                 sort_worktrees(out),
-                Some(format!(
+                Some(GitError::message(format!(
                     "worktree list capped at {MAX_LINKED_WORKTREES} entries"
-                )),
+                ))),
             );
         }
         // A proxy whose gitdir file is unreadable has no recoverable path.
@@ -639,9 +641,10 @@ mod tests {
         );
         assert_eq!(wts.iter().filter(|w| w.main).count(), 1);
         assert!(
-            err.as_deref()
-                .is_some_and(|e| e.contains(&format!("capped at {MAX_LINKED_WORKTREES} entries"))),
-            "truncation must surface an error, got {err:?}"
+            err.is_some_and(|e| e
+                .to_string()
+                .contains(&format!("capped at {MAX_LINKED_WORKTREES} entries"))),
+            "truncation must surface an error"
         );
     }
 

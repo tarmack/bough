@@ -18,17 +18,13 @@ use crate::kitty;
 
 /// True when `path`'s extension names a decodable image format.
 pub fn is_image_path(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let Some((stem, ext)) = name.rsplit_once('.') else {
-        return false;
-    };
-    if stem.is_empty() {
-        return false;
+    match crate::highlight::path_ext(path) {
+        Some(ext) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+        ),
+        None => false,
     }
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-    )
 }
 
 /// A decoded image ready for the terminal, with its re-encoded PNG bytes and
@@ -52,6 +48,11 @@ pub struct Preview {
     placed: Option<(u32, String, Rect, u64)>,
     next_id: u32,
     generation: u64,
+    /// Latched `place` failure for `failed_path`: a broken stdout (or similar)
+    /// fails every frame, so stop re-encoding that image until the selection
+    /// target changes.
+    failed: bool,
+    failed_path: Option<String>,
 }
 
 impl Preview {
@@ -64,6 +65,8 @@ impl Preview {
             placed: None,
             next_id: 0,
             generation: 0,
+            failed: false,
+            failed_path: None,
         }
     }
 
@@ -84,12 +87,6 @@ impl Preview {
             self.generation = self.generation.wrapping_add(1);
             self.current = Some(img);
         }
-    }
-}
-
-impl Default for Preview {
-    fn default() -> Self {
-        Preview::new()
     }
 }
 
@@ -122,10 +119,11 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         app.preview.area = None;
         return;
     }
-    let blank = " ".repeat(body.width as usize);
+    let buf = f.buffer_mut();
     for y in body.y..body.y + body.height {
-        f.buffer_mut()
-            .set_string(body.x, y, blank.clone(), Style::reset());
+        for x in body.x..body.x + body.width {
+            buf[(x, y)].set_char(' ').set_style(Style::reset());
+        }
     }
     app.preview.area = Some(body);
 }
@@ -135,6 +133,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 /// changed (a resize changes the rect; a re-decode bumps the generation) and
 /// deletes when the image goes away.
 pub fn sync(w: &mut impl Write, preview: &mut Preview) -> io::Result<()> {
+    // A latched failure belongs to one selection target; a new target retries
+    // from scratch instead of inheriting the old failure.
+    if preview.failed && preview.failed_path.as_deref() != preview.requested.as_deref() {
+        preview.failed = false;
+        preview.failed_path = None;
+    }
     if let (Some(img), Some(area)) = (preview.current.as_ref(), preview.area) {
         if let Some((_, path, rect, gen)) = preview.placed.as_ref() {
             if path == &img.path && *rect == area && *gen == preview.generation {
@@ -147,6 +151,11 @@ pub fn sync(w: &mut impl Write, preview: &mut Preview) -> io::Result<()> {
                 let _ = w.flush();
                 return Err(e);
             }
+        }
+        if preview.failed && preview.failed_path.as_deref() == Some(img.path.as_str()) {
+            // This image already failed: skip the re-encode instead of failing
+            // every frame. Still flush anything written above (e.g. a delete).
+            return w.flush();
         }
         let mut id = preview.next_id.wrapping_add(1);
         if id == 0 {
@@ -162,6 +171,8 @@ pub fn sync(w: &mut impl Write, preview: &mut Preview) -> io::Result<()> {
             area,
             kitty::cell_size(),
         ) {
+            preview.failed = true;
+            preview.failed_path = Some(img.path.clone());
             preview.placed = None;
             let _ = w.flush();
             return Err(e);
@@ -355,5 +366,40 @@ mod tests {
         let err = sync(&mut FailingWriter, &mut p).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(p.placed.is_none());
+    }
+
+    #[test]
+    fn sync_latches_persistent_place_failure() {
+        let mut p = Preview::new();
+        p.enabled = true;
+        p.requested = Some("x.png".into());
+        p.current = Some(PreviewImage {
+            path: "x.png".into(),
+            png: b"hello".to_vec(),
+            width: 4,
+            height: 3,
+        });
+        p.area = Some(Rect::new(0, 0, 10, 10));
+
+        // First attempt fails on `place` and latches the failure.
+        assert!(sync(&mut FailingWriter, &mut p).is_err());
+        assert!(p.failed);
+        assert_eq!(p.failed_path.as_deref(), Some("x.png"));
+        assert!(p.placed.is_none());
+
+        // Same image + area: the latch skips the re-encode and reports success.
+        assert!(sync(&mut FailingWriter, &mut p).is_ok());
+        assert!(p.placed.is_none());
+
+        // A changed selection target clears the latch and retries (fails again).
+        p.requested = Some("y.png".into());
+        p.current = Some(PreviewImage {
+            path: "y.png".into(),
+            png: b"world".to_vec(),
+            width: 4,
+            height: 3,
+        });
+        assert!(sync(&mut FailingWriter, &mut p).is_err());
+        assert_eq!(p.failed_path.as_deref(), Some("y.png"));
     }
 }

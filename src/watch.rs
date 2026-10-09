@@ -15,8 +15,9 @@
 //!
 //! When `notify` init or its recursive `watch()` fails (unsupported
 //! filesystem, watch-table exhaustion), the watcher degrades to a workdir poll
-//! and flips the shared `poll_mode_flag()` the UI reads, so the footer hints
-//! at degradation the moment it happens rather than at spawn time.
+//! and flips the caller-shared poll-mode flag (the `Arc` passed into
+//! `start_with_flag`, of which the worker/UI already hold a clone), so the
+//! footer hints at degradation the moment it happens rather than at spawn time.
 //! The poll walks workdir metadata (path/mtime/size, `.git` skipped,
 //! git-ignored directories pruned) and emits `WorkdirChanged` only when an
 //! entry appeared, disappeared, or changed, so an idle repository costs no
@@ -104,10 +105,6 @@ const PENDING_CAP: usize = 4096;
 /// a bounded time for the thread to finish.
 pub struct Watcher {
     rx: Receiver<WorkerEvent>,
-    /// Read only through `poll_mode_flag` (tests); the field must stay on the
-    /// struct so the watch thread can flip the caller-shared Arc.
-    #[allow(dead_code)]
-    poll_mode: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     /// Completion signal from the watch thread, so `drop` can tell a finished
@@ -153,7 +150,6 @@ impl Watcher {
 
         Ok(Watcher {
             rx,
-            poll_mode,
             shutdown,
             handle: Some(handle),
             done_rx,
@@ -163,13 +159,6 @@ impl Watcher {
     /// Borrow the event receiver. The worker drains this.
     pub fn receiver(&self) -> &Receiver<WorkerEvent> {
         &self.rx
-    }
-
-    /// The shared degradation flag. The worker/UI clone this `Arc` and read it
-    /// every frame, so they see a mid-run degradation the moment it happens.
-    #[allow(dead_code)]
-    pub fn poll_mode_flag(&self) -> Arc<AtomicBool> {
-        self.poll_mode.clone()
     }
 }
 
@@ -260,37 +249,11 @@ fn run_notify_loop(
     let mut last_beat = Instant::now();
 
     loop {
-        if last_beat.elapsed() >= Duration::from_secs(1) {
-            perf::beat();
-            last_beat = Instant::now();
-        }
-        if io.shutdown.load(Ordering::Relaxed) {
+        if !watch_tick(io, &mut last_beat) {
             break;
         }
-        if refs_pending {
-            match io.out_tx.try_send(WorkerEvent::RefsChanged) {
-                Ok(()) => {
-                    perf::tally(Counter::WatchRefs);
-                    refs_pending = false;
-                }
-                Err(TrySendError::Full(_)) => {
-                    crate::perf_evt!("watch backpressure kind=refs");
-                }
-                Err(TrySendError::Disconnected(_)) => return,
-            }
-        }
-        if !pending.is_empty() {
-            let ev = WorkerEvent::WorkdirChanged(pending.take());
-            match io.out_tx.try_send(ev) {
-                Ok(()) => perf::tally(Counter::WatchWorkdir),
-                Err(TrySendError::Full(ev)) => {
-                    crate::perf_evt!("watch backpressure kind=workdir");
-                    if let WorkerEvent::WorkdirChanged(p) = ev {
-                        pending.restore(p);
-                    }
-                }
-                Err(TrySendError::Disconnected(_)) => return,
-            }
+        if !flush_pending(io, &mut pending, &mut refs_pending) {
+            return;
         }
         match raw_rx.recv_timeout(SHUTDOWN_TICK) {
             Ok(Ok(event)) => {
@@ -338,11 +301,7 @@ fn is_read_access(kind: &EventKind) -> bool {
 fn absorb_event(root: &Path, paths: &[PathBuf], pending: &mut PendingPaths, refs: &mut bool) {
     for path in paths {
         let rel = path.strip_prefix(root).unwrap_or(path);
-        match classify(rel) {
-            Some(WorkerEvent::WorkdirChanged(p)) => pending.push_all(p),
-            Some(WorkerEvent::RefsChanged) => *refs = true,
-            None => {}
-        }
+        classify_into(rel, pending, refs);
     }
 }
 
@@ -430,37 +389,11 @@ fn run_poll_loop(io: &WatchIo) {
     let mut refs_pending = false;
 
     loop {
-        if last_beat.elapsed() >= Duration::from_secs(1) {
-            perf::beat();
-            last_beat = Instant::now();
-        }
-        if io.shutdown.load(Ordering::Relaxed) {
+        if !watch_tick(io, &mut last_beat) {
             break;
         }
-        if refs_pending {
-            match io.out_tx.try_send(WorkerEvent::RefsChanged) {
-                Ok(()) => {
-                    perf::tally(Counter::WatchRefs);
-                    refs_pending = false;
-                }
-                Err(TrySendError::Full(_)) => {
-                    crate::perf_evt!("watch backpressure kind=refs");
-                }
-                Err(TrySendError::Disconnected(_)) => return,
-            }
-        }
-        if !pending.is_empty() {
-            let ev = WorkerEvent::WorkdirChanged(pending.take());
-            match io.out_tx.try_send(ev) {
-                Ok(()) => perf::tally(Counter::WatchWorkdir),
-                Err(TrySendError::Full(ev)) => {
-                    crate::perf_evt!("watch backpressure kind=workdir");
-                    if let WorkerEvent::WorkdirChanged(p) = ev {
-                        pending.restore(p);
-                    }
-                }
-                Err(TrySendError::Disconnected(_)) => return,
-            }
+        if !flush_pending(io, &mut pending, &mut refs_pending) {
+            return;
         }
         thread::sleep(SHUTDOWN_TICK);
 
@@ -709,6 +642,50 @@ fn signature_diff(prev: &Signature, next: &Signature) -> Vec<PathBuf> {
     changed
 }
 
+/// Shared preamble of both watch loops: beat the perf counter at most once per
+/// second, then check shutdown. Returns false when shutdown is set; the caller
+/// breaks. The beat runs first, so the exiting pass still ticks it.
+fn watch_tick(io: &WatchIo, last_beat: &mut Instant) -> bool {
+    if last_beat.elapsed() >= Duration::from_secs(1) {
+        perf::beat();
+        *last_beat = Instant::now();
+    }
+    !io.shutdown.load(Ordering::Relaxed)
+}
+
+/// Shared preamble of both watch loops: flush the latched refs event and the
+/// retained workdir batch with non-blocking sends, restoring a full batch for
+/// the next pass. Returns false when the worker hung up (`Disconnected`) —
+/// watching is over, and the caller returns.
+fn flush_pending(io: &WatchIo, pending: &mut PendingPaths, refs_pending: &mut bool) -> bool {
+    if *refs_pending {
+        match io.out_tx.try_send(WorkerEvent::RefsChanged) {
+            Ok(()) => {
+                perf::tally(Counter::WatchRefs);
+                *refs_pending = false;
+            }
+            Err(TrySendError::Full(_)) => {
+                crate::perf_evt!("watch backpressure kind=refs");
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+    if !pending.is_empty() {
+        let ev = WorkerEvent::WorkdirChanged(pending.take());
+        match io.out_tx.try_send(ev) {
+            Ok(()) => perf::tally(Counter::WatchWorkdir),
+            Err(TrySendError::Full(ev)) => {
+                crate::perf_evt!("watch backpressure kind=workdir");
+                if let WorkerEvent::WorkdirChanged(p) = ev {
+                    pending.restore(p);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+    true
+}
+
 /// Backstop ref poll shared by both loops: on the cadence gated by
 /// `last_poll`, compare the probed ref files and latch `refs_pending` when any
 /// moved. The caller sends (non-blocking) on its next pass, so a stalled worker
@@ -813,63 +790,79 @@ fn mtime_changed(prev: Option<SystemTime>, cur: Option<SystemTime>) -> bool {
     prev != cur
 }
 
-/// Classify a path (relative to the repo root) into a `WorkerEvent`, or
-/// `None` to ignore. `.git/HEAD`, `.git/packed-refs`, and anything under
-/// `.git/refs/` are `RefsChanged` (any ref movement triggers a rescan, so a
-/// freshly picked base stays live). Any path containing a `.git` component —
-/// including a nested/submodule `.git` — is ignored rather than treated as a
-/// workdir change; everything else is `WorkdirChanged` carrying the path.
-fn classify(rel: &Path) -> Option<WorkerEvent> {
-    // Normalise separators so the string comparisons work on Windows too.
-    let s = rel.to_string_lossy().replace('\\', "/");
-    if s == ".git/HEAD" || s == ".git/packed-refs" || s.starts_with(".git/refs/") {
-        return Some(WorkerEvent::RefsChanged);
+/// Classify a path (relative to the repo root) into the pending workdir batch
+/// and the refs flag. `.git/HEAD`, `.git/packed-refs`, and anything under
+/// `.git/refs/` set `refs` (any ref movement triggers a rescan, so a freshly
+/// picked base stays live). Any path containing a `.git` component — including
+/// a nested/submodule `.git` — is ignored rather than treated as a workdir
+/// change; everything else is accumulated as a workdir path. Components are
+/// compared directly, so no string is built and the platform separator is
+/// handled by `Path` itself.
+fn classify_into(rel: &Path, pending: &mut PendingPaths, refs: &mut bool) {
+    let git = std::ffi::OsStr::new(".git");
+    let mut comps = rel.components();
+    let (first, second, third) = (comps.next(), comps.next(), comps.next());
+    let is_ref = match (first, second, third) {
+        (Some(dir), Some(entry), _) if dir.as_os_str() == git => {
+            let name = entry.as_os_str();
+            if name == std::ffi::OsStr::new("HEAD") || name == std::ffi::OsStr::new("packed-refs") {
+                third.is_none()
+            } else {
+                name == std::ffi::OsStr::new("refs") && third.is_some()
+            }
+        }
+        _ => false,
+    };
+    if is_ref {
+        *refs = true;
+        return;
     }
-    if rel
-        .components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
-    {
-        return None;
+    if rel.components().any(|c| c.as_os_str() == git) {
+        return;
     }
-    Some(WorkerEvent::WorkdirChanged(vec![rel.to_path_buf()]))
+    pending.push_all(std::iter::once(rel.to_path_buf()));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Drive `classify_into` with fresh pending state; returns the pending
+    /// batch and the refs latch.
+    fn classify(rel: &Path) -> (PendingPaths, bool) {
+        let mut pending = PendingPaths::default();
+        let mut refs = false;
+        classify_into(rel, &mut pending, &mut refs);
+        (pending, refs)
+    }
+
     #[test]
     fn classify_head_is_refs_changed() {
-        assert_eq!(
-            classify(Path::new(".git/HEAD")),
-            Some(WorkerEvent::RefsChanged)
-        );
+        let (pending, refs) = classify(Path::new(".git/HEAD"));
+        assert!(refs);
+        assert!(pending.paths.is_empty());
     }
 
     #[test]
     fn classify_packed_refs_is_refs_changed() {
-        assert_eq!(
-            classify(Path::new(".git/packed-refs")),
-            Some(WorkerEvent::RefsChanged)
-        );
+        let (pending, refs) = classify(Path::new(".git/packed-refs"));
+        assert!(refs);
+        assert!(pending.paths.is_empty());
     }
 
     #[test]
     fn classify_any_head_ref_is_refs_changed() {
         // Any ref movement (not just the configured base) rescans, so a picked
         // branch stays live.
-        assert_eq!(
-            classify(Path::new(".git/refs/heads/main")),
-            Some(WorkerEvent::RefsChanged)
-        );
-        assert_eq!(
-            classify(Path::new(".git/refs/heads/feature/x")),
-            Some(WorkerEvent::RefsChanged)
-        );
-        assert_eq!(
-            classify(Path::new(".git/refs/tags/v1")),
-            Some(WorkerEvent::RefsChanged)
-        );
+        let (pending, refs) = classify(Path::new(".git/refs/heads/main"));
+        assert!(refs);
+        assert!(pending.paths.is_empty());
+        let (pending, refs) = classify(Path::new(".git/refs/heads/feature/x"));
+        assert!(refs);
+        assert!(pending.paths.is_empty());
+        let (pending, refs) = classify(Path::new(".git/refs/tags/v1"));
+        assert!(refs);
+        assert!(pending.paths.is_empty());
     }
 
     #[test]
@@ -908,30 +901,25 @@ mod tests {
 
     #[test]
     fn classify_other_git_internals_ignored() {
-        assert_eq!(classify(Path::new(".git/index")), None);
-        assert_eq!(classify(Path::new(".git/objects/xx/yyyy")), None);
+        let (pending, refs) = classify(Path::new(".git/index"));
+        assert!(!refs);
+        assert!(pending.paths.is_empty());
+        let (pending, refs) = classify(Path::new(".git/objects/xx/yyyy"));
+        assert!(!refs);
+        assert!(pending.paths.is_empty());
     }
 
     #[test]
     fn classify_workdir_paths_carry_their_path() {
-        assert_eq!(
-            classify(Path::new("src/foo.rs")),
-            Some(WorkerEvent::WorkdirChanged(vec![PathBuf::from(
-                "src/foo.rs"
-            )]))
-        );
-        assert_eq!(
-            classify(Path::new("Cargo.toml")),
-            Some(WorkerEvent::WorkdirChanged(vec![PathBuf::from(
-                "Cargo.toml"
-            )]))
-        );
-        assert_eq!(
-            classify(Path::new("a/b/c/d.txt")),
-            Some(WorkerEvent::WorkdirChanged(vec![PathBuf::from(
-                "a/b/c/d.txt"
-            )]))
-        );
+        let (pending, refs) = classify(Path::new("src/foo.rs"));
+        assert!(!refs);
+        assert_eq!(pending.paths, vec![PathBuf::from("src/foo.rs")]);
+        let (pending, refs) = classify(Path::new("Cargo.toml"));
+        assert!(!refs);
+        assert_eq!(pending.paths, vec![PathBuf::from("Cargo.toml")]);
+        let (pending, refs) = classify(Path::new("a/b/c/d.txt"));
+        assert!(!refs);
+        assert_eq!(pending.paths, vec![PathBuf::from("a/b/c/d.txt")]);
     }
 
     #[test]
@@ -1073,8 +1061,12 @@ mod tests {
     #[test]
     fn classify_nested_git_is_not_workdir() {
         // A submodule's `.git` internals must not surface as workdir changes.
-        assert_eq!(classify(Path::new("sub/.git/HEAD")), None);
-        assert_eq!(classify(Path::new("sub/.git/index")), None);
+        let (pending, refs) = classify(Path::new("sub/.git/HEAD"));
+        assert!(!refs);
+        assert!(pending.paths.is_empty());
+        let (pending, refs) = classify(Path::new("sub/.git/index"));
+        assert!(!refs);
+        assert!(pending.paths.is_empty());
     }
 
     #[test]
@@ -1383,28 +1375,11 @@ mod tests {
     }
 
     #[test]
-    fn poll_mode_flag_is_shared_with_the_watcher() {
-        let dir = tempfile::tempdir().unwrap();
-        let watcher =
-            Watcher::start_with_flag(dir.path().to_path_buf(), Arc::new(AtomicBool::new(false)))
-                .unwrap();
-        let flag = watcher.poll_mode_flag();
-        // A store through one clone must be visible through another: the UI
-        // holds the same allocation the watcher flips on degradation.
-        flag.store(true, Ordering::Relaxed);
-        assert!(watcher.poll_mode_flag().load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn start_with_flag_keeps_caller_flag_identity_and_resets_it() {
+    fn start_with_flag_resets_caller_flag() {
         let dir = tempfile::tempdir().unwrap();
         let flag = Arc::new(AtomicBool::new(true));
-        let watcher = Watcher::start_with_flag(dir.path().to_path_buf(), flag.clone()).unwrap();
+        let _watcher = Watcher::start_with_flag(dir.path().to_path_buf(), flag.clone()).unwrap();
 
-        // The watcher must flip the caller's exact Arc, not a fresh one:
-        // the worker re-arms with one process-lifetime flag the UI already
-        // holds a clone of.
-        assert!(Arc::ptr_eq(&watcher.poll_mode_flag(), &flag));
         // A new watcher starts un-degraded, even when the shared flag still
         // reads true from a previous root's degradation.
         assert!(!flag.load(Ordering::Relaxed));

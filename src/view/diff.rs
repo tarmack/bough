@@ -10,7 +10,7 @@ use crate::diff::{
     Diff, DiffLine, FileHeader, FileStatus, HunkMeta, LfsInfo, LineKind, SectionKind, WordRun,
 };
 use crate::highlight::TokenOwned;
-use crate::text::{elide, max_scroll_for, render_centered};
+use crate::text::{add_del_spans, elide, render_centered, spans_width};
 use crate::theme;
 use crate::view::tree::file_icon;
 
@@ -28,7 +28,7 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
         render_centered(f, area, "select a file to preview its diff", style);
         return;
     }
-    let Some(diff) = app.snapshot.selected_diff.as_ref() else {
+    let Some(diff) = app.snapshot.selected_diff.clone() else {
         // No diff yet and no recorded error: the snapshot is still loading, so
         // render a neutral placeholder rather than mislabel it as a failure.
         let Some(err) = app.diff_error() else {
@@ -40,6 +40,7 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
         f.buffer_mut().set_line(area.x, area.y, &line, area.width);
         return;
     };
+    let diff = &diff;
 
     let multi = diff.files.len() > 1;
     let has_rename = !multi && diff.header.old_path.is_some();
@@ -56,10 +57,7 @@ pub fn render_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let headers = app.header_positions();
     // The app-side sticky count and this renderer share `sticky_pair_capped`,
     // so a single clamp against it is exact (no render-time reconciliation).
-    let max_scroll = max_scroll_for(visible.len(), body_height as usize, app.sticky_row_count());
-    if app.diff_scroll > max_scroll {
-        app.diff_scroll = max_scroll;
-    }
+    app.clamp_diff_scroll();
     let (file_sticky, hunk_sticky, flow_height) =
         sticky_headers(&visible, &headers, app.diff_scroll, body_height);
     // Pinned sticky lines, for click-row mapping.
@@ -221,53 +219,51 @@ fn emit_visible_rows(
     y
 }
 
-/// Locked header for a multi-file (folder) diff: `<path>  N files` with the
-/// aggregate diffstat right-aligned.
-fn build_summary_header(diff: &Diff, width: usize) -> Vec<Span<'static>> {
-    // The folder's icon tab in the tree's dark directory tint, then the path
-    // and file count.
-    let mut left = icon_chip(
-        file_icon(&diff.header.path),
-        theme::DIR_FG,
-        Color::DarkGray,
-        0,
-    );
+/// Shared scaffolding for the locked-header rows: an icon chip in
+/// `icon_color`, a plain space, the `path` in white, the builder's
+/// `middle` spans, then a right-aligned `right` block — all over the
+/// DarkGray rail. Each builder keeps only its distinct middle spans.
+fn header_shell(
+    path: &str,
+    icon_color: Color,
+    middle: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let mut left = icon_chip(file_icon(path), icon_color, Color::DarkGray, 0);
     left.push(Span::styled(" ", Style::default()));
     left.push(Span::styled(
-        diff.header.path.clone(),
+        path.to_string(),
         Style::default().fg(Color::White),
     ));
-    left.push(Span::raw("  "));
-    left.push(Span::styled(
-        format!("{} files", diff.files.len()),
-        Style::default().fg(Color::Gray),
-    ));
-    let right = stat_spans(diff.header.added, diff.header.deleted, false, None);
-    let right_w: usize = right.iter().map(|s| s.width()).sum();
+    left.extend(middle);
+    let right_w = spans_width(&right);
     right_align(&mut left, right_w, width);
     left.extend(right);
     left
 }
 
+/// Locked header for a multi-file (folder) diff: `<path>  N files` with the
+/// aggregate diffstat right-aligned.
+fn build_summary_header(diff: &Diff, width: usize) -> Vec<Span<'static>> {
+    let middle = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{} files", diff.files.len()),
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+    let right = stat_spans(diff.header.added, diff.header.deleted, false, None);
+    header_shell(&diff.header.path, theme::DIR_FG, middle, right, width)
+}
+
 /// Locked header line 1: `<path>  +A -D  <status>  [cur/total]`, plus a
 /// right-aligned mode change (`old → new`, octal) when the modes differ.
 fn build_header_line(header: &FileHeader, current_hunk: usize, width: usize) -> Vec<Span<'static>> {
-    // Left content: the file's icon tab in its status tint, then the path
-    // and hunk position.
-    let mut left = icon_chip(
-        file_icon(&header.path),
-        theme::status_color(header.status),
-        Color::DarkGray,
-        0,
-    );
-    left.push(Span::styled(" ", Style::default()));
-    left.push(Span::styled(
-        header.path.clone(),
-        Style::default().fg(Color::White),
-    ));
+    let mut middle: Vec<Span<'static>> = Vec::new();
     if !header.hunks.is_empty() {
-        left.push(Span::raw("  "));
-        left.push(Span::styled(
+        middle.push(Span::raw("  "));
+        middle.push(Span::styled(
             format!("[{current_hunk}/{}]", header.hunks.len()),
             Style::default().fg(Color::Gray),
         ));
@@ -290,12 +286,13 @@ fn build_header_line(header: &FileHeader, current_hunk: usize, width: usize) -> 
         None,
     ));
 
-    let right_w: usize = right.iter().map(|s| s.width()).sum();
-    // Right-align the block when there is room (at least one space of pad);
-    // otherwise append it and let elide truncate the overflow.
-    right_align(&mut left, right_w, width);
-    left.extend(right);
-    left
+    header_shell(
+        &header.path,
+        theme::status_color(header.status),
+        middle,
+        right,
+        width,
+    )
 }
 
 /// Locked header line 2: rename `old → new  R <percent>%`.
@@ -337,18 +334,7 @@ fn stat_spans(added: usize, deleted: usize, binary: bool, bg: Option<Color>) -> 
         };
         return vec![Span::styled("binary", style)];
     }
-    let add_style = match bg {
-        Some(c) => Style::default().fg(Color::Green).bg(c),
-        None => Style::default().fg(Color::Green),
-    };
-    let del_style = match bg {
-        Some(c) => Style::default().fg(Color::Red).bg(c),
-        None => Style::default().fg(Color::Red),
-    };
-    vec![
-        Span::styled(format!("+{added}"), add_style),
-        Span::styled(format!(" -{deleted}"), del_style),
-    ]
+    add_del_spans(added, deleted, bg, false)
 }
 
 /// The muted one-line note for an LFS object: `LFS object · 12.4 MB · <oid>`,
@@ -389,7 +375,7 @@ fn human_size(bytes: u64) -> String {
 /// pad when there is at least one space of room, otherwise leave `left` alone
 /// and let the caller's elide truncate the overflow.
 fn right_align(left: &mut Vec<Span<'static>>, right_w: usize, width: usize) {
-    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let left_w = spans_width(left);
     if width >= left_w + 1 + right_w {
         left.push(Span::raw(" ".repeat(width - left_w - right_w)));
     }
@@ -625,7 +611,7 @@ fn draw_section_header(
     content: &HeaderContent<'_>,
 ) -> u16 {
     let stat = content.stat_spans(bg, collapsed);
-    let stat_w: u16 = stat.iter().map(|s| s.width()).sum::<usize>() as u16;
+    let stat_w = spans_width(&stat) as u16;
     // The strip (name region + diffstat + fold arrow) spans every column but
     // the last, which is reserved for the cap.
     let name_w = area.width.saturating_sub(stat_w).saturating_sub(1);
@@ -637,7 +623,7 @@ fn draw_section_header(
     );
     // Pad so the name's background spans the full name region (ending one cell
     // short of the diffstat).
-    let used: usize = name_line.spans.iter().map(|s| s.width()).sum();
+    let used = spans_width(&name_line.spans);
     let pad = (name_w as usize).saturating_sub(used);
     if pad > 0 {
         name_line

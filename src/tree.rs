@@ -61,8 +61,12 @@ impl Tree {
         }];
         let root = 0;
 
+        // Node path → index, so each path component resolves in O(1) instead
+        // of a linear scan of the parent's children, which made the build
+        // O(files²) on wide directories.
+        let mut index: HashMap<String, usize> = HashMap::new();
         for (status, path) in entries {
-            insert(&mut nodes, root, &path, status);
+            insert(&mut nodes, root, &path, status, &mut index);
         }
 
         sort_recursive(&mut nodes, root);
@@ -126,15 +130,22 @@ impl Tree {
     }
 }
 
-fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
+fn insert(
+    nodes: &mut Vec<TreeNode>,
+    root: usize,
+    path: &str,
+    status: char,
+    index: &mut HashMap<String, usize>,
+) {
     let parts: Vec<&str> = path.split('/').collect();
     let mut cur = root;
 
     for (i, part) in parts.iter().enumerate() {
         let is_file = i == parts.len() - 1;
         let kind = if is_file { Kind::File } else { Kind::Dir };
+        let node_path = parts[..=i].join("/");
 
-        if let Some(existing) = find_child(nodes, cur, part) {
+        if let Some(&existing) = index.get(&node_path) {
             // A repeated `(status, path)` entry: the newer file status wins.
             debug_assert_eq!(nodes[existing].kind, kind);
             if is_file && nodes[existing].kind == Kind::File {
@@ -145,11 +156,10 @@ fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
         }
 
         let depth = i + 1;
-        let node_path = parts[..=i].join("/");
         let new_idx = nodes.len();
         nodes.push(TreeNode {
             name: (*part).to_string(),
-            path: node_path,
+            path: node_path.clone(),
             kind,
             status: if is_file {
                 status.to_string()
@@ -165,6 +175,7 @@ fn insert(nodes: &mut Vec<TreeNode>, root: usize, path: &str, status: char) {
             status_counts: [0; 6],
         });
         nodes[cur].children.push(new_idx);
+        index.insert(node_path, new_idx);
         cur = new_idx;
     }
 }
@@ -197,14 +208,6 @@ fn sum_stats(nodes: &mut Vec<TreeNode>, idx: usize) -> (usize, usize) {
     nodes[idx].file_count = files;
     nodes[idx].status_counts = counts;
     (added, deleted)
-}
-
-fn find_child(nodes: &[TreeNode], parent: usize, name: &str) -> Option<usize> {
-    nodes[parent]
-        .children
-        .iter()
-        .copied()
-        .find(|&c| nodes[c].name == name)
 }
 
 /// Order children: directories first, then files, each alphabetically
@@ -386,5 +389,35 @@ mod tests {
         let src = &tree.nodes[tree.nodes[tree.root].children[0]];
         assert_eq!(src.file_count, 2);
         assert_eq!(src.status_counts, [1, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn wide_flat_directory_builds_same_shape() {
+        // 500 files in one directory: the path index must keep the build
+        // linear while producing the same shape — one directory holding all
+        // files in alphabetical order with complete per-dir aggregates.
+        let entries: Vec<(char, String)> = (0..500)
+            .map(|i| ('M', format!("dir/f{i:03}.txt")))
+            .collect();
+        let tree = Tree::build(entries);
+
+        assert_eq!(tree.nodes[tree.root].children.len(), 1, "one directory");
+        let dir_idx = tree.nodes[tree.root].children[0];
+        assert_eq!(tree.nodes[dir_idx].kind, Kind::Dir);
+        assert_eq!(tree.nodes[dir_idx].children.len(), 500);
+
+        let names: Vec<&str> = tree.nodes[dir_idx]
+            .children
+            .iter()
+            .map(|&c| tree.nodes[c].name.as_str())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_by_key(|n| n.to_lowercase());
+        assert_eq!(names, sorted, "files stay in alphabetical order");
+
+        assert_eq!(tree.nodes[dir_idx].file_count, 500);
+        assert_eq!(tree.nodes[dir_idx].status, "M");
+        // Indexed by STATUS_ORDER (M first): 500 modified files.
+        assert_eq!(tree.nodes[tree.root].status_counts, [500, 0, 0, 0, 0, 0]);
     }
 }

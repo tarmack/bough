@@ -1,15 +1,17 @@
 //! Reference/head state: repo classification, branch name, divergence vs a
 //! base ref, upstream tracking, and default-branch detection.
 
-use crate::git::{open_repo, resolve_id};
+use crate::git::{open_repo, resolve_id, split_range, GitError};
 
 /// All local branch names, most recently committed tip first (e.g. for the
 /// branch picker). Alphabetical as the tiebreak and as the fallback when a
 /// tip cannot be resolved to a commit.
-pub fn local_branches() -> Vec<String> {
+pub fn local_branches() -> Result<Vec<String>, GitError> {
     match open_repo() {
-        Ok(repo) => local_branches_in(&repo),
-        Err(_) => Vec::new(),
+        Ok(repo) => Ok(local_branches_in(&repo)),
+        // Surfaced instead of swallowed: the picker needs to distinguish
+        // "no branches" from "could not open the repository".
+        Err(e) => Err(e),
     }
 }
 
@@ -107,6 +109,12 @@ pub enum RepoState {
 
 /// Classify the current directory: not a repository, a repository with no
 /// commits yet, or a usable repository.
+///
+/// Degradation note: a repository that is discovered but whose `HEAD` cannot
+/// be read (a corrupt or unresolvable ref) is also classified as
+/// [`RepoState::NotARepo`], so it prints the misleading "not a git
+/// repository" message. A dedicated corrupt-repo classification is out of
+/// scope here.
 pub fn repo_state() -> RepoState {
     let repo = match open_repo() {
         Ok(r) => r,
@@ -164,9 +172,7 @@ pub(crate) fn branch_state_in(repo: &gix::Repository, rev: &str) -> BranchState 
 
     // Ahead/behind vs base: `base...HEAD` prints `<behind>\t<ahead>`. The
     // revision's left side is the base ref, the right side the head.
-    if let Some((base, head)) = rev.split_once("...") {
-        let base = base.trim();
-        let head = head.trim();
+    if let Some((base, head)) = split_range(rev) {
         if !base.is_empty() && base != "HEAD" {
             state.base = Some(base.to_string());
             if let (Ok(base_id), Ok(head_id)) = (resolve_id(repo, base), resolve_id(repo, head)) {
@@ -176,12 +182,12 @@ pub(crate) fn branch_state_in(repo: &gix::Repository, rev: &str) -> BranchState 
         }
     }
 
-    // Upstream short name and unpushed count vs the upstream.
+    // Upstream short name and unpushed count vs the upstream. One `rev_parse`
+    // serves both: the reference name and the resolved id.
     if let Ok(rp) = repo.rev_parse("@{u}") {
-        let (from_ref, _) = rp.into_references();
-        state.upstream = from_ref.map(|r| r.name().shorten().to_string());
-        if let (Ok(up_id), Ok(head_id)) = (resolve_id(repo, "@{u}"), repo.head_id()) {
-            state.unpushed = count_reachable(repo, &head_id.detach(), &up_id);
+        state.upstream = rp.first_reference().map(|r| r.name.shorten().to_string());
+        if let (Some(up_id), Ok(head_id)) = (rp.single(), repo.head_id()) {
+            state.unpushed = count_reachable(repo, &head_id.detach(), &up_id.detach());
         }
     }
 

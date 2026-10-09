@@ -165,6 +165,34 @@ pub struct FileHeader {
     pub hunks: Vec<HunkMeta>,
 }
 
+impl FileHeader {
+    /// Build the single-file header the git engine attaches to every one-file
+    /// [`Diff`]: the identity fields come from the scan's per-file `meta`,
+    /// the caller supplies its own LFS classification, binary flag and hunk
+    /// metadata.
+    pub(crate) fn from_meta(
+        path: &str,
+        meta: &crate::git::FileMeta,
+        lfs: Option<LfsInfo>,
+        binary: bool,
+        hunks: Vec<HunkMeta>,
+    ) -> Self {
+        FileHeader {
+            path: path.to_string(),
+            old_path: meta.old_path.clone(),
+            status: meta.status,
+            added: meta.added,
+            deleted: meta.deleted,
+            rename_percent: meta.rename_percent,
+            mode_old: meta.mode_old,
+            mode_new: meta.mode_new,
+            binary,
+            lfs,
+            hunks,
+        }
+    }
+}
+
 /// A structured diff, built directly by the git engine, covering one file or
 /// many (a directory diff produces one entry per changed file).
 #[derive(Debug, Clone, PartialEq)]
@@ -183,34 +211,23 @@ pub struct Diff {
 }
 
 impl Diff {
-    /// Index of the `File` section owning `s` (the first `File` section with
-    /// the same `file`), or `None` when no file section exists (single-file
-    /// diffs have hunk sections only).
-    pub fn file_section_for(&self, s: usize) -> Option<usize> {
-        let file = self.sections.get(s)?.file;
-        self.sections
-            .iter()
-            .position(|x| x.kind == SectionKind::File && x.file == file)
-    }
-
     /// An empty directory aggregate for `path`: no files, sections or lines,
     /// with a zeroed summary header. Extend it with
     /// [`Diff::extend_from_children`].
     pub fn directory(path: &str) -> Diff {
+        let meta = crate::git::FileMeta {
+            status: FileStatus::Modified,
+            added: 0,
+            deleted: 0,
+            old_path: None,
+            rename_percent: None,
+            mode_old: None,
+            mode_new: None,
+            binary: false,
+        };
+        let header = FileHeader::from_meta(path, &meta, None, false, Vec::new());
         Diff {
-            header: FileHeader {
-                path: path.to_string(),
-                old_path: None,
-                status: FileStatus::Modified,
-                added: 0,
-                deleted: 0,
-                rename_percent: None,
-                mode_old: None,
-                mode_new: None,
-                binary: false,
-                lfs: None,
-                hunks: Vec::new(),
-            },
+            header: header.clone(),
             files: Vec::new(),
             sections: Vec::new(),
             lines: Vec::new(),

@@ -8,6 +8,7 @@
 //! in the diff pane). No application logic lives here.
 
 mod diff;
+mod footer;
 mod tree;
 
 use ratatui::layout::Rect;
@@ -16,23 +17,41 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use crate::app::{App, MouseGeometry, PickerGeometry, PickerKind};
 use crate::git::WorktreeInfo;
 use crate::preview;
+use crate::text::{display_width, truncate_right};
 
-/// How long a transient copy confirmation (`App::flash`) overrides the
-/// persistent status messages.
-pub(crate) const FLASH_TTL: Duration = Duration::from_secs(3);
+/// Width of the one-column divider between the diff and tree panes. The
+/// shared constant keeps the layout (here) and the mouse router
+/// (`input::in_tree_pane`) in lockstep — a magic `+1` in two files is the
+/// kind of drift that lands a tree click in the diff pane.
+pub(crate) const PANE_DIVIDER_W: u16 = 1;
+
+/// Popup width padding: two border columns, two inner side padding columns,
+/// and two columns of breathing room around the longest row.
+const PICKER_WIDTH_PAD: u16 = 6;
+/// Smallest picker width that still reads as a popup rather than a sliver.
+const PICKER_MIN_W: u16 = 28;
+/// Popup height padding: top + bottom borders plus the shared filter row
+/// above the entry list.
+const PICKER_ROW_EXTRA: u16 = 3;
+/// Smallest picker height that fits the filter row plus a couple entries.
+const PICKER_MIN_H: u16 = 6;
 
 /// Compute the pane split and draw both panes plus a full-width footer row
 /// (vim-style status line). Returns early on degenerate terminal sizes.
 pub fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
     if area.width < 6 || area.height < 2 {
-        // A skipped frame must not leave last frame's hitboxes live.
+        // A skipped frame must not leave last frame's hitboxes live, and the
+        // diff pane is not rendered so its mouse routes and sticky rows must
+        // go stale too (mirroring the preview branch below).
         app.mouse = MouseGeometry::default();
+        app.sticky_file = None;
+        app.sticky_hunk = None;
+        app.diff_width = 0;
         return;
     }
 
@@ -40,7 +59,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     let body_height = area.height.saturating_sub(1);
 
     let tree_w = (area.width / 3).clamp(1, area.width.saturating_sub(2));
-    let diff_w = area.width.saturating_sub(tree_w).saturating_sub(1);
+    let diff_w = area
+        .width
+        .saturating_sub(tree_w)
+        .saturating_sub(PANE_DIVIDER_W);
 
     if app.diff_width != diff_w {
         app.diff_width = diff_w;
@@ -54,9 +76,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     // The tree pane carries a one-row header summarizing what it lists
     // (file count, per-status breakdown, diff totals); the list follows
     // beneath it.
-    let tree_header = ratatui::layout::Rect::new(area.x + diff_w + 1, area.y, tree_w, 1);
+    let tree_header =
+        ratatui::layout::Rect::new(area.x + diff_w + PANE_DIVIDER_W, area.y, tree_w, 1);
     let tree = ratatui::layout::Rect::new(
-        area.x + diff_w + 1,
+        area.x + diff_w + PANE_DIVIDER_W,
         area.y + 1,
         tree_w,
         body_height.saturating_sub(1),
@@ -78,7 +101,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     tree::render_tree_header(f, app, tree_header);
     tree::render_tree(f, app, tree);
     let status = status_line(app);
-    tree::render_footer(f, app, footer, status.as_deref());
+    footer::render_footer(f, app, footer, status.as_deref());
 
     if app.base_picker.is_some() {
         render_branch_picker(f, app);
@@ -146,14 +169,18 @@ fn render_branch_picker(f: &mut Frame, app: &mut App) {
             .unwrap_or(0)
     };
     let max_w = (area.width.saturating_mul(3) / 5).max(1);
-    let width =
-        (u16::try_from(longest).unwrap_or(u16::MAX).saturating_add(6)).clamp(28.min(max_w), max_w);
-    // +1 inner row for the shared filter row above the entry list.
+    let width = (u16::try_from(longest)
+        .unwrap_or(u16::MAX)
+        .saturating_add(PICKER_WIDTH_PAD))
+    .clamp(PICKER_MIN_W.min(max_w), max_w);
     let max_h = (area.height.saturating_mul(4) / 5).max(1);
+    // Height tracks the full entry list, not the filtered subset: the popup
+    // keeps a stable size while the filter narrows, so the layout does not
+    // jump as the user types. Blank rows below a filtered list are expected.
     let height = (u16::try_from(picker.entries.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(3))
-    .clamp(6.min(max_h), max_h);
+        .saturating_add(PICKER_ROW_EXTRA))
+    .clamp(PICKER_MIN_H.min(max_h), max_h);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -246,48 +273,14 @@ fn worktree_row_text(wt: &WorktreeInfo, dirty: Option<usize>, is_current: bool) 
     text
 }
 
-/// Display width of `s` in terminal cells. ratatui 0.30 does not re-export
-/// `unicode-width`, so measure through `Span::width`, which uses the same
-/// crate internally as `Line::width()` (the footer zones' measurement).
-fn display_width(s: &str) -> usize {
-    Span::raw(s).width()
-}
-
-/// Keep the head of `s` within `max` display columns (terminal cells, not
-/// chars — CJK/emoji glyphs span more than one column), marking the cut
-/// with `…`. The kept head plus the `…` always fit in `max` columns.
-fn truncate_right(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if display_width(s) <= max {
-        return s.to_string();
-    }
-    // One column is reserved for the `…`; zero-width chars at the cut edge
-    // still fit (width 0 never exceeds the budget).
-    let budget = max - 1;
-    let mut kept = String::new();
-    let mut used = 0;
-    for ch in s.chars() {
-        let mut buf = [0u8; 4];
-        let w = display_width(ch.encode_utf8(&mut buf));
-        if used + w > budget {
-            break;
-        }
-        kept.push(ch);
-        used += w;
-    }
-    format!("{kept}…")
-}
-
+/// Display width of `s` in terminal cells (re-exported from `crate::text`
+/// so the render panes share one spelling with `elide`/`truncate_right`).
 fn status_line(app: &App) -> Option<String> {
     // Deliberate precedence: a fresh copy confirmation outranks the persistent
     // `diff_error`/`picker_error` for its brief window. Reversing this would let
     // a lingering `picker_error` permanently mask later copy confirmations.
-    if let Some((msg, at)) = &app.flash {
-        if at.elapsed() < FLASH_TTL {
-            return Some(msg.clone());
-        }
+    if app.flash_fresh() {
+        return app.flash.as_ref().map(|(msg, _)| msg.clone());
     }
     if let Some(err) = app.diff_error() {
         return Some(format!("git: {err}"));
@@ -477,29 +470,5 @@ mod tests {
         let empty_row = row_text(buf, g.inner.y);
         assert!(empty_row.contains("filter: █"), "{empty_row}");
         assert!(!empty_row.contains("/2"), "{empty_row}");
-    }
-
-    #[test]
-    fn truncate_right_caps_with_ellipsis() {
-        assert_eq!(truncate_right("short", 40), "short");
-        let long = truncate_right("/a/very/long/path/that/keeps/going/on", 10);
-        assert_eq!(long.chars().count(), 10);
-        assert!(long.ends_with('…'));
-        assert_eq!(truncate_right("anything", 0), "");
-    }
-
-    #[test]
-    fn truncate_right_budgets_display_columns() {
-        // CJK glyphs span two terminal columns each: 10 chars paint 14
-        // columns, so char-count truncation would overflow the budget.
-        let path = "/git/仓库/项目";
-        assert_eq!(display_width(path), 14);
-        let cut = truncate_right(path, 10);
-        assert!(cut.ends_with('…'));
-        assert_eq!(display_width(&cut), 10);
-        // ASCII rows keep the old behaviour: chars and columns agree.
-        let ascii = truncate_right("/a/very/long/path", 10);
-        assert_eq!(display_width(&ascii), 10);
-        assert_eq!(ascii.chars().count(), 10);
     }
 }

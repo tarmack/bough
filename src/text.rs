@@ -143,6 +143,80 @@ pub fn max_scroll_for(visible_len: usize, win: usize, sticky_rows: usize) -> usi
     }
 }
 
+/// Total display width of `spans` in terminal cells — the shared spelling
+/// for the `iter().map(|s| s.width()).sum()` idiom duplicated across the
+/// render panes (header right-alignment, footer pill measurement).
+pub fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| s.width()).sum()
+}
+
+/// Keep the head of `s` within `max` display columns (terminal cells, not
+/// chars — CJK/emoji glyphs span more than one column), marking the cut with
+/// `…`. The kept head plus `…` always fit in `max` columns.
+pub fn truncate_right(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    // One column is reserved for `…`; zero-width chars at the cut edge still
+    // fit (width 0 never exceeds the budget).
+    let budget = max - 1;
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        kept.push(ch);
+        used += w;
+    }
+    format!("{kept}…")
+}
+
+/// The `+added -deleted` diffstat spans (green add / red delete), each
+/// omitted when its count is zero, with a single bar-coloured separator
+/// between them when both are present. `bg` tints the spans for a row with a
+/// painted background; `None` leaves them on the plain locked-header style.
+/// Shared by the tree row's per-file stat and the diff header's diffstat so
+/// the +N/-N language stays identical.
+/// Green `+N` / red `-N` pair, bg-tinted when given. The two call-site
+/// conventions differ and both are load-bearing: the diff header always
+/// shows both sides (`+2 -0`) while the tree pane omits zero sides —
+/// `omit_zeros` selects which.
+pub fn add_del_spans(
+    added: usize,
+    deleted: usize,
+    bg: Option<Color>,
+    omit_zeros: bool,
+) -> Vec<Span<'static>> {
+    let add_style = match bg {
+        Some(c) => Style::default().fg(Color::Green).bg(c),
+        None => Style::default().fg(Color::Green),
+    };
+    let del_style = match bg {
+        Some(c) => Style::default().fg(Color::Red).bg(c),
+        None => Style::default().fg(Color::Red),
+    };
+    let sep_style = match bg {
+        Some(c) => Style::default().bg(c),
+        None => Style::default(),
+    };
+    let mut spans = Vec::new();
+    if added > 0 || !omit_zeros {
+        spans.push(Span::styled(format!("+{added}"), add_style));
+    }
+    if deleted > 0 || !omit_zeros {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" ", sep_style));
+        }
+        spans.push(Span::styled(format!("-{deleted}"), del_style));
+    }
+    spans
+}
+
 /// Draw `text` centered within `area`, using a single `style`.
 pub fn render_centered(f: &mut Frame, area: Rect, text: &str, style: Style) {
     if area.width == 0 || area.height == 0 {
@@ -217,5 +291,72 @@ mod tests {
         assert!(total <= 5, "wide line exceeded width: {total}");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "…世界");
+    }
+
+    #[test]
+    fn truncate_right_caps_with_ellipsis() {
+        assert_eq!(truncate_right("short", 40), "short");
+        let long = truncate_right("/a/very/long/path/that/keeps/going/on", 10);
+        assert_eq!(long.chars().count(), 10);
+        assert!(long.ends_with('…'));
+        assert_eq!(truncate_right("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_right_budgets_display_columns() {
+        // CJK glyphs span two terminal columns each: 10 chars paint 14
+        // columns, so char-count truncation would overflow the budget.
+        let path = "/git/仓库/项目";
+        assert_eq!(display_width(path), 14);
+        let cut = truncate_right(path, 10);
+        assert!(cut.ends_with('…'));
+        assert_eq!(display_width(&cut), 10);
+        // ASCII rows keep the old behaviour: chars and columns agree.
+        let ascii = truncate_right("/a/very/long/path", 10);
+        assert_eq!(display_width(&ascii), 10);
+        assert_eq!(ascii.chars().count(), 10);
+    }
+
+    #[test]
+    fn spans_width_sums_display_cells() {
+        assert_eq!(spans_width(&[]), 0);
+        assert_eq!(spans_width(&[Span::raw("ab")]), 2);
+        // Wide glyphs count as two cells each.
+        assert_eq!(spans_width(&[Span::raw("a"), Span::raw("日")]), 3);
+    }
+
+    #[test]
+    fn add_del_spans_omits_zeros_and_separates() {
+        // Both zero with omission: no spans.
+        assert!(add_del_spans(0, 0, None, true).is_empty());
+        // Only added: single green span, no separator.
+        let only_add = add_del_spans(3, 0, None, true);
+        assert_eq!(only_add.len(), 1);
+        assert_eq!(only_add[0].content.as_ref(), "+3");
+        assert_eq!(only_add[0].style.fg, Some(Color::Green));
+        // Only deleted: single red span, no leading separator.
+        let only_del = add_del_spans(0, 2, None, true);
+        assert_eq!(only_del.len(), 1);
+        assert_eq!(only_del[0].content.as_ref(), "-2");
+        assert_eq!(only_del[0].style.fg, Some(Color::Red));
+        // Both: add, separator, delete — three spans.
+        let both = add_del_spans(3, 2, Some(Color::DarkGray), true);
+        assert_eq!(both.len(), 3);
+        assert_eq!(both[0].content.as_ref(), "+3");
+        assert_eq!(both[1].content.as_ref(), " ");
+        assert_eq!(both[1].style.bg, Some(Color::DarkGray));
+        assert_eq!(both[2].content.as_ref(), "-2");
+        assert_eq!(both[2].style.bg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn add_del_spans_keeps_both_sides_for_headers() {
+        // The diff-header convention: both sides always render, zeros
+        // included (`+2 -0`), with the same separator.
+        let spans = add_del_spans(2, 0, None, false);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "+2");
+        assert_eq!(spans[1].content.as_ref(), " ");
+        assert_eq!(spans[2].content.as_ref(), "-0");
     }
 }

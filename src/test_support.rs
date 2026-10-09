@@ -51,7 +51,7 @@ pub fn sample_app() -> App {
     App::new(
         snap,
         tx,
-        false,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
         "main...HEAD".to_string(),
         "HEAD".to_string(),
     )
@@ -134,6 +134,57 @@ pub fn hunk_header(idx: usize) -> DiffLine {
         raw_text: format!("@@ -{idx} +{idx} @@"),
         section: idx,
         word_runs: None,
+    }
+}
+
+/// A worktree entry for the picker tests: id, path, branch, main, missing.
+pub fn wtinfo(
+    id: &str,
+    path: &str,
+    branch: Option<&str>,
+    main: bool,
+    missing: bool,
+) -> crate::git::WorktreeInfo {
+    crate::git::WorktreeInfo {
+        id: id.to_string(),
+        path: std::path::PathBuf::from(path),
+        branch: branch.map(Into::into),
+        main,
+        missing,
+        tip_time: None,
+    }
+}
+
+/// A picker entry with `rev` used as both revision spec and label.
+pub fn pentry(rev: &str) -> crate::app::PickerEntry {
+    crate::app::PickerEntry {
+        rev: rev.to_string(),
+        label: rev.to_string(),
+    }
+}
+
+/// A single-file `FileHeader` with `n` hunks, each with one added and one
+/// removed line. Generalizes the three near-identical hand-rolled headers
+/// in the chunk-navigation tests (all share the same shape modulo hunk
+/// count).
+pub fn header_with_hunks(n: usize) -> FileHeader {
+    FileHeader {
+        path: "x.rs".into(),
+        status: FileStatus::Modified,
+        added: 1,
+        deleted: 1,
+        old_path: None,
+        rename_percent: None,
+        mode_old: None,
+        mode_new: None,
+        binary: false,
+        lfs: None,
+        hunks: (0..n)
+            .map(|_| HunkMeta {
+                added: 1,
+                deleted: 1,
+            })
+            .collect(),
     }
 }
 

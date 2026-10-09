@@ -3,10 +3,13 @@
 //! This module is the entry point: CLI parsing, git bootstrap, terminal setup,
 //! and the main loop. Responsibilities are split into:
 //! - `app` — application state and behavior
+//! - `picker` — worktree picker
 //! - `input` — event loop and key/mouse dispatch
 //! - `view` — layout and rendering (diff + tree panes)
+//! - `kitty`, `preview` — kitty graphics protocol and image previews
 //! - `theme`, `text` — shared colors and span helpers
 //! - `tree`, `diff`, `git`, `highlight` — data / engines
+//! - `perf` — optional performance instrumentation
 //! - `snapshot`, `worker`, `watch` — live-update machinery
 
 mod app;
@@ -16,6 +19,7 @@ mod highlight;
 mod input;
 mod kitty;
 mod perf;
+mod picker;
 mod preview;
 mod snapshot;
 #[cfg(test)]
@@ -44,7 +48,7 @@ use app::App;
 use highlight::{HighlightError, Highlighter};
 use snapshot::{ArcSnapshot, Snapshot};
 use tree::Tree;
-use worker::Worker;
+use worker::{SpawnInit, Worker};
 
 #[derive(Parser)]
 #[command(name = "bough", about = "Minimalist terminal tree-diff viewer")]
@@ -121,36 +125,39 @@ fn main() -> io::Result<()> {
         std::process::exit(0);
     }
 
-    if let Err(HighlightError::UnknownTheme {
-        requested,
-        available,
-    }) = Highlighter::new(&cli.theme)
-    {
-        eprintln!("bough: unknown theme {requested:?}. Available:");
-        for t in available {
-            eprintln!("  {t}");
-        }
-        eprintln!("bough: continuing without syntax highlighting.");
-    }
-
-    // Resolving the `--worktree` spec is the one git call permitted before
-    // the override: it must enumerate the cwd repo's worktrees to find the
-    // target. Every git call that consumes repo state runs after this block
-    // — `open_repo()` resolves through the global root, so a late switch
-    // would make startup read the process cwd's worktree while the UI
-    // claims another. Without the flag nothing is set and the git layer
-    // falls back to the process cwd, keeping startup identical.
-    if let Some(spec) = &cli.worktree {
-        match git::resolve_worktree_spec(spec) {
-            Some(info) => {
-                if let Err(e) = git::set_repo_root(info.path.clone()) {
-                    eprintln!("bough: cannot open worktree '{}': {e}", info.id);
-                    std::process::exit(1);
-                }
+    let highlighter = match Highlighter::new(&cli.theme) {
+        Ok(h) => Some(h),
+        Err(HighlightError::UnknownTheme {
+            requested,
+            available,
+        }) => {
+            eprintln!("bough: unknown theme {requested:?}. Available:");
+            for t in available {
+                eprintln!("  {t}");
             }
-            None => {
+            eprintln!("bough: continuing without syntax highlighting.");
+            None
+        }
+    };
+
+    // Selecting the `--worktree` target is the one git call permitted before
+    // the override: `select_worktree` resolves the spec (enumerating the
+    // cwd repo's worktrees) and sets the global root atomically. Every git
+    // call that consumes repo state runs after this block — `open_repo()`
+    // resolves through the global root, so a late switch would make startup
+    // read the process cwd's worktree while the UI claims another. Without
+    // the flag nothing is set and the git layer falls back to the process
+    // cwd, keeping startup identical.
+    if let Some(spec) = &cli.worktree {
+        match git::select_worktree(spec) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
                 eprintln!("bough: no worktree matching '{spec}'. Available:");
                 eprintln!("{}", format_available_worktrees(&git::worktrees()));
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("bough: cannot open worktree '{spec}': {e}");
                 std::process::exit(1);
             }
         }
@@ -197,13 +204,14 @@ fn main() -> io::Result<()> {
         revision,
         empty
     );
-    let worker = Worker::spawn(
-        revision.clone(),
+    let worker = Worker::spawn(SpawnInit {
+        rev: revision.clone(),
         empty,
         repo_root,
-        cli.theme,
-        branch_state.clone(),
-    )
+        highlighter,
+        initial_branch: branch_state.clone(),
+        initial_error: None,
+    })
     .unwrap_or_else(|e| {
         eprintln!("bough: worker spawn failed: {e}");
         std::process::exit(1);
@@ -217,13 +225,10 @@ fn main() -> io::Result<()> {
     let mut app = App::new(
         initial_snapshot,
         worker.request_tx.clone(),
-        worker.poll_mode.load(std::sync::atomic::Ordering::Relaxed),
+        worker.poll_mode.clone(),
         revision.clone(),
         "HEAD".to_string(),
     );
-    // The footer must reflect a degradation the moment the watcher thread
-    // flips it, so the app reads the worker's real flag, not a spawn-time copy.
-    app.poll_mode = worker.poll_mode.clone();
     app.set_current_worktree(current_wt);
     // A degenerate comparison (no committed work since the origin: standing
     // on the trunk, or a branch still at the trunk's tip) is the uncommitted

@@ -2,9 +2,10 @@
 //!
 //! Wraps syntect + two-face behind an owned-token API so the rest of `bough`
 //! never touches syntect types. Grammar resolution is by file extension;
-// themes come from two-face's embedded collection, which already includes
-// syntect's bundled defaults under matching names.
+//! themes come from two-face's embedded collection, which already includes
+//! syntect's bundled defaults under matching names.
 
+use std::path::Path;
 use std::sync::OnceLock;
 
 use ratatui::style::Color;
@@ -37,9 +38,9 @@ pub struct TokenOwned {
 #[derive(Clone)]
 pub struct ResumeState {
     /// The live syntect parser state.
-    pub parse: ParseState,
+    parse: ParseState,
     /// The scope stack at the end of the last parsed line.
-    pub scope: ScopeStack,
+    scope: ScopeStack,
 }
 
 /// A failure during highlighter construction.
@@ -202,21 +203,23 @@ impl Highlighter {
 
     /// Look up the grammar for `path` by its file extension.
     fn syntax_for_path(&self, path: &str) -> Option<&'static SyntaxReference> {
-        let ext = extension(path)?.to_ascii_lowercase();
+        let ext = path_ext(path)?.to_ascii_lowercase();
         self.syntaxes.find_syntax_by_extension(&ext)
     }
 }
 
-/// Extract the lowercase-hint extension from a path, if any.
-fn extension(path: &str) -> Option<&str> {
-    let name = path.rsplit('/').next()?;
-    let dot = name.rfind('.')?;
-    let ext = &name[dot + 1..];
-    if ext.is_empty() {
-        None
-    } else {
-        Some(ext)
+/// Extract a path's file extension, or `None` for stemless names like `.png`.
+///
+/// `Path::extension` reports an extension for a bare dotfile (`.png` → `png`)
+/// even though its stem is empty; callers treat those as extensionless, so
+/// they are rejected here too. Shared with `preview::is_image_path`.
+pub(crate) fn path_ext(path: &str) -> Option<&str> {
+    let p = Path::new(path);
+    let ext = p.extension()?.to_str()?;
+    if p.file_stem().map(|s| s.is_empty()).unwrap_or(true) {
+        return None;
     }
+    Some(ext)
 }
 
 /// Translate a syntect style's sRGB foreground into a ratatui color.
