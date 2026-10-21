@@ -2,7 +2,7 @@
 name = "bough"
 version = "0.1.0"
 edition = "2021"
-description = "A minimalist terminal tree-diff viewer"
+description = "Diff each git worktree against main — a terminal review tool for parallel (AI) work"
 
 [dependencies]
 ratatui = "0.30"

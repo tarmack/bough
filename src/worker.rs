@@ -53,11 +53,10 @@ const MAX_PREVIEW_DIM: u32 = 16384;
 /// Hard cap on decoder allocation while building a preview.
 const MAX_PREVIEW_ALLOC: u64 = 64 * 1024 * 1024;
 
-/// Compile-time proof that the worker's cross-thread types are `Send`. The
-/// `Highlighter` is intentionally NOT asserted here: syntect's onig backend
-/// holds raw pointers, so it is not `Send`. Instead the worker constructs its
-/// `Highlighter` on the worker thread and never moves it across threads —
-/// only `Snapshot`/`ArcSnapshot` cross the boundary.
+/// Compile-time proof that the worker's cross-thread types are `Send`. Only
+/// `Snapshot`/`ArcSnapshot` travel back to the UI. `Highlighter` is created on
+/// the main thread and moved into the worker once via `SpawnInit`; syntect is
+/// `&mut self`, so it is only ever *used* on the worker thread after that.
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<Snapshot>();

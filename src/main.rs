@@ -51,10 +51,13 @@ use tree::Tree;
 use worker::{SpawnInit, Worker};
 
 #[derive(Parser)]
-#[command(name = "bough", about = "Minimalist terminal tree-diff viewer")]
+#[command(
+    name = "bough",
+    about = "Diff each git worktree against main — a terminal review tool for parallel (AI) work"
+)]
 struct Cli {
     /// Git revision to diff against (e.g. `main...`, `main..HEAD`).
-    /// Defaults to the merge-base of `main` and `HEAD`.
+    /// Defaults to the merge-base of the repository's default branch and `HEAD`.
     revision: Option<String>,
     /// Start viewing the worktree matching this spec (exact id first, then
     /// exact path) instead of the process working directory. Resolving the
