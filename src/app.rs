@@ -347,11 +347,13 @@ pub struct App {
     /// saved state (removed at switch-out) when the worker rejects the
     /// switch. `target_state` is `None` when the target was never visited.
     pub(crate) pending_restore: Option<(String, String, Option<WorktreeUiState>)>,
-    /// Set while a worktree switch is in flight, until the switch's BUSY
-    /// placeholder snapshot arrives in `apply_snapshot`. Keeps stale
-    /// settled snapshots from the old root queued ahead of the placeholder
-    /// (channel FIFO) from consuming `pending_restore`.
+    /// Set while a worktree switch is in flight, until a snapshot answering
+    /// the attempt (a newer `switch_epoch`) arrives in `apply_snapshot`. Keeps
+    /// stale settled snapshots from the old root queued ahead of the answer
+    /// (channel FIFO) from consuming `pending_restore` or faking a rejection.
     pub(crate) awaiting_switch: bool,
+    /// Worker switch epoch observed when the in-flight switch was requested.
+    pub(crate) switch_epoch: u64,
     /// Results of the picker's background dirty-count scan: `(id, stats)`
     /// pairs streamed in by the scan thread. Dropped when the picker closes.
     pub dirty_rx: Option<Receiver<(String, DirtyStats)>>,
@@ -443,6 +445,7 @@ impl App {
             worktree_ui: HashMap::new(),
             pending_restore: None,
             awaiting_switch: false,
+            switch_epoch: 0,
             dirty_rx: None,
             dirty_counts: HashMap::new(),
             dirty_scan_cancel: None,
@@ -494,6 +497,14 @@ impl App {
             self.last_highlight_range = None;
             // The old selection's indices refer to the replaced diff's lines.
             self.diff_selection = DiffSelection::default();
+            // A recompute can drop sections; a stale cursor would render an
+            // out-of-range `[n/N]` and make chunk navigation jump to the top.
+            let sections = self
+                .snapshot
+                .selected_diff
+                .as_ref()
+                .map_or(0, |diff| diff.sections.len());
+            self.active_chunk = self.active_chunk.filter(|section| *section < sections);
         }
 
         if tree_changed {
@@ -502,19 +513,24 @@ impl App {
             // A pending worktree-restore overrides the usual relocation
             // (consumed once, so later snapshots never re-trigger it). It may
             // only be consumed by the settled snapshot of the switched-to
-            // worktree: the switch's BUSY placeholder cleared the
-            // `awaiting_switch` gate above, while stale settled snapshots
-            // from the old root queued ahead of it (channel FIFO) are
-            // skipped while the gate is still set.
+            // worktree: `settle_switch_gates` above releases the gate only for
+            // a snapshot answering the switch (a newer `switch_epoch`), so
+            // stale old-root snapshots queued ahead of the answer (channel
+            // FIFO) are skipped while the gate is still set.
             let pending = if !self.snapshot.busy && !self.awaiting_switch {
                 self.pending_restore.take()
             } else {
                 None
             };
+            // A switch's busy placeholder relocates before the saved state is
+            // restored; the context width is not per-worktree state and must
+            // survive the placeholder (folded hunks cannot: the picker's
+            // `apply_base_switch` clears them before the placeholder).
+            let session = self.pending_restore.is_some().then_some(self.context_lines);
             if let Some((_, _, Some(state))) = pending {
                 relocated = self.apply_pending_restore(&state);
             } else {
-                relocated = self.relocate_after_tree_change(&old_path);
+                relocated = self.relocate_after_tree_change(&old_path, session);
             }
         }
 
@@ -536,34 +552,50 @@ impl App {
 
     /// Settle the worktree-switch gates after swapping in a snapshot.
     ///
-    /// A BUSY placeholder (e.g. the worktree switch's own marker snapshot)
-    /// clears the awaiting-switch gate; it must never consume the pending
-    /// restore (guarded below).
+    /// Only a snapshot that *answers* the switch attempt may settle the gate: a
+    /// snapshot still carrying the epoch observed at request time is a stale
+    /// old-root snapshot (a recompute that was already in flight) and must be
+    /// ignored. Otherwise it could clear the gate and let the next settled
+    /// old-root tree consume the pending restore, or make a rejected switch look
+    /// accepted.
     ///
-    /// A settled snapshot whose tree did NOT change can only mean the switch
-    /// never landed (the worker rejected it — its error snapshot replays the
-    /// old view's tree Arc verbatim). A real switch always changes the tree
-    /// Arc (the new root's tree is freshly built). On rejection: re-stash the
-    /// target's saved state into `worktree_ui` (it was removed at switch-out),
-    /// and revert `current_worktree`/`mode`/`last_origin` to the `from`
-    /// worktree's saved state (still in `worktree_ui[from]`; `switch_worktree`
-    /// saved it at switch-out).
+    /// A rejected switch replays the old view (same tree `Arc`) with a fresh
+    /// epoch and an error. A rejection snapshot always replays the tree the
+    /// app already holds: `last_tree` is written immediately before any
+    /// recompute's busy send and the worker is single-threaded, so
+    /// `tree_changed == false` reliably identifies a rejected switch. A landed
+    /// switch sends its busy placeholder (fresh epoch, empty tree) first; the
+    /// gate clears there so the settled new-root tree can consume
+    /// `pending_restore`, which the placeholder must never do.
     fn settle_switch_gates(&mut self, tree_changed: bool) {
-        if self.snapshot.busy {
+        if !self.awaiting_switch || self.snapshot.switch_epoch <= self.switch_epoch {
+            return;
+        }
+        if !self.snapshot.busy && !tree_changed {
+            self.revert_switch();
+        } else {
+            // The switch landed: release the gate; `pending_restore` is consumed
+            // when the settled new-root tree arrives.
             self.awaiting_switch = false;
         }
-        if !self.snapshot.busy && !tree_changed && self.awaiting_switch {
-            self.awaiting_switch = false;
-            if let Some((from, target, state)) = self.pending_restore.take() {
-                if let Some(s) = state {
-                    self.worktree_ui.insert(target, s);
-                }
-                if let Some(from_state) = self.worktree_ui.get(&from).cloned() {
-                    self.mode = from_state.mode;
-                    self.last_origin = from_state.last_origin;
-                }
-                self.set_current_worktree((from != MAIN_WORKTREE).then_some(from));
+    }
+
+    /// Abandon an in-flight switch: re-stash the target's saved state, restore
+    /// the from-worktree's mode/origin/pill, and drop the gate. Used for a
+    /// worker-rejected switch and for worker death mid-switch (which would
+    /// otherwise leave the gate armed forever, so the next tree change could
+    /// apply the target's restore to the old root).
+    fn revert_switch(&mut self) {
+        self.awaiting_switch = false;
+        if let Some((from, target, state)) = self.pending_restore.take() {
+            if let Some(s) = state {
+                self.worktree_ui.insert(target, s);
             }
+            if let Some(from_state) = self.worktree_ui.get(&from).cloned() {
+                self.mode = from_state.mode;
+                self.last_origin = from_state.last_origin;
+            }
+            self.set_current_worktree((from != MAIN_WORKTREE).then_some(from));
         }
     }
 
@@ -571,8 +603,15 @@ impl App {
     /// `expanded_dirs`, re-locate the selection by path (nearest-sibling
     /// fallback), and re-request the diff when the selection moved. Returns
     /// whether the selection relocated (the selected path vanished and a
-    /// sibling was chosen).
-    fn relocate_after_tree_change(&mut self, old_path: &Option<String>) -> bool {
+    /// sibling was chosen). `session` carries the context width captured
+    /// while a restore is pending; the relocation's reset must not wipe it
+    /// before the restore re-applies. (Folded hunks are not carried: the
+    /// picker clears them before the placeholder.)
+    fn relocate_after_tree_change(
+        &mut self,
+        old_path: &Option<String>,
+        session: Option<u32>,
+    ) -> bool {
         let mut tree = (*self.snapshot.tree).clone();
         tree.expand_paths(&self.expanded_dirs);
         self.flat = tree.flatten();
@@ -593,6 +632,9 @@ impl App {
         // shows stale content (or the dead file's section indices).
         if relocated {
             self.reset_diff_view();
+            if let Some(context) = session {
+                self.context_lines = context;
+            }
             self.request_diff();
         }
         relocated
@@ -857,6 +899,7 @@ impl App {
     pub fn mark_worker_dead(&mut self) {
         self.snapshot = Arc::new(Snapshot {
             seq: self.snapshot.seq,
+            switch_epoch: self.snapshot.switch_epoch,
             busy: false,
             empty: self.snapshot.empty,
             tree: self.snapshot.tree.clone(),
@@ -866,11 +909,20 @@ impl App {
             branch_state: self.snapshot.branch_state.clone(),
             uncommitted_stats: self.snapshot.uncommitted_stats,
         });
+        // A switch in flight can no longer be answered; do not leave the gate
+        // armed on a dead worker.
+        self.revert_switch();
     }
 
     /// Track which worktree the app is viewing (`None` = main checkout);
     /// called at startup and on every in-app worktree switch.
     pub fn set_current_worktree(&mut self, id: Option<String>) {
+        if self.current_worktree != id {
+            // A preview is keyed by repo-relative path alone, so the previous
+            // root's image must not survive into another worktree.
+            self.preview.current = None;
+            self.preview.requested = None;
+        }
         self.current_worktree = id;
     }
 
@@ -2436,6 +2488,7 @@ mod tests {
         // snapping to the top of the sticky section.
         app.apply_snapshot(Arc::new(crate::snapshot::Snapshot {
             seq: 1,
+            switch_epoch: 0,
             busy: false,
             empty: false,
             tree: shared_tree,
@@ -2630,6 +2683,7 @@ mod tests {
     fn highlight_only_snapshot(app: &App, highlight_len: usize) -> ArcSnapshot {
         Arc::new(crate::snapshot::Snapshot {
             seq: 1,
+            switch_epoch: app.snapshot.switch_epoch,
             busy: false,
             empty: false,
             tree: app.snapshot.tree.clone(),
@@ -2706,6 +2760,7 @@ mod tests {
         // Same diff Arc and same highlight Arc: nothing is recomputed.
         app.apply_snapshot(Arc::new(crate::snapshot::Snapshot {
             seq: 1,
+            switch_epoch: app.snapshot.switch_epoch,
             busy: false,
             empty: false,
             tree: app.snapshot.tree.clone(),
@@ -3198,5 +3253,146 @@ mod tests {
             "switching files drops the diff selection"
         );
         assert!(app.diff_selection.anchor.is_none());
+    }
+
+    #[test]
+    fn settle_switch_gates_ignores_stale_old_root_snapshots() {
+        let mut app = sample_app();
+        app.awaiting_switch = true;
+        app.switch_epoch = 3;
+        app.current_worktree = Some("wt-b".to_string());
+        app.pending_restore = Some(("main".to_string(), "wt-b".to_string(), None));
+
+        // A settled old-root recompute queued ahead of the switch's answer
+        // (channel FIFO): same tree Arc, and still carrying the epoch observed
+        // when the switch was requested.
+        let mut stale = sample_snapshot(Tree::build(Vec::new()));
+        {
+            let s = Arc::get_mut(&mut stale).unwrap();
+            s.tree = app.snapshot.tree.clone();
+            s.switch_epoch = 3;
+        }
+        app.apply_snapshot(stale);
+
+        assert!(
+            app.awaiting_switch,
+            "a stale old-root snapshot must not settle the gate"
+        );
+        assert!(
+            app.pending_restore.is_some(),
+            "the pending restore must survive a stale snapshot"
+        );
+        assert_eq!(
+            app.current_worktree.as_deref(),
+            Some("wt-b"),
+            "the footer pill must not revert on a stale snapshot"
+        );
+    }
+
+    #[test]
+    fn settle_switch_gates_reverts_a_rejected_switch() {
+        let mut app = sample_app();
+        app.awaiting_switch = true;
+        app.switch_epoch = 3;
+        app.current_worktree = Some("wt-b".to_string());
+        app.mode = Mode::Uncommitted;
+        // The from worktree's saved state, as `switch_worktree` stashes it at
+        // switch-out.
+        app.worktree_ui.insert(
+            "main".to_string(),
+            WorktreeUiState {
+                mode: Mode::Branch(Origin::Picked("feature".to_string())),
+                last_origin: Some(Origin::Picked("feature".to_string())),
+                selected_path: Some("a.rs".to_string()),
+                expanded_dirs: HashSet::new(),
+                tree_scroll: 0,
+                diff_scroll: 0,
+                diff_col: 0,
+            },
+        );
+        app.pending_restore = Some((
+            "main".to_string(),
+            "wt-b".to_string(),
+            Some(WorktreeUiState {
+                mode: Mode::Uncommitted,
+                last_origin: None,
+                selected_path: Some("target.rs".to_string()),
+                expanded_dirs: HashSet::new(),
+                tree_scroll: 0,
+                diff_scroll: 0,
+                diff_col: 0,
+            }),
+        ));
+
+        // The rejected switch replays the old view (same tree Arc) with a
+        // fresh epoch and an error.
+        {
+            let s = Arc::get_mut(&mut app.snapshot).unwrap();
+            s.switch_epoch = 4;
+            s.error = Some("worktree belongs to a different repository".to_string());
+        }
+        let replay = app.snapshot.clone();
+        app.apply_snapshot(replay);
+
+        assert!(
+            !app.awaiting_switch,
+            "the answering error snapshot settles the gate"
+        );
+        assert!(
+            app.pending_restore.is_none(),
+            "the stale restore is dropped"
+        );
+        assert!(
+            app.worktree_ui.contains_key("wt-b"),
+            "the target's saved state is re-stashed"
+        );
+        assert_eq!(
+            app.worktree_ui.get("wt-b").unwrap().mode,
+            Mode::Uncommitted,
+            "the re-stashed state is the target's saved state"
+        );
+        assert_eq!(
+            app.current_worktree, None,
+            "the footer pill reverts to the from worktree (main)"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Branch(Origin::Picked("feature".to_string())),
+            "mode reverts to the from worktree's saved mode"
+        );
+        assert_eq!(
+            app.last_origin,
+            Some(Origin::Picked("feature".to_string())),
+            "last_origin reverts to the from worktree's saved origin"
+        );
+    }
+
+    #[test]
+    fn switch_placeholder_preserves_session_preferences() {
+        let mut app = sample_app();
+        app.context_lines = 7;
+        app.awaiting_switch = true;
+        app.switch_epoch = app.snapshot.switch_epoch;
+        app.pending_restore = Some(("main".to_string(), "wt-b".to_string(), None));
+
+        // The switch's busy placeholder: fresh epoch, empty tree. Its
+        // relocation must not wipe the captured context width, which the
+        // pending restore re-applies when the settled new-root tree arrives.
+        let mut placeholder = sample_snapshot(Tree::build(Vec::new()));
+        {
+            let s = Arc::get_mut(&mut placeholder).unwrap();
+            s.busy = true;
+            s.switch_epoch = app.switch_epoch + 1;
+        }
+        app.apply_snapshot(placeholder);
+
+        assert!(
+            !app.awaiting_switch,
+            "the placeholder answers the switch and settles the gate"
+        );
+        assert_eq!(
+            app.context_lines, 7,
+            "context width survives the placeholder's relocation reset"
+        );
     }
 }

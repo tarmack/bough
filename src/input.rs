@@ -76,29 +76,37 @@ impl Redraw {
     }
 }
 
-/// Drain the snapshot channel, keeping only the latest `ArcSnapshot`, and
-/// apply it to `app`. Returns `true` when the app state changed (a snapshot was
+/// Drain the snapshot channel, applying every queued `ArcSnapshot` to `app` in
+/// order (not only the latest), and report worker death when the channel is
+/// disconnected. Returns `true` when the app state changed (a snapshot was
 /// applied, or the worker was found dead), so the caller can redraw.
 fn drain_snapshots(rx: &Receiver<ArcSnapshot>, app: &mut App, worker_dead: &mut bool) -> bool {
-    let mut latest: Option<ArcSnapshot> = None;
-    let mut drained = 0usize;
-    while let Ok(snap) = rx.try_recv() {
-        latest = Some(snap);
-        drained += 1;
-    }
     let mut changed = false;
-    if let Some(snap) = latest {
-        app.apply_snapshot(snap);
-        perf::tally(Counter::SnapshotsApplied);
-        if drained > 1 {
-            crate::perf_evt!("snapshot drain n={drained}");
+    let mut drained = 0usize;
+    loop {
+        match rx.try_recv() {
+            Ok(snap) => {
+                // Apply in order: a busy placeholder can be exactly what clears
+                // a worktree-switch gate, so dropping intermediates can strand
+                // the view on "loading…".
+                app.apply_snapshot(snap);
+                perf::tally(Counter::SnapshotsApplied);
+                drained += 1;
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                if !*worker_dead {
+                    *worker_dead = true;
+                    app.mark_worker_dead();
+                    changed = true;
+                }
+                break;
+            }
         }
-        changed = true;
     }
-    if !*worker_dead && matches!(rx.try_recv(), Err(TryRecvError::Disconnected)) {
-        *worker_dead = true;
-        app.mark_worker_dead();
-        changed = true;
+    if drained > 1 {
+        crate::perf_evt!("snapshot drain n={drained}");
     }
     changed
 }
@@ -1909,6 +1917,53 @@ mod tests {
         assert!(drain_snapshots(&rx, &mut app, &mut dead));
         assert!(dead);
         assert!(!drain_snapshots(&rx, &mut app, &mut dead));
+    }
+
+    #[test]
+    fn drain_snapshots_applies_busy_placeholder_before_settled() {
+        let mut app = sample_app();
+        let (tx, rx) = crossbeam_channel::unbounded::<ArcSnapshot>();
+        let mut dead = false;
+
+        // Queue a busy placeholder ahead of a settled snapshot that reuses the
+        // same tree Arc. Applied in order, the busy marker clears
+        // `awaiting_switch`, so the settled snapshot must not be misread as a
+        // rejected worktree switch (which would consume the pending restore).
+        // Latest-wins draining would apply only the settled snapshot and
+        // consume it.
+        app.awaiting_switch = true;
+        app.pending_restore = Some(("main".into(), "wt".into(), None));
+        for (mut snap, busy) in [
+            (
+                sample_snapshot(crate::tree::Tree::build(vec![
+                    ('M', "a.rs".to_string()),
+                    ('M', "b.rs".to_string()),
+                ])),
+                true,
+            ),
+            (
+                sample_snapshot(crate::tree::Tree::build(vec![
+                    ('M', "a.rs".to_string()),
+                    ('M', "b.rs".to_string()),
+                ])),
+                false,
+            ),
+        ] {
+            let s = std::sync::Arc::get_mut(&mut snap).unwrap();
+            s.busy = busy;
+            s.tree = app.snapshot.tree.clone();
+            s.switch_epoch = app.switch_epoch + 1;
+            tx.send(snap).unwrap();
+        }
+
+        assert!(drain_snapshots(&rx, &mut app, &mut dead));
+        assert!(!dead);
+        assert!(!app.awaiting_switch, "busy placeholder cleared the gate");
+        assert!(
+            app.pending_restore.is_some(),
+            "settled snapshot must not be treated as a rejected switch"
+        );
+        assert!(!app.snapshot.busy, "app ended on the settled snapshot");
     }
 
     #[test]

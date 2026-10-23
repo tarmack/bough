@@ -297,6 +297,7 @@ fn main() -> io::Result<()> {
 fn initial_snapshot(empty: bool, branch_state: crate::git::BranchState) -> ArcSnapshot {
     Arc::new(Snapshot {
         seq: 0,
+        switch_epoch: 0,
         busy: false,
         empty,
         selected_diff: None,

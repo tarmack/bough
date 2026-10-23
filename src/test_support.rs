@@ -61,6 +61,7 @@ pub fn sample_app() -> App {
 pub fn sample_snapshot(tree: Tree) -> ArcSnapshot {
     Arc::new(Snapshot {
         seq: 0,
+        switch_epoch: 0,
         busy: false,
         empty: false,
         selected_diff: None,
@@ -81,6 +82,7 @@ pub fn snapshot_with_diff(diff: Diff) -> ArcSnapshot {
     let tree = Tree::build(vec![('M', diff.header.path.clone())]);
     Arc::new(Snapshot {
         seq: 0,
+        switch_epoch: 0,
         busy: false,
         empty: false,
         selected_diff: Some(Arc::new(diff)),

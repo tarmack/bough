@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{select, Receiver, Sender, TryRecvError};
 
@@ -279,6 +279,9 @@ fn new_cached_diff(diff: Arc<Diff>, highlighter: Option<&Highlighter>) -> Cached
 /// Mutable worker-thread state.
 struct WorkerState {
     rev: String,
+    /// Counter of worktree-switch attempts; stamped onto every snapshot so the
+    /// UI can tell stale old-root snapshots from the switch's own outcome.
+    switch_epoch: u64,
     empty: bool,
     highlighter: Option<Highlighter>,
     /// Repository root the worker resolves preview image paths against.
@@ -310,6 +313,10 @@ struct WorkerState {
     /// True once the UI has sent a `LoadImage` request: recomputes then also
     /// refresh the selected image preview when it changed on disk.
     preview_active: bool,
+    /// `(path, mtime, size)` of the last preview load (requested or refreshed),
+    /// so an unrelated recompute does not re-read and re-encode an unchanged
+    /// image.
+    last_preview: Option<(String, Option<SystemTime>, u64)>,
     /// Uncommitted-only `(added, deleted)` totals for branch comparisons —
     /// how much of the view is mid-flight work. `None` in the uncommitted
     /// view (its own totals already are uncommitted-only) or when the extra
@@ -340,6 +347,7 @@ impl WorkerState {
     ) -> Self {
         WorkerState {
             rev,
+            switch_epoch: 0,
             empty,
             highlighter,
             repo_root,
@@ -357,6 +365,7 @@ impl WorkerState {
             last_branch: initial_branch,
             last_changes: HashMap::new(),
             preview_active: false,
+            last_preview: None,
             uncommitted_stats: None,
             scan_sets: None,
             ignore: IgnoreMatcher::open(),
@@ -390,6 +399,7 @@ impl WorkerState {
     ) -> Snapshot {
         Snapshot {
             seq: self.latest_request_seq,
+            switch_epoch: self.switch_epoch,
             busy,
             empty: self.empty,
             tree,
@@ -565,9 +575,10 @@ fn run_loop(
     // always recompute, even alongside only-ignored workdir paths, and it is
     // what makes branch state worth re-walking.
     let mut saw_refs = false;
-    // An unattributable burst (watcher pending-overflow collapse) must always
-    // recompute: its empty path batch must never be swallowed by the
-    // ignore-gate even when the window also collected only-ignored paths.
+    // An unattributable burst (watcher pending-overflow collapse or a worktree
+    // index rewrite) must always recompute: its empty path batch must never be
+    // swallowed by the ignore-gate even when the window also collected
+    // only-ignored paths.
     let mut unattributable = false;
     let mut last_beat = Instant::now();
 
@@ -679,14 +690,17 @@ fn run_loop(
                     &mut state,
                     &io,
                     saw_refs,
-                    !changed_paths.is_empty() || unattributable,
+                    saw_refs || !changed_paths.is_empty() || unattributable,
                 );
             }
-            // A `.gitignore` edit invalidates the cached exclude chain; rebuild
-            // it so a path newly ignored or unignored is judged correctly next.
-            if changed_paths
-                .iter()
-                .any(|p| p.ends_with(Path::new(".gitignore")))
+            // An unattributable window (index or `.git/info/exclude` rewrite)
+            // may have folded a `.gitignore` path away before the send, so
+            // rebuild there too; otherwise a stale exclude chain can keep
+            // skipping a now-unignored path.
+            if unattributable
+                || changed_paths
+                    .iter()
+                    .any(|p| p.ends_with(Path::new(".gitignore")))
             {
                 state.ignore = IgnoreMatcher::open();
             }
@@ -987,6 +1001,9 @@ fn handle_request(
                 // discarded the requests coalesced around it.
                 return false;
             }
+            // Every real attempt — accepted or rejected — gets a fresh epoch so
+            // the UI can settle its gate on the answering snapshot only.
+            state.switch_epoch = state.switch_epoch.wrapping_add(1);
             if let Err(e) = switch_worktree(state, io, &root, watch) {
                 // Validation/re-aim failure: surface the error over the
                 // current (unchanged) view; `switch_worktree` left every bit
@@ -1042,6 +1059,7 @@ fn handle_request(
             }
             state.latest_request_seq = seq;
             state.preview_active = true;
+            state.last_preview = Some(preview_signature(&state.repo_root, &path));
             load_preview(state, io, &path);
             false
         }
@@ -1095,6 +1113,7 @@ fn switch_worktree(
     state.selected_path = None;
     state.ctx = DEFAULT_CTX;
     state.preview_active = false;
+    state.last_preview = None;
     state.uncommitted_stats = None;
     // The dirty scans came from the old worktree's revision; stale.
     state.scan_sets = None;
@@ -1174,6 +1193,17 @@ fn load_preview(state: &mut WorkerState, io: &LoopIo, path: &str) {
             }
         }
     }
+}
+
+/// `(path, mtime, size)` of an on-disk preview target. A stat failure yields
+/// `(path, None, 0)`; the load itself then surfaces the error.
+fn preview_signature(repo_root: &Path, path: &str) -> (String, Option<SystemTime>, u64) {
+    let meta = std::fs::metadata(repo_root.join(path)).ok();
+    (
+        path.to_string(),
+        meta.as_ref().and_then(|m| m.modified().ok()),
+        meta.as_ref().map(|m| m.len()).unwrap_or(0),
+    )
 }
 
 /// Read a preview image from disk, rejecting symlinks/non-regular files and
@@ -1324,11 +1354,33 @@ fn scan_entries(
 /// on file selection. `refs_moved` controls whether branch state (which only
 /// refs can change) is re-walked. `workdir_dirty` says whether the workdir may
 /// have changed since the last recompute: true at startup and on a rev or
-/// worktree switch; on the watcher path, `!changed_paths.is_empty() ||
-/// unattributable`, since a refs-only window cannot move the uncommitted
-/// totals the second scan below recomputes.
+/// worktree switch; on the watcher path, `saw_refs ||
+/// !changed_paths.is_empty() || unattributable`. A refs-only window counts as
+/// dirty because a ref move without an index write (e.g. `git reset --soft`,
+/// `git update-ref HEAD`) still changes what is staged against HEAD, so the
+/// uncommitted totals the second scan below recomputes must be recounted.
 fn recompute(state: &mut WorkerState, io: &LoopIo, refs_moved: bool, workdir_dirty: bool) {
     let t0 = Instant::now();
+    // `empty` is captured at startup, but the first commit turns a no-commit
+    // repository into a normal one. Only flip once the diff's revs actually
+    // resolve: an empty repo's default branch may not exist yet, and switching
+    // to a HEAD comparison against a missing base would fail every recompute.
+    if refs_moved && state.empty {
+        let ready = git::open_repo().is_ok_and(|repo| {
+            if repo.head_id().is_err() {
+                return false;
+            }
+            match git::split_range(&state.rev) {
+                Some((base, head)) => {
+                    git::resolve_id(&repo, base).is_ok() && git::resolve_id(&repo, head).is_ok()
+                }
+                None => git::resolve_id(&repo, &state.rev).is_ok(),
+            }
+        });
+        if ready {
+            state.empty = false;
+        }
+    }
     perf::tally(Counter::Recomputes);
     let mut span = perf::span("recompute");
     let (entries, stats) = {
@@ -1341,6 +1393,11 @@ fn recompute(state: &mut WorkerState, io: &LoopIo, refs_moved: bool, workdir_dir
                 }
                 state.last_error = Some(err);
                 send_error_snapshot(state, io);
+                // A failing scan still counts toward the duty-cycle floor and
+                // the hard ceiling; otherwise repeated slow failures retry at
+                // the baseline floor forever.
+                state.last_recompute = t0.elapsed();
+                state.last_recompute_at = Some(Instant::now());
                 return;
             }
         }
@@ -1456,14 +1513,21 @@ fn recompute_from_scan(
     let error = state.last_error.clone();
     send_snapshot(state, io, tree, diff, hl, error, false);
 
-    // Refresh an image preview when the selected image changed on disk: its
-    // binary diff is content-identical, so nothing else in the snapshot
-    // signals the edit. Only fires once the UI has opted in via a
-    // `LoadImage` request, and only for files the scan reports as changed.
+    // Refresh an image preview when the selected image changed on disk (mtime
+    // or size), not on every recompute: its binary diff is content-identical,
+    // so nothing else in the snapshot signals the edit. Only fires once the UI
+    // has opted in via a `LoadImage` request, and only for files the scan
+    // reports as changed.
     if state.preview_active {
         if let Some(path) = state.selected_path.clone() {
             if state.last_changes.contains_key(&path) && crate::preview::is_image_path(&path) {
-                load_preview(state, io, &path);
+                let signature = preview_signature(&state.repo_root, &path);
+                if state.last_preview.as_ref() != Some(&signature) {
+                    load_preview(state, io, &path);
+                    // Recorded even on decode failure: like the diff cache, a
+                    // bad file is not retried until it changes on disk.
+                    state.last_preview = Some(signature);
+                }
             }
         }
     }

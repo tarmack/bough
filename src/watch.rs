@@ -7,11 +7,26 @@
 //!
 //! - **`notify` (recommended watcher)** watches the repo root recursively.
 //!   Paths under `.git/` are ignored except `.git/HEAD`, `.git/packed-refs`,
-//!   and anything under `.git/refs/`, which become `RefsChanged`.
-//! - **Backstop poll**: every 2s, stat `.git/HEAD` *and* the ref file its
-//!   symref targets (plus `.git/packed-refs`), because a commit moves the ref
-//!   file without touching `HEAD`'s mtime. If `notify` missed a ref change
-//!   (some filesystems are flaky), the poll catches it.
+//!   and anything under `.git/refs/` or `.git/reftable/`, which become
+//!   `RefsChanged`, and `.git/index` + `.git/info/exclude`, which force an
+//!   unattributable recompute; everything else under `.git` is ignored.
+//! - **Backstop poll**: every 2s, compare a `(mtime, size)` signature over
+//!   this worktree's `HEAD`, the shared `packed-refs` and reftable
+//!   `tables.list`, every file under the loose ref trees, the worktree index,
+//!   and the shared `info/exclude`; no symref resolution (every ref file is
+//!   probed on its own, so a moved base ref is caught even though a commit
+//!   doesn't touch `HEAD`'s mtime). If `notify` missed a ref change (some
+//!   filesystems are flaky), the poll catches it.
+//!
+//! Ref state is not always inside the worktree root: the main checkout keeps it
+//! under `<root>/.git`, but a linked worktree's `.git` is a *file* pointing at
+//! `<common>/worktrees/<id>` (per-worktree `HEAD` and `index`) while the shared
+//! refs live in `<common>/refs` and `<common>/packed-refs` — all outside the
+//! root. [`GitAdmin`] resolves both dirs once at watcher start; the notify loop
+//! adds watches for them and the backstop poll stats their ref files. The
+//! worktree index and the shared `info/exclude` are watched too: staging or
+//! unstaging, or an exclude rewrite, changes the view without moving a file
+//! under the root.
 //!
 //! When `notify` init or its recursive `watch()` fails (unsupported
 //! filesystem, watch-table exhaustion), the watcher degrades to a workdir poll
@@ -40,6 +55,7 @@
 //! rather than blocking process exit on a wedged walk.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -48,8 +64,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use notify::event::{AccessKind, AccessMode, EventKind};
-use notify::{recommended_watcher, RecursiveMode};
+use notify::RecursiveMode;
 
+use crate::git;
 use crate::perf::{self, Counter};
 
 /// Classification of what moved. A workdir event carries the repo-relative
@@ -57,8 +74,9 @@ use crate::perf::{self, Counter};
 /// coarse (any ref movement triggers a rescan).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerEvent {
-    /// Any non-`.git` path changed (tracked or untracked file), with the
-    /// repo-relative paths that changed (empty when unattributable).
+    /// A path under the worktree changed (tracked or untracked file), with the
+    /// repo-relative paths that changed. An empty list means "unattributable,
+    /// recompute": a watcher batch overflow, or the worktree index changed.
     WorkdirChanged(Vec<PathBuf>),
     /// Any git ref moved (`HEAD`, `packed-refs`, or a local/remote/tag ref).
     RefsChanged,
@@ -100,6 +118,12 @@ const DROP_TIMEOUT: Duration = Duration::from_secs(2);
 /// until the next successful send, so a sustained burst under a stalled worker
 /// can never grow the retry buffer without bound.
 const PENDING_CAP: usize = 4096;
+/// Cap on loose-ref entries the backstop signature stats. Past this a
+/// pathological ref count is truncated; notify is still the primary trigger.
+const MAX_REF_ENTRIES: usize = 4096;
+/// Cap on a `.gitignore` read in the degraded poll walk: a committed symlink to
+/// a device or a huge file must not hang or exhaust memory every interval.
+const MAX_GITIGNORE_BYTES: u64 = 1024 * 1024;
 
 /// Owns the filesystem watcher thread. Dropping it signals shutdown and waits
 /// a bounded time for the thread to finish.
@@ -124,6 +148,25 @@ impl Watcher {
         repo_root: PathBuf,
         poll_mode: Arc<AtomicBool>,
     ) -> Result<Watcher, WatchError> {
+        Self::start(repo_root, poll_mode, BACKSTOP_INTERVAL)
+    }
+
+    /// Test-only: run with a caller-supplied backstop cadence so a test can
+    /// disable the poll and prove an event came from `notify`.
+    #[cfg(test)]
+    fn start_with_backstop(
+        repo_root: PathBuf,
+        poll_mode: Arc<AtomicBool>,
+        backstop: Duration,
+    ) -> Result<Watcher, WatchError> {
+        Self::start(repo_root, poll_mode, backstop)
+    }
+
+    fn start(
+        repo_root: PathBuf,
+        poll_mode: Arc<AtomicBool>,
+        backstop: Duration,
+    ) -> Result<Watcher, WatchError> {
         poll_mode.store(false, Ordering::Relaxed);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded::<WorkerEvent>(128);
@@ -131,11 +174,16 @@ impl Watcher {
 
         let poll_mode_t = poll_mode.clone();
         let shutdown_t = shutdown.clone();
+        // Resolve the git admin dirs once on the caller's thread; the watch
+        // thread and both poll loops then use only paths and stats.
+        let refs = GitAdmin::discover(&repo_root);
         let handle = thread::Builder::new()
             .name("bough-watch".into())
             .spawn(move || {
                 let io = WatchIo {
                     repo_root,
+                    refs,
+                    backstop,
                     out_tx: tx,
                     shutdown: shutdown_t,
                 };
@@ -187,10 +235,102 @@ fn wait_done(done_rx: &Receiver<()>, timeout: Duration) -> Result<(), ()> {
     }
 }
 
+/// The two git administration directories a repository's ref state lives under,
+/// resolved once at watcher start. In the main checkout both point at
+/// `<root>/.git` (already covered by the recursive workdir watch); in a linked
+/// worktree they are `<common>/worktrees/<id>` and `<common>`, both outside the
+/// worktree root. Only paths are kept, so the watch and poll loops stay
+/// gix-free after this discovery.
+struct GitAdmin {
+    /// Per-worktree admin dir: this worktree's `HEAD` and `index`.
+    git_dir: PathBuf,
+    /// Shared admin dir: `refs/`, `packed-refs`, and the reftable store.
+    common_dir: PathBuf,
+}
+
+impl GitAdmin {
+    /// Resolve from `repo_root`. `None` when it is not a repository or git
+    /// discovery failed (the workdir watch still works; there is nothing to
+    /// probe).
+    fn discover(repo_root: &Path) -> Option<Self> {
+        match git::open_repo_at(repo_root) {
+            Ok(repo) => Some(GitAdmin {
+                git_dir: repo.git_dir().to_path_buf(),
+                common_dir: repo.common_dir().to_path_buf(),
+            }),
+            Err(e) => {
+                // Without the admin dirs the ref and index backstop is blind;
+                // the workdir watch keeps working, so log rather than fail.
+                crate::perf_evt!("watch git_admin err={e}");
+                None
+            }
+        }
+    }
+
+    /// Extra watches for the admin dirs, skipping anything already under the
+    /// recursive workdir watch. The admin dirs are watched non-recursively
+    /// (`HEAD` and `index` sit directly in them; recursing would pull in
+    /// `objects/` and `logs/` churn); the shared ref trees are watched
+    /// recursively.
+    fn extra_watches(&self, repo_root: &Path) -> Vec<(PathBuf, RecursiveMode)> {
+        let candidates = [
+            (self.git_dir.clone(), RecursiveMode::NonRecursive),
+            (self.common_dir.clone(), RecursiveMode::NonRecursive),
+            (self.common_dir.join("info"), RecursiveMode::NonRecursive),
+            (self.common_dir.join("refs"), RecursiveMode::Recursive),
+            (self.git_dir.join("refs"), RecursiveMode::Recursive),
+            (self.common_dir.join("reftable"), RecursiveMode::Recursive),
+        ];
+        let mut out: Vec<(PathBuf, RecursiveMode)> = Vec::new();
+        for (path, mode) in candidates {
+            if path.starts_with(repo_root) || !path.exists() {
+                continue;
+            }
+            if !out.iter().any(|(p, _)| p == &path) {
+                out.push((path, mode));
+            }
+        }
+        out
+    }
+
+    /// True when `path` is a ref path: this worktree's `HEAD`, the shared
+    /// `packed-refs`, anything under either `refs/` tree, or the reftable store.
+    fn is_ref_path(&self, path: &Path) -> bool {
+        let named = |dir: &Path, name: &str| {
+            path.parent() == Some(dir) && path.file_name() == Some(std::ffi::OsStr::new(name))
+        };
+        named(&self.git_dir, "HEAD")
+            || named(&self.common_dir, "packed-refs")
+            || path.starts_with(self.common_dir.join("refs"))
+            || path.starts_with(self.common_dir.join("reftable"))
+            || path.starts_with(self.git_dir.join("refs"))
+    }
+
+    /// True for the worktree's index: staging or unstaging rewrites it, which
+    /// changes the view (the staged side of every diff) without moving a file
+    /// under the worktree root.
+    fn is_index_path(&self, path: &Path) -> bool {
+        path == self.git_dir.join("index")
+    }
+
+    /// True for the shared `info/exclude` file: it changes which untracked
+    /// paths count without moving a file under the worktree root.
+    fn is_exclude_path(&self, path: &Path) -> bool {
+        path == self.common_dir.join("info").join("exclude")
+    }
+}
+
 /// Shared thread inputs threaded through the orchestration: where to watch,
 /// where to emit events, and the shutdown flag.
 struct WatchIo {
     repo_root: PathBuf,
+    /// Git admin dirs whose refs the notify loop extra-watches and the poll
+    /// backstop stats. `None` when the root is not a repository or git
+    /// discovery failed.
+    refs: Option<GitAdmin>,
+    /// Backstop poll cadence; [`BACKSTOP_INTERVAL`] in production, effectively
+    /// disabled by the live-watch test.
+    backstop: Duration,
     out_tx: Sender<WorkerEvent>,
     shutdown: Arc<AtomicBool>,
 }
@@ -199,9 +339,17 @@ struct WatchIo {
 /// fall back to the 1s poll loop.
 fn run_loop(io: WatchIo, poll_mode: Arc<AtomicBool>) {
     let (raw_tx, raw_rx) = bounded::<notify::Result<notify::Event>>(128);
-    match recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let _ = raw_tx.send(res);
-    }) {
+    // A committed `link -> /` must not pull inotify watches outside the repo
+    // (watch exhaustion + event flood); the poll walk already never follows
+    // links.
+    // `<... as notify::Watcher>::new`: the trait isn't imported (it would
+    // collide with this file's `Watcher` struct), so UFCS pins `Self`.
+    match <notify::RecommendedWatcher as notify::Watcher>::new(
+        move |res: notify::Result<notify::Event>| {
+            let _ = raw_tx.send(res);
+        },
+        notify::Config::default().with_follow_symlinks(false),
+    ) {
         Ok(mut watcher) => {
             if let Err(e) =
                 notify::Watcher::watch(&mut watcher, &io.repo_root, RecursiveMode::Recursive)
@@ -218,6 +366,7 @@ fn run_loop(io: WatchIo, poll_mode: Arc<AtomicBool>) {
                 run_poll_loop(&io);
                 return;
             }
+            watch_ref_locations(&mut watcher, &io);
             run_notify_loop(&io, watcher, raw_rx);
         }
         Err(e) => {
@@ -226,6 +375,20 @@ fn run_loop(io: WatchIo, poll_mode: Arc<AtomicBool>) {
             crate::perf_evt!("watch poll_mode init err={e}");
             poll_mode.store(true, Ordering::Relaxed);
             run_poll_loop(&io);
+        }
+    }
+}
+
+/// Arm the extra watches for the git admin dirs a linked worktree's refs live
+/// under. A failure is logged, not fatal: the 2s ref poll still backstops it,
+/// and degrading the whole watcher to poll mode would cost far more.
+fn watch_ref_locations(watcher: &mut notify::RecommendedWatcher, io: &WatchIo) {
+    let Some(admin) = io.refs.as_ref() else {
+        return;
+    };
+    for (path, mode) in admin.extra_watches(&io.repo_root) {
+        if let Err(e) = notify::Watcher::watch(watcher, &path, mode) {
+            crate::perf_evt!("watch refs err={e} path={}", path.display());
         }
     }
 }
@@ -239,7 +402,7 @@ fn run_notify_loop(
     // Keep the watcher alive for the life of the loop.
     let _watcher = watcher;
 
-    let mut refs = RefProbe::new(&io.repo_root.join(".git"));
+    let mut refs = io.refs.as_ref().map(RefProbe::new);
     let mut last_poll = Instant::now();
     // Workdir paths observed since the last successful send. A send dropped
     // under backpressure restores them here so the worker can't miss the final
@@ -258,18 +421,29 @@ fn run_notify_loop(
         match raw_rx.recv_timeout(SHUTDOWN_TICK) {
             Ok(Ok(event)) => {
                 perf::tally(Counter::WatchRawEvents);
-                if is_read_access(&event.kind) {
+                if event.need_rescan() {
+                    // notify dropped events (e.g. an inotify queue overflow) and
+                    // cannot say what changed: recompute unconditionally instead
+                    // of silently losing them.
+                    pending.push_unattributable();
+                } else if is_read_access(&event.kind) {
                     perf::tally(Counter::WatchReadFiltered);
                 } else {
-                    absorb_event(&io.repo_root, &event.paths, &mut pending, &mut refs_pending);
+                    absorb_event(io, &event.paths, &mut pending, &mut refs_pending);
                 }
             }
-            Ok(Err(_)) => { /* notify internal error; keep going */ }
+            Ok(Err(e)) => crate::perf_evt!("watch notify_err err={e}"),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        poll_refs(&mut refs, &mut last_poll, &mut refs_pending);
+        poll_refs(
+            &mut refs,
+            &mut pending,
+            &mut last_poll,
+            &mut refs_pending,
+            io.backstop,
+        );
     }
 }
 
@@ -296,12 +470,25 @@ fn is_read_access(kind: &EventKind) -> bool {
 }
 
 /// Classify a raw notify event's `paths` into accumulated `pending` workdir
-/// paths and the `refs` flag. Paths are made relative to `root`; `.git`
-/// internals and unrecognised paths are dropped.
-fn absorb_event(root: &Path, paths: &[PathBuf], pending: &mut PendingPaths, refs: &mut bool) {
+/// paths and the `refs` flag. Paths under the worktree root are made relative
+/// and classified by [`classify_into`]; paths outside it can only come from the
+/// [`GitAdmin`] watches, so they are matched against it directly (a ref move
+/// latches `refs`; an index or exclude rewrite forces an unattributable recompute).
+fn absorb_event(io: &WatchIo, paths: &[PathBuf], pending: &mut PendingPaths, refs: &mut bool) {
     for path in paths {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        classify_into(rel, pending, refs);
+        match path.strip_prefix(&io.repo_root) {
+            Ok(rel) => classify_into(rel, pending, refs),
+            Err(_) => {
+                let Some(admin) = io.refs.as_ref() else {
+                    continue;
+                };
+                if admin.is_ref_path(path) {
+                    *refs = true;
+                } else if admin.is_index_path(path) || admin.is_exclude_path(path) {
+                    pending.push_unattributable();
+                }
+            }
+        }
     }
 }
 
@@ -311,45 +498,54 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
     paths.dedup();
 }
 
-/// Accumulated workdir paths awaiting a send, plus the overdue-batch latch.
+/// Accumulated workdir paths awaiting a send, plus the unattributable latch.
 /// While the out channel is full the batch is retried; past [`PENDING_CAP`] it
-/// collapses to the empty-path form (`Vec::new()`, i.e. "unattributable,
+/// collapses to the empty-path form (an empty `Vec`, i.e. "unattributable,
 /// recompute") and new paths are dropped until the next successful send, so a
 /// sustained burst can't grow the retry buffer without bound.
 #[derive(Default)]
 struct PendingPaths {
     paths: Vec<PathBuf>,
-    /// True once the batch overflowed: it is now the empty-path unattributable
-    /// form, and further paths are dropped until it is sent.
-    overflowed: bool,
+    /// True once the batch is unattributable (overflow collapse or an index
+    /// rewrite): it sends no paths, and further paths are dropped until it is
+    /// sent.
+    unattributable: bool,
 }
 
 impl PendingPaths {
     /// Record changed paths, collapsing to the unattributable form on overflow.
     fn push_all(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
-        if self.overflowed {
+        if self.unattributable {
             return;
         }
         for path in paths {
             if self.paths.len() >= PENDING_CAP {
                 self.paths.clear();
-                self.overflowed = true;
+                self.unattributable = true;
                 return;
             }
             self.paths.push(path);
         }
     }
 
-    /// True when there is a batch (paths or the overflow latch) to send.
+    /// Latch the unattributable form without recording a path: the view changed
+    /// (the worktree index was rewritten) but no path under the root did, so
+    /// the ignore gate must never skip the next recompute.
+    fn push_unattributable(&mut self) {
+        self.paths.clear();
+        self.unattributable = true;
+    }
+
+    /// True when there is a batch (paths or the unattributable latch) to send.
     fn is_empty(&self) -> bool {
-        self.paths.is_empty() && !self.overflowed
+        self.paths.is_empty() && !self.unattributable
     }
 
     /// Take the batch for a send: the deduped paths, or an empty `Vec` for an
-    /// overflowed (unattributable) batch.
+    /// unattributable batch.
     fn take(&mut self) -> Vec<PathBuf> {
-        if self.overflowed {
-            self.overflowed = false;
+        if self.unattributable {
+            self.unattributable = false;
             self.paths.clear();
             Vec::new()
         } else {
@@ -359,10 +555,10 @@ impl PendingPaths {
     }
 
     /// Restore a batch rejected by `try_send`: an empty batch re-arms the
-    /// overflow latch, otherwise the paths are kept for the next retry.
+    /// unattributable latch, otherwise the paths are kept for the next retry.
     fn restore(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
-            self.overflowed = true;
+            self.unattributable = true;
         } else {
             self.paths = paths;
         }
@@ -375,7 +571,7 @@ impl PendingPaths {
 /// matched by a conservative, std-only subset of the active `.gitignore`
 /// layers, so it covers the tracked tree without any gix/git dependency.
 fn run_poll_loop(io: &WatchIo) {
-    let mut refs = RefProbe::new(&io.repo_root.join(".git"));
+    let mut refs = io.refs.as_ref().map(RefProbe::new);
     let mut last_refs = Instant::now();
     // Baseline taken before the first interval so a change landing right after
     // startup is not folded into the baseline unseen.
@@ -413,7 +609,13 @@ fn run_poll_loop(io: &WatchIo) {
                 pending.push_all(changed);
             }
         }
-        poll_refs(&mut refs, &mut last_refs, &mut refs_pending);
+        poll_refs(
+            &mut refs,
+            &mut pending,
+            &mut last_refs,
+            &mut refs_pending,
+            io.backstop,
+        );
     }
 }
 
@@ -426,7 +628,8 @@ fn next_poll_interval(walk: Duration) -> Duration {
 
 /// Metadata signature of the workdir: repo-relative path -> `(mtime, size)`.
 /// Symlink metadata only, so the walk reads no file content and never follows
-/// links. `.git` is skipped entirely (ref movement is the backstop poll's job).
+/// links. `.git` is skipped entirely (ref and index movement is the backstop
+/// poll's job).
 type Signature = HashMap<PathBuf, (SystemTime, u64)>;
 
 /// One parsed `.gitignore` file, reduced to the patterns that can prune a
@@ -539,9 +742,26 @@ impl PollWalk<'_> {
         let Ok(rel) = dir.strip_prefix(self.root) else {
             return false;
         };
-        let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) else {
+        let path = dir.join(".gitignore");
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             return false;
         };
+        // Only a regular file under the cap: a symlink to `/dev/zero` or a
+        // multi-gigabyte file would otherwise hang or exhaust memory.
+        if !meta.file_type().is_file() || meta.len() > MAX_GITIGNORE_BYTES {
+            return false;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        let mut text = String::new();
+        if file
+            .take(MAX_GITIGNORE_BYTES)
+            .read_to_string(&mut text)
+            .is_err()
+        {
+            return false;
+        }
         let (names, anchored, negated) = parse_gitignore(&text);
         if names.is_empty() && anchored.is_empty() && !negated {
             return false;
@@ -688,117 +908,191 @@ fn flush_pending(io: &WatchIo, pending: &mut PendingPaths, refs_pending: &mut bo
 
 /// Backstop ref poll shared by both loops: on the cadence gated by
 /// `last_poll`, compare the probed ref files and latch `refs_pending` when any
-/// moved. The caller sends (non-blocking) on its next pass, so a stalled worker
-/// cannot wedge the watcher here.
-fn poll_refs(refs: &mut RefProbe, last_poll: &mut Instant, refs_pending: &mut bool) {
-    if last_poll.elapsed() >= BACKSTOP_INTERVAL {
+/// moved, and latch an unattributable recompute in `pending` when the worktree
+/// index or the shared exclude file was rewritten (view changes that are not
+/// ref moves). The caller sends (non-blocking) on its next pass, so a stalled
+/// worker cannot wedge the watcher here.
+fn poll_refs(
+    refs: &mut Option<RefProbe>,
+    pending: &mut PendingPaths,
+    last_poll: &mut Instant,
+    refs_pending: &mut bool,
+    backstop: Duration,
+) {
+    if last_poll.elapsed() >= backstop {
         *last_poll = Instant::now();
-        if refs.poll() {
+        let Some(probe) = refs.as_mut() else {
+            return;
+        };
+        let change = probe.poll();
+        if change.refs {
             *refs_pending = true;
+        }
+        if change.index || change.exclude {
+            pending.push_unattributable();
         }
     }
 }
 
-/// Tracks the git ref files a commit actually moves. `.git/HEAD` is usually a
-/// symref (`ref: refs/heads/<branch>`); a commit rewrites the target ref file
-/// without touching `HEAD`'s mtime, so stat-ing HEAD alone misses commits. The
-/// probe stats HEAD, `packed-refs`, and the resolved symref target, and
-/// re-resolves the target whenever HEAD's own mtime moves (a branch switch or
-/// detach rewrites HEAD).
+/// What the backstop probe observed since the previous poll.
+struct ProbeChange {
+    /// A ref (HEAD, packed-refs, a loose ref, or the reftable store) moved.
+    refs: bool,
+    /// The worktree index was rewritten: a view change that is not a ref move.
+    index: bool,
+    /// The shared `info/exclude` file changed, which changes which untracked
+    /// paths count but is not a ref move.
+    exclude: bool,
+}
+
+/// Tracks the ref state a commit, fetch, pull, or branch switch moves. Takes a
+/// stat-only signature of this worktree's `HEAD`, the shared `packed-refs` and
+/// reftable table list, and every file under the loose ref trees, and reports
+/// movement when anything differs. It also stats the worktree index and the
+/// shared `info/exclude` file, which the degraded poll's workdir walk skips. It
+/// deliberately does not resolve HEAD's symref: the base ref (e.g. `main`) is
+/// usually not the checked-out branch, and its movement must be caught too.
+///
+/// A linked worktree's `HEAD` lives in its per-worktree admin dir and all
+/// shared refs in the common dir, which is why [`GitAdmin`] carries both.
 struct RefProbe {
-    head: PathBuf,
-    packed_refs: PathBuf,
-    /// The ref file HEAD points at, or `None` for a detached HEAD.
-    target: Option<PathBuf>,
-    /// HEAD's mtime when `target` was last resolved; meaningful once `resolved`.
-    resolved_for: Option<SystemTime>,
-    resolved: bool,
-    /// Last observed mtimes of `(HEAD, packed-refs, target)`.
-    last: (Option<SystemTime>, Option<SystemTime>, Option<SystemTime>),
+    /// Files whose `(mtime, size)` alone signals ref movement.
+    fixed: Vec<PathBuf>,
+    /// Loose ref trees, walked for `(path, (mtime, size))` entries.
+    trees: Vec<PathBuf>,
+    /// The worktree index: a rewrite here changes the staged side of the view
+    /// without moving any ref.
+    index: PathBuf,
+    /// The shared exclude file: a rewrite changes which untracked paths count.
+    exclude: PathBuf,
+    /// Last observed signature, sorted by path: `(mtime, size)` per ref file.
+    last: Vec<(PathBuf, (Option<SystemTime>, u64))>,
+    /// Last observed `(mtime, size)` of the worktree index.
+    last_index: (Option<SystemTime>, u64),
+    /// Last observed `(mtime, size)` of the exclude file.
+    last_exclude: (Option<SystemTime>, u64),
 }
 
 impl RefProbe {
-    /// Build a probe for the git dir and take the initial baseline, so the
+    /// Build a probe for the admin dirs and take the initial baseline, so the
     /// first poll reports only movement after construction.
-    fn new(git_dir: &Path) -> Self {
+    fn new(admin: &GitAdmin) -> Self {
+        let mut trees = vec![admin.common_dir.join("refs")];
+        if admin.git_dir != admin.common_dir {
+            trees.push(admin.git_dir.join("refs"));
+        }
         let mut probe = RefProbe {
-            head: git_dir.join("HEAD"),
-            packed_refs: git_dir.join("packed-refs"),
-            target: None,
-            resolved_for: None,
-            resolved: false,
-            last: (None, None, None),
+            fixed: vec![
+                admin.git_dir.join("HEAD"),
+                admin.common_dir.join("packed-refs"),
+                admin.common_dir.join("reftable").join("tables.list"),
+            ],
+            trees,
+            index: admin.git_dir.join("index"),
+            exclude: admin.common_dir.join("info").join("exclude"),
+            last: Vec::new(),
+            last_index: (None, 0),
+            last_exclude: (None, 0),
         };
-        probe.refresh_target();
-        probe.last = probe.stat();
+        probe.last = probe.signature();
+        probe.last_index = stat_signature(&probe.index);
+        probe.last_exclude = stat_signature(&probe.exclude);
         probe
     }
 
-    /// Re-read HEAD's `ref:` line only when HEAD's own mtime moved, so a branch
-    /// switch is picked up while the common case reads no file.
-    fn refresh_target(&mut self) {
-        let head_mtime = stat_mtime(&self.head);
-        if self.resolved && self.resolved_for == head_mtime {
+    /// Stat-only signature: every probe file plus every file under the loose
+    /// ref trees, sorted by path so the comparison is order-independent. Each
+    /// entry is `(mtime, size)`: the size disambiguates same-tick rewrites on
+    /// coarse-mtime filesystems. A ref rewrite with `rename` changes the file's
+    /// mtime; creation or deletion changes the set.
+    fn signature(&self) -> Vec<(PathBuf, (Option<SystemTime>, u64))> {
+        let mut sig = Vec::new();
+        for path in &self.fixed {
+            sig.push((path.clone(), stat_signature(path)));
+        }
+        for tree in &self.trees {
+            collect_ref_files(tree, &mut sig);
+        }
+        sig.sort_by(|a, b| a.0.cmp(&b.0));
+        sig
+    }
+
+    /// Compare the current signature and the index and exclude `(mtime, size)`
+    /// against the previous poll, updating the baselines. Reports what moved.
+    fn poll(&mut self) -> ProbeChange {
+        let index = stat_signature(&self.index);
+        let exclude = stat_signature(&self.exclude);
+        let cur = self.signature();
+        let change = ProbeChange {
+            refs: cur != self.last,
+            index: index != self.last_index,
+            exclude: exclude != self.last_exclude,
+        };
+        self.last = cur;
+        self.last_index = index;
+        self.last_exclude = exclude;
+        change
+    }
+}
+
+/// Collect `(path, (mtime, size))` for every entry under a loose-ref tree,
+/// bounded so a pathological ref count cannot make the 2s backstop unbounded.
+/// Symlinked directories are not followed.
+fn collect_ref_files(dir: &Path, out: &mut Vec<(PathBuf, (Option<SystemTime>, u64))>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // Sort before the cap: `read_dir` order is not guaranteed, and flipping the
+    // retained subset between polls would latch a spurious ref change.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    for path in paths {
+        if out.len() >= MAX_REF_ENTRIES {
             return;
         }
-        self.resolved = true;
-        self.resolved_for = head_mtime;
-        self.target = resolve_head_target(&self.head);
-    }
-
-    fn stat(&self) -> (Option<SystemTime>, Option<SystemTime>, Option<SystemTime>) {
-        (
-            stat_mtime(&self.head),
-            stat_mtime(&self.packed_refs),
-            self.target.as_deref().and_then(stat_mtime),
-        )
-    }
-
-    /// Compare the probed ref mtimes against the previous poll, updating the
-    /// baseline. True when any moved (created, deleted, or rewritten).
-    fn poll(&mut self) -> bool {
-        self.refresh_target();
-        let cur = self.stat();
-        let changed = mtime_changed(self.last.0, cur.0)
-            || mtime_changed(self.last.1, cur.1)
-            || mtime_changed(self.last.2, cur.2);
-        self.last = cur;
-        changed
+        let Ok(link_meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if link_meta.is_dir() {
+            collect_ref_files(&path, out);
+        } else {
+            // A symlinked ref is followed (git permits them); a symlinked
+            // directory is not, matching the walk's no-follow stance.
+            out.push((path.clone(), stat_signature(&path)));
+        }
     }
 }
 
-/// Resolve `.git/HEAD`'s `ref: <path>` symref to the ref file it points at
-/// (relative to HEAD's directory), or `None` for a detached HEAD (bare object
-/// id) or an unreadable HEAD.
-fn resolve_head_target(head: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(head).ok()?;
-    let rest = text.strip_prefix("ref:")?.trim();
-    if rest.is_empty() {
-        return None;
+/// `(mtime, size)` of `p`, following symlinks, or `(None, 0)` when it can't be
+/// stat-ed. The size disambiguates rewrites that share a timestamp on
+/// coarse-mtime filesystems, mirroring the workdir poll's signature.
+fn stat_signature(p: &Path) -> (Option<SystemTime>, u64) {
+    match std::fs::metadata(p) {
+        Ok(meta) => (meta.modified().ok(), meta.len()),
+        Err(_) => (None, 0),
     }
-    Some(head.parent()?.join(rest))
-}
-
-/// mtime of `p`, or `None` when it can't be stat-ed.
-fn stat_mtime(p: &Path) -> Option<SystemTime> {
-    std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
-}
-
-/// True when `cur` differs from `prev` (ref moved/created/deleted). Both
-/// `None` (never seen, still absent) means no change.
-fn mtime_changed(prev: Option<SystemTime>, cur: Option<SystemTime>) -> bool {
-    prev != cur
 }
 
 /// Classify a path (relative to the repo root) into the pending workdir batch
 /// and the refs flag. `.git/HEAD`, `.git/packed-refs`, and anything under
-/// `.git/refs/` set `refs` (any ref movement triggers a rescan, so a freshly
-/// picked base stays live). Any path containing a `.git` component — including
-/// a nested/submodule `.git` — is ignored rather than treated as a workdir
-/// change; everything else is accumulated as a workdir path. Components are
-/// compared directly, so no string is built and the platform separator is
-/// handled by `Path` itself.
+/// `.git/refs/` or `.git/reftable/` set `refs` (any ref movement triggers a
+/// rescan, so a freshly picked base stays live). `.git/index` and
+/// `.git/info/exclude` force an unattributable recompute: staging or unstaging
+/// changes the staged side of the view and the exclude file changes which
+/// untracked paths count, without moving a file under the root. Any other path
+/// containing a `.git` component — including a nested/submodule `.git` — is
+/// ignored rather than treated as a workdir change; everything else is
+/// accumulated as a workdir path. Components are compared directly, so no
+/// string is built and the platform separator is handled by `Path` itself.
 fn classify_into(rel: &Path, pending: &mut PendingPaths, refs: &mut bool) {
+    // The index decides the staged side of the view and the local exclude file
+    // changes which untracked paths count: both change what is shown without
+    // touching a file under the root. Force an unattributable recompute so the
+    // worker re-reads them.
+    if rel == Path::new(".git/index") || rel == Path::new(".git/info/exclude") {
+        pending.push_unattributable();
+        return;
+    }
     let git = std::ffi::OsStr::new(".git");
     let mut comps = rel.components();
     let (first, second, third) = (comps.next(), comps.next(), comps.next());
@@ -808,7 +1102,8 @@ fn classify_into(rel: &Path, pending: &mut PendingPaths, refs: &mut bool) {
             if name == std::ffi::OsStr::new("HEAD") || name == std::ffi::OsStr::new("packed-refs") {
                 third.is_none()
             } else {
-                name == std::ffi::OsStr::new("refs") && third.is_some()
+                (name == std::ffi::OsStr::new("refs") || name == std::ffi::OsStr::new("reftable"))
+                    && third.is_some()
             }
         }
         _ => false,
@@ -834,6 +1129,18 @@ mod tests {
         let mut refs = false;
         classify_into(rel, &mut pending, &mut refs);
         (pending, refs)
+    }
+
+    /// A `WatchIo` for `absorb_event` tests, with an optional admin layout.
+    fn test_io(root: &Path, admin: Option<GitAdmin>) -> WatchIo {
+        let (tx, _rx) = bounded(1);
+        WatchIo {
+            repo_root: root.to_path_buf(),
+            refs: admin,
+            backstop: BACKSTOP_INTERVAL,
+            out_tx: tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[test]
@@ -901,10 +1208,40 @@ mod tests {
 
     #[test]
     fn classify_other_git_internals_ignored() {
-        let (pending, refs) = classify(Path::new(".git/index"));
+        let (pending, refs) = classify(Path::new(".git/objects/xx/yyyy"));
         assert!(!refs);
         assert!(pending.paths.is_empty());
-        let (pending, refs) = classify(Path::new(".git/objects/xx/yyyy"));
+    }
+
+    #[test]
+    fn classify_index_forces_a_recompute() {
+        let (mut pending, refs) = classify(Path::new(".git/index"));
+        assert!(!refs);
+        assert!(
+            !pending.is_empty(),
+            "an index change must force a recompute"
+        );
+        assert_eq!(pending.take(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn classify_reftable_is_refs_changed() {
+        let (pending, refs) = classify(Path::new(".git/reftable/tables.list"));
+        assert!(refs);
+        assert!(pending.paths.is_empty());
+    }
+
+    #[test]
+    fn classify_local_exclude_forces_a_recompute() {
+        let (mut pending, refs) = classify(Path::new(".git/info/exclude"));
+        assert!(!refs);
+        assert!(!pending.is_empty());
+        assert_eq!(pending.take(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn classify_nested_git_index_is_ignored() {
+        let (pending, refs) = classify(Path::new("sub/.git/index"));
         assert!(!refs);
         assert!(pending.paths.is_empty());
     }
@@ -923,70 +1260,331 @@ mod tests {
     }
 
     #[test]
-    fn mtime_changed_detects_creation() {
-        assert!(mtime_changed(None, Some(SystemTime::UNIX_EPOCH)));
+    fn absorb_event_classifies_admin_paths_outside_the_root() {
+        let admin = GitAdmin {
+            git_dir: PathBuf::from("/common/worktrees/wt"),
+            common_dir: PathBuf::from("/common"),
+        };
+        let io = test_io(Path::new("/wt"), Some(admin));
+        let mut pending = PendingPaths::default();
+        let mut refs = false;
+        absorb_event(
+            &io,
+            &[
+                PathBuf::from("/common/worktrees/wt/HEAD"),
+                PathBuf::from("/common/refs/heads/main"),
+                PathBuf::from("/common/packed-refs"),
+                PathBuf::from("/common/objects/ab/cdef"),
+            ],
+            &mut pending,
+            &mut refs,
+        );
+        assert!(refs, "a shared ref move outside the root must refire");
+        assert!(
+            pending.is_empty(),
+            "objects churn must not force a recompute"
+        );
+
+        let mut pending = PendingPaths::default();
+        let mut refs = false;
+        absorb_event(
+            &io,
+            &[PathBuf::from("/common/worktrees/wt/index")],
+            &mut pending,
+            &mut refs,
+        );
+        assert!(!refs);
+        assert!(
+            !pending.is_empty(),
+            "an index rewrite outside the root must force a recompute"
+        );
+        assert_eq!(pending.take(), Vec::<PathBuf>::new());
+
+        let mut pending = PendingPaths::default();
+        let mut refs = false;
+        absorb_event(
+            &io,
+            &[PathBuf::from("/common/info/exclude")],
+            &mut pending,
+            &mut refs,
+        );
+        assert!(!refs);
+        assert!(
+            !pending.is_empty(),
+            "a shared info/exclude rewrite must force a recompute"
+        );
+        assert_eq!(pending.take(), Vec::<PathBuf>::new());
     }
 
     #[test]
-    fn mtime_changed_detects_deletion() {
-        assert!(mtime_changed(Some(SystemTime::UNIX_EPOCH), None));
+    fn ref_probe_detects_a_base_ref_move_when_head_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        std::fs::write(git.join("refs/heads/feature"), "0000\n").unwrap();
+        let base = git.join("refs/heads/main");
+        std::fs::write(&base, "1111\n").unwrap();
+
+        let admin = GitAdmin {
+            git_dir: git.clone(),
+            common_dir: git.clone(),
+        };
+        let mut probe = RefProbe::new(&admin);
+        let change = probe.poll();
+        assert!(
+            !change.refs && !change.index,
+            "a stable repo must not report a change"
+        );
+
+        // Pulling `main` rewrites its ref file while HEAD stays on `feature`;
+        // the base is not HEAD's target, so it must be probed on its own.
+        std::fs::File::options()
+            .write(true)
+            .open(&base)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        assert!(probe.poll().refs, "a base ref move must fire");
+        let change = probe.poll();
+        assert!(
+            !change.refs && !change.index,
+            "the new baseline must be stable"
+        );
     }
 
     #[test]
-    fn mtime_changed_detects_movement() {
-        let a = SystemTime::UNIX_EPOCH;
-        let b = a + Duration::from_secs(60);
-        assert!(mtime_changed(Some(a), Some(b)));
-    }
-
-    #[test]
-    fn mtime_changed_stable_when_equal() {
-        assert!(!mtime_changed(None, None));
-        assert!(!mtime_changed(
-            Some(SystemTime::UNIX_EPOCH),
-            Some(SystemTime::UNIX_EPOCH)
-        ));
-    }
-
-    #[test]
-    fn ref_probe_detects_target_movement_with_stable_head() {
+    fn ref_probe_detects_a_same_timestamp_rewrite_by_size() {
         let dir = tempfile::tempdir().unwrap();
         let git = dir.path().join(".git");
         std::fs::create_dir_all(git.join("refs/heads")).unwrap();
         std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let ref_file = git.join("refs/heads/main");
-        std::fs::write(&ref_file, "0000000000000000000000000000000000000000\n").unwrap();
-
-        let mut probe = RefProbe::new(&git);
-        assert!(!probe.poll(), "a stable tree must not report a change");
-
-        // Move the ref file alone (as a commit does), leaving HEAD untouched.
-        let moved = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let base = git.join("refs/heads/main");
+        std::fs::write(&base, "0000\n").unwrap();
+        let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(5_000_000);
         std::fs::File::options()
             .write(true)
-            .open(&ref_file)
+            .open(&base)
             .unwrap()
-            .set_modified(moved)
+            .set_modified(stamp)
             .unwrap();
 
+        let admin = GitAdmin {
+            git_dir: git.clone(),
+            common_dir: git,
+        };
+        let mut probe = RefProbe::new(&admin);
+        assert!(!probe.poll().refs);
+
+        // Same timestamp, different content length: only the size half of the
+        // signature can catch this on a coarse-mtime filesystem.
+        std::fs::write(&base, "0000\n1111\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&base)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        assert!(probe.poll().refs, "a same-timestamp rewrite must be caught");
+    }
+
+    #[test]
+    fn ref_probe_tracks_a_linked_worktrees_admin_and_common_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path().join("main/.git");
+        let admin_dir = common.join("worktrees/wt");
+        std::fs::create_dir_all(common.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(&admin_dir).unwrap();
+        std::fs::write(admin_dir.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        std::fs::write(admin_dir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(admin_dir.join("index"), b"index").unwrap();
+        let base = common.join("refs/heads/main");
+        std::fs::write(&base, "1111\n").unwrap();
+
+        let admin = GitAdmin {
+            git_dir: admin_dir.clone(),
+            common_dir: common.clone(),
+        };
+        let mut probe = RefProbe::new(&admin);
+        let change = probe.poll();
         assert!(
-            probe.poll(),
-            "a ref move must fire even when HEAD is unchanged"
+            !change.refs && !change.index,
+            "a stable linked worktree must be quiet"
+        );
+
+        std::fs::File::options()
+            .write(true)
+            .open(&base)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        assert!(probe.poll().refs, "a common-dir base ref move must fire");
+
+        std::fs::write(admin_dir.join("HEAD"), "ref: refs/heads/other\n").unwrap();
+        assert!(probe.poll().refs, "a per-worktree HEAD rewrite must fire");
+
+        std::fs::write(admin_dir.join("index"), b"index2").unwrap();
+        let change = probe.poll();
+        assert!(change.index, "an index rewrite must be reported");
+        assert!(!change.refs, "an index rewrite is not a ref move");
+    }
+
+    #[test]
+    fn ref_probe_detects_packed_refs_and_reftable_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(git.join("reftable")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("refs/heads/main"), "0000\n").unwrap();
+        std::fs::write(git.join("packed-refs"), "# pack-refs\n").unwrap();
+        std::fs::write(git.join("reftable/tables.list"), "table\n").unwrap();
+
+        let admin = GitAdmin {
+            git_dir: git.clone(),
+            common_dir: git.clone(),
+        };
+        let mut probe = RefProbe::new(&admin);
+        let change = probe.poll();
+        assert!(!change.refs && !change.index);
+
+        let bump = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000))
+                .unwrap();
+        };
+        bump(&git.join("packed-refs"));
+        assert!(probe.poll().refs, "a packed-refs rewrite must fire");
+
+        bump(&git.join("reftable/tables.list"));
+        assert!(probe.poll().refs, "a reftable table-list rewrite must fire");
+    }
+
+    #[test]
+    fn ref_probe_reports_the_exclude_file_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(git.join("info")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("refs/heads/main"), "0000\n").unwrap();
+        std::fs::write(git.join("info/exclude"), "target/\n").unwrap();
+
+        let admin = GitAdmin {
+            git_dir: git.clone(),
+            common_dir: git.clone(),
+        };
+        let mut probe = RefProbe::new(&admin);
+        assert!(!probe.poll().exclude);
+
+        std::fs::write(git.join("info/exclude"), "target/\nbuild/\n").unwrap();
+        let change = probe.poll();
+        assert!(change.exclude, "an exclude rewrite must be reported");
+        assert!(
+            !change.refs,
+            "an exclude rewrite is not a ref move (the worker rebuilds the \
+             exclude chain only for unattributable windows)"
         );
     }
 
     #[test]
-    fn resolve_head_target_reads_symref_and_skips_detached() {
+    fn extra_watches_skip_the_worktree_root_and_dedup() {
         let dir = tempfile::tempdir().unwrap();
-        let head = dir.path().join("HEAD");
-        std::fs::write(&head, "ref: refs/heads/feature/x\n").unwrap();
-        assert_eq!(
-            resolve_head_target(&head),
-            Some(dir.path().join("refs/heads/feature/x"))
+        let root = dir.path().join("wt");
+        let common = dir.path().join("repo/.git");
+        let admin_dir = common.join("worktrees/wt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&admin_dir).unwrap();
+        std::fs::create_dir_all(common.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(common.join("info")).unwrap();
+        std::fs::write(admin_dir.join("HEAD"), "ref: refs/heads/f\n").unwrap();
+
+        let admin = GitAdmin {
+            git_dir: admin_dir.clone(),
+            common_dir: common.clone(),
+        };
+        let watches = admin.extra_watches(&root);
+        assert!(watches.contains(&(admin_dir, RecursiveMode::NonRecursive)));
+        assert!(watches.contains(&(common.clone(), RecursiveMode::NonRecursive)));
+        assert!(watches.contains(&(common.join("refs"), RecursiveMode::Recursive)));
+        assert!(watches.contains(&(common.join("info"), RecursiveMode::NonRecursive)));
+        assert!(
+            watches.iter().all(|(p, _)| !p.starts_with(&root)),
+            "nothing under the worktree root may be watched twice"
+        );
+    }
+
+    #[test]
+    fn extra_watches_empty_for_the_main_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(git.join("info")).unwrap();
+        let admin = GitAdmin {
+            git_dir: git.clone(),
+            common_dir: git,
+        };
+        assert!(
+            admin.extra_watches(&root).is_empty(),
+            "the recursive workdir watch already covers <root>/.git"
+        );
+    }
+
+    #[test]
+    fn watcher_sees_a_commit_outside_a_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::test_util::repo_with_commits(dir.path(), &["one\n"]);
+        crate::git::test_util::run_git(dir.path(), &["worktree", "add", "-b", "feature", "wt"]);
+        let wt = std::fs::canonicalize(dir.path().join("wt")).unwrap();
+        assert!(
+            wt.join(".git").is_file(),
+            "a linked worktree's .git must be a file"
         );
 
-        std::fs::write(&head, "0123456789abcdef0123456789abcdef01234567\n").unwrap();
-        assert_eq!(resolve_head_target(&head), None);
+        let poll_flag = Arc::new(AtomicBool::new(false));
+        let watcher =
+            Watcher::start_with_backstop(wt.clone(), poll_flag.clone(), Duration::from_secs(3600))
+                .unwrap();
+        let rx = watcher.receiver().clone();
+        // The watch thread arms its watches asynchronously; a workdir event
+        // proves the loop is live (all watches are installed before the loop starts).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            std::fs::write(wt.join("ping.txt"), "ping\n").unwrap();
+            if rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "watcher never armed");
+        }
+        while rx.try_recv().is_ok() {}
+
+        // Advancing `main` in the main checkout moves only a shared ref, in the
+        // common dir outside this worktree's root. The backstop is effectively
+        // disabled, so only the notify admin watches can deliver the event.
+        crate::git::test_util::run_git(dir.path(), &["commit", "--allow-empty", "-m", "advance"]);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(WorkerEvent::RefsChanged) => break,
+                Ok(WorkerEvent::WorkdirChanged(_)) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a commit in the main worktree must reach the linked worktree's watcher"
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => panic!("watcher closed"),
+            }
+        }
+        assert!(
+            !poll_flag.load(Ordering::Relaxed),
+            "notify watches must deliver this, not a poll-mode fallback"
+        );
     }
 
     #[test]
@@ -1076,12 +1674,11 @@ mod tests {
         let mut refs = false;
 
         absorb_event(
-            root,
+            &test_io(root, None),
             &[
                 PathBuf::from("/repo/src/a.rs"),
                 PathBuf::from("/repo/src/a.rs"),
                 PathBuf::from("/repo/.git/HEAD"),
-                PathBuf::from("/repo/.git/index"),
             ],
             &mut pending,
             &mut refs,
@@ -1092,6 +1689,28 @@ mod tests {
             vec![PathBuf::from("src/a.rs"), PathBuf::from("src/a.rs")]
         );
         assert!(refs, "HEAD must be classified as a ref change");
+    }
+
+    #[test]
+    fn absorb_event_index_collapses_to_unattributable() {
+        // An index rewrite forces a recompute; the already-accumulated paths
+        // are superseded by the unattributable batch.
+        let mut pending = PendingPaths::default();
+        let mut refs = false;
+
+        absorb_event(
+            &test_io(Path::new("/repo"), None),
+            &[
+                PathBuf::from("/repo/src/a.rs"),
+                PathBuf::from("/repo/.git/index"),
+            ],
+            &mut pending,
+            &mut refs,
+        );
+
+        assert!(!refs);
+        assert!(!pending.is_empty());
+        assert_eq!(pending.take(), Vec::<PathBuf>::new());
     }
 
     #[test]

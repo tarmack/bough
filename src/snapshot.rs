@@ -28,6 +28,11 @@ pub struct Snapshot {
     /// Request sequence this snapshot answers (the latest request the worker
     /// had accepted when it was built).
     pub seq: Seq,
+    /// Worker-side counter of worktree-switch attempts. The UI records the
+    /// value observed when it requests a switch and only settles the switch gate
+    /// on a snapshot carrying a newer value, so stale old-root snapshots can
+    /// never consume a pending restore or fake a rejection.
+    pub switch_epoch: u64,
     /// True when the worker still has in-flight or pending work for this state
     /// ("more coming"). A settled snapshot (`busy == false`) always follows.
     /// The tree/diff carried are the best known at send time.

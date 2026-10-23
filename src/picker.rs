@@ -380,6 +380,14 @@ impl App {
             self.close_picker();
             return;
         }
+        if self.awaiting_switch {
+            // A second switch would arm over an unanswered epoch: the first
+            // attempt's answer would settle the second gate. The window is one
+            // worker round-trip, so just refuse the extra pick.
+            self.close_picker();
+            self.flash("switch already in progress");
+            return;
+        }
         self.worktree_ui
             .insert(from.clone(), self.capture_ui_state());
         let saved = self.worktree_ui.remove(&wt.id);
@@ -409,10 +417,13 @@ impl App {
         // Both branches drive the worker to the mode's revision, exactly as
         // if the user had re-picked it (`apply_base_switch` sends SetRev).
         self.apply_base_switch();
-        // The gate stays set until the switch's BUSY placeholder arrives, so
-        // stale old-root snapshots queued ahead of it (channel FIFO) can
-        // never consume the pending restore in `apply_snapshot`.
+        // The gate stays set until a snapshot answering the switch (a newer
+        // `switch_epoch`) arrives, so stale old-root snapshots queued ahead of
+        // it (channel FIFO) can never consume the pending restore in
+        // `apply_snapshot`. The epoch observed now is what marks later
+        // snapshots as stale (`settle_switch_gates`).
         self.awaiting_switch = true;
+        self.switch_epoch = self.snapshot.switch_epoch;
         self.pending_restore = Some((from, wt.id.clone(), saved));
     }
 
@@ -942,6 +953,26 @@ mod tests {
             other => panic!("expected SetRev, got {other:?}"),
         }
 
+        // The switch's busy placeholder answers the A → B switch (fresh epoch)
+        // and clears the gate; without it a second pick would be refused as
+        // "switch already in progress". It must not consume the restore.
+        let mut placeholder = sample_snapshot(Tree::build(Vec::new()));
+        {
+            let s = Arc::get_mut(&mut placeholder).unwrap();
+            s.busy = true;
+            s.switch_epoch = app.switch_epoch + 1;
+        }
+        app.apply_snapshot(placeholder);
+        assert!(
+            !app.awaiting_switch,
+            "the placeholder settles the first switch's gate"
+        );
+        assert!(
+            app.pending_restore.is_some(),
+            "the placeholder must not consume the restore"
+        );
+        let _ = rx.try_recv(); // Diff requested by the placeholder's relocation
+
         // Mutate the view "in" B; the changes must not leak into A's memory.
         app.move_down(1);
         let _ = rx.try_recv();
@@ -963,12 +994,17 @@ mod tests {
         }
 
         // A stale settled snapshot from the old root, queued before the
-        // switch's BUSY placeholder (channel FIFO), must not consume the
-        // pending restore.
+        // switch's answer (channel FIFO) and still carrying the epoch observed
+        // at request time, must not settle the gate or consume the pending
+        // restore.
         app.apply_snapshot(sample_snapshot(Tree::build(vec![
             ('M', "top.rs".to_string()),
             ('M', "old-root-only.rs".to_string()),
         ])));
+        assert!(
+            app.awaiting_switch,
+            "a stale old-root snapshot must not settle the gate"
+        );
         assert!(
             app.pending_restore.is_some(),
             "a settled pre-placeholder snapshot must not consume the restore"
@@ -978,10 +1014,14 @@ mod tests {
         // Diff request is unambiguous below.
         let _ = rx.try_recv();
 
-        // The switch's BUSY placeholder clears the awaiting-switch gate but
-        // must not consume the restore either.
+        // The switch's busy placeholder answers the switch (fresh epoch) and
+        // clears the awaiting-switch gate, but must not consume the restore.
         let mut placeholder = sample_snapshot(Tree::build(Vec::new()));
-        Arc::get_mut(&mut placeholder).unwrap().busy = true;
+        {
+            let s = Arc::get_mut(&mut placeholder).unwrap();
+            s.busy = true;
+            s.switch_epoch = app.switch_epoch + 1;
+        }
         app.apply_snapshot(placeholder);
         assert!(
             app.pending_restore.is_some(),
@@ -1095,7 +1135,9 @@ mod tests {
         app.awaiting_switch = true;
 
         // The rejected switch's settled error snapshot: every inner Arc is
-        // shared with the current snapshot, so nothing changed.
+        // shared with the current snapshot, so nothing changed — but it
+        // answers the switch attempt with a fresh epoch.
+        Arc::get_mut(&mut app.snapshot).unwrap().switch_epoch = app.switch_epoch + 1;
         let replay = app.snapshot.clone();
         app.apply_snapshot(replay);
         assert!(app.pending_restore.is_none(), "stale restore dropped");
@@ -1156,11 +1198,11 @@ mod tests {
         assert_eq!(app.selected_path, None);
         assert!(app.expanded_dirs.is_empty());
 
-        // The new tree arrives: selection lands on the first row.
-        app.apply_snapshot(sample_snapshot(Tree::build(vec![(
-            'M',
-            "z.rs".to_string(),
-        )])));
+        // The new tree arrives: selection lands on the first row. The settled
+        // snapshot answers the switch (fresh epoch), releasing the gate.
+        let mut settled = sample_snapshot(Tree::build(vec![('M', "z.rs".to_string())]));
+        Arc::get_mut(&mut settled).unwrap().switch_epoch = app.switch_epoch + 1;
+        app.apply_snapshot(settled);
         assert_eq!(app.selected_path.as_deref(), Some("z.rs"));
     }
 
